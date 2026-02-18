@@ -68,17 +68,30 @@ FULL_BENCHING_BATCH_SIZES = [
 ]
 
 
+def _generate_slide_64_batch_sizes(max_batch_size: int) -> list[int]:
+    batch_sizes = [1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120, 128]
+    while True:
+        if batch_sizes[-1] + 64 > max_batch_size:
+            break
+        batch_sizes.append(batch_sizes[-1] + 64)
+    return batch_sizes
+
+
+SLIDE_64_BATCH_SIZES = _generate_slide_64_batch_sizes(2048)
+
+
 class CudaGraphBenchmark:
     """Orchestrates trtllm-bench throughput benchmarks across CUDA graph padding configs and batch sizes."""
 
     def __init__(self):
-        f"""Initialize benchmark parameters from environment variables and register signal handlers.
+        """Initialize benchmark parameters from environment variables and register signal handlers.
 
         All parameters are configured via environment variables (defaults in parentheses):
 
         Model & paths:
             MODEL_NAME        - Model name from HuggingFace ("TinyLlama/TinyLlama-1.1B-Chat-v1.0").
-            OUTPUT_DIR        - Root dir for all output files ({LUSTRE_USER_DIR}/cuda_graph_testing_logs_eos_h100).
+            OUTPUT_DIR_SUFFIX - Root dir suffix for all output files ("TinyLlama_h100"). The output dir path will be
+                                {LUSTRE_USER_DIR}/cuda_graph_testing_logs_{OUTPUT_DIR_SUFFIX}.
 
         Dataset generation:
             INPUT_LENGTH  (500)  - Fixed input sequence length (ISL) for generated dataset.
@@ -104,13 +117,11 @@ class CudaGraphBenchmark:
         # self.model_name = "deepseek_v3_lite_fp8_hf"
 
         # self.model_name = "deepseek-ai/DeepSeek-V3"
-        self.model_name = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+        self.model_name = os.environ.get("MODEL_NAME", "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
 
-        # Specify the output directory for different experiments
-        # E.g., _gh200, _h200, etc.
-        self.output_dir = Path(
-            os.environ.get("OUTPUT_DIR", f"{LUSTRE_USER_DIR}/cuda_graph_testing_logs_eos_h100")
-        )
+        # Specify the output directory for different experiments, e.g. _b200, _gb200
+        output_dir_suffix = os.environ.get("OUTPUT_DIR_SUFFIX", "TinyLlama_h100")
+        self.output_dir = Path(f"{LUSTRE_USER_DIR}/cuda_graph_testing_logs_{output_dir_suffix}")
         self.trtllm_code_path = "/home/yijingl/dev/TensorRT-LLM"
 
         self.benching_batch_sizes = FULL_BENCHING_BATCH_SIZES
@@ -224,39 +235,7 @@ class CudaGraphBenchmark:
             "print_iter_log": False,
             "cuda_graph_config": {
                 "enable_padding": True,
-                "batch_sizes": [
-                    128,
-                    192,
-                    256,
-                    320,
-                    384,
-                    448,
-                    512,
-                    576,
-                    640,
-                    704,
-                    768,
-                    832,
-                    896,
-                    960,
-                    1024,
-                    1088,
-                    1152,
-                    1216,
-                    1280,
-                    1344,
-                    1408,
-                    1472,
-                    1536,
-                    1600,
-                    1664,
-                    1728,
-                    1792,
-                    1856,
-                    1920,
-                    1984,
-                    2048,
-                ],
+                "batch_sizes": SLIDE_64_BATCH_SIZES,
             },
             "kv_cache_config": {"dtype": "auto", "free_gpu_memory_fraction": 0.9},
             "enable_chunked_prefill": True,
