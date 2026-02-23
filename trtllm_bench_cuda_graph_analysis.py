@@ -10,9 +10,6 @@ from typing import Optional
 
 import yaml
 
-# Location of my personal Lustre directory on EOS cluster.
-LUSTRE_USER_DIR = "/lustre/fsw/coreai_comparch_trtllm/yijingl"
-
 FULL_BENCHING_BATCH_SIZES = [
     1,
     2,
@@ -89,9 +86,13 @@ class CudaGraphBenchmark:
         All parameters are configured via environment variables (defaults in parentheses):
 
         Model & paths:
-            MODEL_NAME        - Model name from HuggingFace ("TinyLlama/TinyLlama-1.1B-Chat-v1.0").
-            OUTPUT_DIR_SUFFIX - Root dir suffix for all output files ("TinyLlama_h100"). The output dir path will be
-                                {LUSTRE_USER_DIR}/cuda_graph_testing_logs_{OUTPUT_DIR_SUFFIX}.
+            STORAGE_DIR       - Personal storage directory for storing the downloaded LLM model, generated
+                                dataset and output files.
+            MODEL_NAME        - LLM Model name from HuggingFace (e.g. "TinyLlama/TinyLlama-1.1B-Chat-v1.0").
+                                Ensure the model is already downloaded as {STORAGE_DIR}/hf_models/{MODEL_NAME}.
+
+            OUTPUT_DIR_SUFFIX - Root dir suffix for all output files (e.g. "TinyLlama_h100"). The output dir
+                                path will be {STORAGE_DIR}/cuda_graph_testing_logs_{OUTPUT_DIR_SUFFIX}.
 
         Dataset generation:
             INPUT_LENGTH  (500)  - Fixed input sequence length (ISL) for generated dataset.
@@ -110,19 +111,32 @@ class CudaGraphBenchmark:
             GPU_ID           (0) - GPU index for nvidia-smi dmon monitoring.
             MONITOR_INTERVAL (1) - Sampling interval in seconds for nvidia-smi dmon.
         """
-        # self.model_path = os.environ.get(
-        #     "MODEL_PATH", f"{LUSTRE_USER_DIR}/llm-models/DeepSeek-V3-Lite/fp8"
-        # )
         # self.model_path = "/tmp/DeepSeek-V3-Lite/fp8"
         # self.model_name = "deepseek_v3_lite_fp8_hf"
 
-        # self.model_name = "deepseek-ai/DeepSeek-V3"
-        self.model_name = os.environ.get("MODEL_NAME", "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+        self.model_name = os.environ["MODEL_NAME"]
+        self.storage_dir = Path(os.environ["STORAGE_DIR"])
+        self.model_path = self.storage_dir / f"hf_models/{self.model_name}"
+        output_dir_suffix = os.environ["OUTPUT_DIR_SUFFIX"]
+        self.trtllm_code_path = self.storage_dir / "dev/TensorRT-LLM"
 
-        # Specify the output directory for different experiments, e.g. _b200, _gb200
-        output_dir_suffix = os.environ.get("OUTPUT_DIR_SUFFIX", "TinyLlama_h100")
-        self.output_dir = Path(f"{LUSTRE_USER_DIR}/cuda_graph_testing_logs_{output_dir_suffix}")
-        self.trtllm_code_path = "/home/yijingl/dev/TensorRT-LLM"
+        if not self.storage_dir.exists():
+            raise ValueError(
+                f"Storage directory {self.storage_dir} does not exist! Create it first."
+            )
+        if not self.model_path.exists():
+            raise ValueError(
+                f"Model path {self.model_path} does not exist! Download the model first."
+            )
+        if not self.trtllm_code_path.exists():
+            raise ValueError(f"TensorRT-LLM code path {self.trtllm_code_path} does not exist!")
+
+        self.output_dir = self.storage_dir / f"cuda_graph_testing_logs_{output_dir_suffix}"
+
+        print(f"Personal storage directory: {self.storage_dir}")
+        print(f"Model path: {self.model_path}")
+        print(f"TensorRT-LLM code path: {self.trtllm_code_path}")
+        print(f"Output directory: {self.output_dir}")
 
         self.benching_batch_sizes = FULL_BENCHING_BATCH_SIZES
         # self.benching_batch_sizes = [1, 2, 3, 4, 5, 6, 7, 8]
@@ -266,11 +280,11 @@ class CudaGraphBenchmark:
 
             cmd = [
                 "python3",
-                self.trtllm_code_path + "/benchmarks/cpp/prepare_dataset.py",
+                str(self.trtllm_code_path) + "/benchmarks/cpp/prepare_dataset.py",
                 "--stdout",
                 "--tokenizer",
-                self.model_name,
-                # str(self.model_path),
+                # self.model_name,
+                str(self.model_path),
                 "token-norm-dist",
                 "--num-requests",
                 str(self.num_requests_in_dataset),
@@ -283,6 +297,7 @@ class CudaGraphBenchmark:
                 "--output-stdev",
                 "0",
             ]
+            print(f"Executing command: {' '.join(cmd)}")
 
             with open(dataset_path, "w") as f:
                 result = subprocess.run(cmd, stdout=f, stderr=subprocess.PIPE, text=True)
@@ -378,7 +393,7 @@ class CudaGraphBenchmark:
         cmd = [
             "trtllm-bench",
             f"--model={self.model_name}",
-            # f"--model_path={self.model_path}",
+            f"--model_path={self.model_path}",
             "throughput",
             f"--dataset={dataset_path}",
             "--backend=pytorch",
