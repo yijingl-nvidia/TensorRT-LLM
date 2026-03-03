@@ -388,9 +388,9 @@ class CudaGraphBenchmark:
         dataset_path: Path,
         trial: Optional[int] = None,
     ) -> bool:
-        f"""
-        Run a single trtllm-bench throughput test with GPU monitoring; return True if trtllm-bench
-        finishes successfully.
+        """Run a single trtllm-bench throughput test with GPU monitoring.
+
+        Returns True if trtllm-bench finishes successfully, False otherwise.
 
         Output files created per run:
             {self.output_dir}/logs/benchmark_{config_name}_bs{batch_size}.log
@@ -509,8 +509,7 @@ class CudaGraphBenchmark:
         self.logger.info(f"Results available in: {self.output_dir}")
 
     def run(self):
-        f"""
-        Execute the full benchmark sweep: setup, dataset generation, and all config x batch_size runs.
+        """Execute the full benchmark sweep: setup, dataset generation, and all config x batch_size runs.
 
         Steps:
             1. Create output directory structure under {self.output_dir}/.
