@@ -13,8 +13,9 @@ import os
 import re
 import sys
 
-DEFAULT_DATA_DIR = (
-    "/lustre/fsw/coreai_comparch_trtllm/yijingl/cuda_graph_testing_logs_TinyLlama_h100/reports"
+DEFAULT_DATA_DIR = os.environ.get("STORAGE_DIR", "") + (
+    # "/cuda_graph_testing_logs_TinyLlama_h100/reports"
+    "/cuda_graph_testing_logs_DSR1NVFP4_gb200/reports"
 )
 
 CONFIGS = ["no_padding", "default_padding", "padding_slide_64"]

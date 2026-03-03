@@ -110,6 +110,11 @@ class CudaGraphBenchmark:
         GPU monitoring:
             GPU_ID           (0) - GPU index for nvidia-smi dmon monitoring.
             MONITOR_INTERVAL (1) - Sampling interval in seconds for nvidia-smi dmon.
+
+        Benchmark mode:
+            MODE (sweep) - "sweep" (default) sweeps batch sizes; "variance" repeats a fixed concurrency N times.
+            VARIANCE_CONCURRENCY (512) - Concurrency for variance mode.
+            NUM_VARIANCE_TRIALS (10) - Number of trials for variance mode.
         """
         # self.model_path = "/tmp/DeepSeek-V3-Lite/fp8"
         # self.model_name = "deepseek_v3_lite_fp8_hf"
@@ -158,6 +163,13 @@ class CudaGraphBenchmark:
         self.monitor_interval = int(os.environ.get("MONITOR_INTERVAL", 1))
         self.monitor_process: Optional[subprocess.Popen] = None
 
+        # Mode: "sweep" (default) sweeps batch sizes; "variance" repeats a fixed concurrency N times.
+        self.mode = os.environ.get("MODE", "sweep")
+        if self.mode not in ["sweep", "variance"]:
+            raise ValueError(f"Invalid mode: {self.mode}, must be 'sweep' or 'variance'")
+        self.variance_concurrency = int(os.environ.get("VARIANCE_CONCURRENCY", 512))
+        self.num_variance_trials = int(os.environ.get("NUM_VARIANCE_TRIALS", 10))
+
         self.setup_logging()
 
         # SIGINT (Ctrl+C)
@@ -200,17 +212,27 @@ class CudaGraphBenchmark:
         for directory in directories:
             (self.output_dir / directory).mkdir(parents=True, exist_ok=True)
 
-    def _done_flag_path(self, config_name: str, batch_size: int) -> Path:
-        """Return the path to the done-flag file for a given config and batch size."""
-        return self.output_dir / "done_flags" / f"done_{config_name}_bs{batch_size}"
+    def _done_flag_path(
+        self, config_name: str, batch_size: int, trial: Optional[int] = None
+    ) -> Path:
+        """Return the path to the done-flag file for a given config, batch size, and optional trial."""
+        name = f"done_{config_name}_bs{batch_size}"
+        if trial is not None:
+            name += f"_trial{trial:02d}"
+        return self.output_dir / "done_flags" / name
 
-    def is_run_completed(self, config_name: str, batch_size: int) -> bool:
-        """Check whether a previous run for this config/batch_size finished successfully."""
-        return self._done_flag_path(config_name, batch_size).exists()
+    def is_run_completed(
+        self, config_name: str, batch_size: int, trial: Optional[int] = None
+    ) -> bool:
+        """Check whether a previous run for this config/batch_size (and optional trial) finished successfully."""
+        return self._done_flag_path(config_name, batch_size, trial).exists()
 
     def create_cuda_graph_configs(self):
         """Write YAML configs for padding-enabled, padding-disabled, and slide-64 CUDA graph modes."""
         self.logger.info("Creating CUDA graph configuration files...")
+
+        # in TRTLLM the batch sizes for CUDA graphs are set in
+        # tensorrt_llm/llmapi/llm_args.py:validate_cuda_graph_config()
 
         # Config 1: Default padding enabled
         config_default = {
@@ -220,7 +242,7 @@ class CudaGraphBenchmark:
                 "max_batch_size": self.max_batch_size,
                 # Default batch sizes with padding:
                 # [1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120, 128]
-                # > 128 it will add powers of 2 up to max_batch_size, e.g., (128, 256, 512, 1024, 2048)
+                # > 128 it will add powers of 2 up to max_batch_size, e.g., (256, 512, 1024, 2048, ... max_batch_size)
             },
             "kv_cache_config": {"dtype": "auto", "free_gpu_memory_fraction": 0.9},
             "enable_chunked_prefill": True,
@@ -238,7 +260,7 @@ class CudaGraphBenchmark:
                 # Default batch sizes without padding:
                 # [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
                 #  28, 29, 30, 31, 32, 64, 128]
-                # > 128 it will add powers of 2 up to max_batch_size, e.g., (128, 256, 512, 1024, 2048)
+                # > 128 it will add powers of 2 up to max_batch_size, e.g., (256, 512, 1024, 2048, ... max_batch_size)
             },
             "kv_cache_config": {"dtype": "auto", "free_gpu_memory_fraction": 0.9},
             "enable_chunked_prefill": True,
@@ -318,11 +340,12 @@ class CudaGraphBenchmark:
 
         return dataset_path
 
-    def start_gpu_monitoring(self, config_name: str, batch_size: int):
+    def start_gpu_monitoring(self, config_name: str, batch_size: int, trial: Optional[int] = None):
         """Launch nvidia-smi dmon in the background to log GPU utilization and memory."""
-        gpu_log_path = (
-            self.output_dir / "gpu_logs" / f"gpu_monitor_{config_name}_bs{batch_size}.log"
-        )
+        tag = f"{config_name}_bs{batch_size}"
+        if trial is not None:
+            tag += f"_trial{trial:02d}"
+        gpu_log_path = self.output_dir / "gpu_logs" / f"gpu_monitor_{tag}.log"
 
         self.logger.info(f"Starting GPU monitoring for {config_name}, batch size {batch_size}")
         self.logger.info(f"GPU log: {gpu_log_path}")
@@ -358,7 +381,12 @@ class CudaGraphBenchmark:
             self.monitor_process = None
 
     def run_benchmark(
-        self, config_name: str, config_path: Path, batch_size: int, dataset_path: Path
+        self,
+        config_name: str,
+        config_path: Path,
+        batch_size: int,
+        dataset_path: Path,
+        trial: Optional[int] = None,
     ) -> bool:
         f"""
         Run a single trtllm-bench throughput test with GPU monitoring; return True if trtllm-bench
@@ -374,8 +402,11 @@ class CudaGraphBenchmark:
             {self.output_dir}/gpu_logs/gpu_monitor_{config_name}_bs{batch_size}.log
             - nvidia-smi dmon output (GPU utilization & memory usage over time).
         """
-        benchmark_log = self.output_dir / "logs" / f"benchmark_{config_name}_bs{batch_size}.log"
-        report_json = self.output_dir / "reports" / f"report_{config_name}_bs{batch_size}.json"
+        tag = f"{config_name}_bs{batch_size}"
+        if trial is not None:
+            tag += f"_trial{trial:02d}"
+        benchmark_log = self.output_dir / "logs" / f"benchmark_{tag}.log"
+        report_json = self.output_dir / "reports" / f"report_{tag}.json"
 
         self.logger.info(f"Running benchmark: {config_name}, batch size: {batch_size}")
         self.logger.info(f"Config: {config_path}")
@@ -383,14 +414,16 @@ class CudaGraphBenchmark:
         self.logger.info(f"Benchmark log: {benchmark_log}")
         self.logger.info(f"Report: {report_json}")
 
-        self.start_gpu_monitoring(config_name, batch_size)
+        self.start_gpu_monitoring(config_name, batch_size, trial)
 
         # Build benchmark command
-        iteration_log = self.output_dir / "logs" / f"iteration_{config_name}_bs{batch_size}.log"
+        iteration_log = self.output_dir / "logs" / f"iteration_{tag}.log"
         # when batch_size is small (e.g. 1), limit the number of total requests in benchmarking to be at most
         # batch_size * 32.
         runtime_total_requests = min(self.num_requests_in_dataset, batch_size * 32)
-        cmd = [
+        cmd = ["mpirun", "-n", "1", "--oversubscribe", "--allow-run-as-root"]
+        cmd += [
+            # "trtllm-llmapi-launch",
             "trtllm-bench",
             f"--model={self.model_name}",
             f"--model_path={self.model_path}",
@@ -422,7 +455,7 @@ class CudaGraphBenchmark:
                 self.logger.info(
                     f"Benchmark completed successfully for {config_name}, batch size {batch_size}"
                 )
-                self._done_flag_path(config_name, batch_size).touch()
+                self._done_flag_path(config_name, batch_size, trial).touch()
                 success = True
             else:
                 self.logger.error(
@@ -438,6 +471,42 @@ class CudaGraphBenchmark:
             time.sleep(5)
 
         return success
+
+    def run_variance(self, configs: dict, dataset_path: Path):
+        """Run the variance mode: repeat a fixed concurrency NUM_VARIANCE_TRIALS times per config."""
+        self.logger.info(
+            f"Variance mode: concurrency={self.variance_concurrency}, trials={self.num_variance_trials}"
+        )
+        total_tests = len(configs) * self.num_variance_trials
+        current_test = 0
+
+        for config_name, config_path in configs.items():
+            self.logger.info(f"Testing configuration: {config_name}")
+
+            for trial in range(1, self.num_variance_trials + 1):
+                current_test += 1
+
+                if self.is_run_completed(config_name, self.variance_concurrency, trial):
+                    self.logger.info(
+                        f"Progress: {current_test}/{total_tests} - "
+                        f"Skipping {config_name} trial {trial:02d} (already completed)"
+                    )
+                    continue
+
+                self.logger.info(
+                    f"Progress: {current_test}/{total_tests} - "
+                    f"{config_name} trial {trial:02d}/{self.num_variance_trials}"
+                )
+
+                if self.run_benchmark(
+                    config_name, config_path, self.variance_concurrency, dataset_path, trial
+                ):
+                    self.logger.info(f"✓ Completed: {config_name}, trial {trial:02d}")
+                else:
+                    self.logger.error(f"✗ Failed: {config_name}, trial {trial:02d}")
+
+        self.logger.info("Variance analysis completed!")
+        self.logger.info(f"Results available in: {self.output_dir}")
 
     def run(self):
         f"""
@@ -469,6 +538,7 @@ class CudaGraphBenchmark:
                                                           (enables resume).
         """
         self.logger.info("Starting CUDA Graph Padding Analysis")
+        self.logger.info(f"Mode: {self.mode}")
         self.logger.info(f"Output directory: {self.output_dir}")
 
         try:
@@ -481,6 +551,10 @@ class CudaGraphBenchmark:
                 "no_padding": self.output_dir / "configs" / "padding_disabled.yaml",
                 "padding_slide_64": self.output_dir / "configs" / "padding_slide_64.yaml",
             }
+
+            if self.mode == "variance":
+                self.run_variance(configs, dataset_path)
+                return
 
             total_tests = len(configs) * len(self.benching_batch_sizes)
             current_test = 0
