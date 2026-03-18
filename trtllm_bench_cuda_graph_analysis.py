@@ -90,6 +90,8 @@ class CudaGraphBenchmark:
                                 dataset and output files.
             MODEL_NAME        - LLM Model name from HuggingFace (e.g. "TinyLlama/TinyLlama-1.1B-Chat-v1.0").
                                 Ensure the model is already downloaded as {STORAGE_DIR}/hf_models/{MODEL_NAME}.
+            MODEL_PATH        - (optional) Explicit path to the model directory. If set, overrides the default
+                                {STORAGE_DIR}/hf_models/{MODEL_NAME}.
 
             OUTPUT_DIR_SUFFIX - Root dir suffix for all output files (e.g. "TinyLlama_h100"). The output dir
                                 path will be {STORAGE_DIR}/cuda_graph_testing_logs_{OUTPUT_DIR_SUFFIX}.
@@ -121,7 +123,11 @@ class CudaGraphBenchmark:
 
         self.model_name = os.environ["MODEL_NAME"]
         self.storage_dir = Path(os.environ["STORAGE_DIR"])
-        self.model_path = self.storage_dir / f"hf_models/{self.model_name}"
+        model_path_override = os.environ.get("MODEL_PATH")
+        if model_path_override:
+            self.model_path = Path(model_path_override)
+        else:
+            self.model_path = self.storage_dir / f"hf_models/{self.model_name}"
         output_dir_suffix = os.environ["OUTPUT_DIR_SUFFIX"]
         self.trtllm_code_path = self.storage_dir / "dev/TensorRT-LLM"
 
