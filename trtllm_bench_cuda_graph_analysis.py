@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import argparse
 import logging
 import os
 import signal
@@ -88,9 +89,10 @@ class CudaGraphBenchmark:
         Model & paths:
             STORAGE_DIR       - Personal storage directory for storing the downloaded LLM model, generated
                                 dataset and output files.
-            MODEL_NAME        - LLM Model name from HuggingFace (e.g. "TinyLlama/TinyLlama-1.1B-Chat-v1.0").
-                                Ensure the model is already downloaded as {STORAGE_DIR}/hf_models/{MODEL_NAME}.
-            MODEL_PATH        - (optional) Explicit path to the model directory. If set, overrides the default
+            MODEL_NAME        - (required) HuggingFace model name (e.g. "TinyLlama/TinyLlama-1.1B-Chat-v1.0").
+                                Used as the model identifier passed to trtllm-bench and to derive the default
+                                model path {STORAGE_DIR}/hf_models/{MODEL_NAME}.
+            MODEL_PATH        - (optional) Explicit path to the model directory. If omitted, defaults to
                                 {STORAGE_DIR}/hf_models/{MODEL_NAME}.
 
             OUTPUT_DIR_SUFFIX - Root dir suffix for all output files (e.g. "TinyLlama_h100"). The output dir
@@ -300,7 +302,7 @@ class CudaGraphBenchmark:
             self.output_dir
             / f"dataset_{self.input_length}_{self.output_length}_{self.num_requests_in_dataset}.txt"
         )
-        if not dataset_path.exists():
+        if not dataset_path.exists() or dataset_path.stat().st_size == 0:
             self.logger.info(
                 f"Generating dataset: ISL={self.input_length}, OSL={self.output_length}, "
                 f"requests={self.num_requests_in_dataset}"
@@ -313,6 +315,7 @@ class CudaGraphBenchmark:
                 "--tokenizer",
                 # self.model_name,
                 str(self.model_path),
+                "--trust-remote-code",
                 "token-norm-dist",
                 "--num-requests",
                 str(self.num_requests_in_dataset),
@@ -600,6 +603,53 @@ class CudaGraphBenchmark:
 
 def main():
     """Entry point: instantiate CudaGraphBenchmark and run the full analysis."""
+    parser = argparse.ArgumentParser(
+        description="CUDA graph padding benchmark and analysis tool.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Environment variables (can also be set via these flags):
+  MODEL_NAME          HuggingFace model name, e.g. "TinyLlama/TinyLlama-1.1B-Chat-v1.0" (required)
+  STORAGE_DIR         Root storage directory (required)
+  MODEL_PATH          Explicit model directory path; defaults to $STORAGE_DIR/hf_models/$MODEL_NAME (optional)
+  OUTPUT_DIR_SUFFIX   Suffix appended to the output directory name (required)
+  NUM_GPUS            Number of GPUs (default: 1)
+  GPU_MEMORY_FRAC     GPU memory fraction (default: 0.95)
+  MAX_BATCH_SIZE      Maximum batch size (default: 2048)
+  MAX_NUM_TOKENS      Maximum number of tokens (default: 8192)
+  ISL                 Input sequence length (default: 128)
+  OSL                 Output sequence length (default: 128)
+  CUDA_GRAPHS         Enable CUDA graphs: "1"/"true" (default: true)
+  MODE                Benchmark mode: "sweep" or "variance" (default: sweep)
+  VARIANCE_CONCURRENCY  Concurrency for variance mode (default: 512)
+  NUM_VARIANCE_TRIALS   Number of trials for variance mode (default: 10)
+        """,
+    )
+    parser.add_argument(
+        "--model-name", metavar="NAME", help="HuggingFace model name, required (sets MODEL_NAME)"
+    )
+    parser.add_argument("--storage-dir", metavar="DIR", help="Storage directory (sets STORAGE_DIR)")
+    parser.add_argument(
+        "--model-path", metavar="PATH", help="Override model path (sets MODEL_PATH)"
+    )
+    parser.add_argument(
+        "--output-dir-suffix",
+        metavar="SUFFIX",
+        help="Output directory suffix (sets OUTPUT_DIR_SUFFIX)",
+    )
+    args = parser.parse_args()
+
+    # Allow CLI args to set env vars so __init__ picks them up.
+    # Note: os.environ changes only affect this process and its children —
+    # they do NOT persist in the parent shell after the script exits.
+    if args.model_name:
+        os.environ["MODEL_NAME"] = args.model_name
+    if args.storage_dir:
+        os.environ["STORAGE_DIR"] = args.storage_dir
+    if args.model_path:
+        os.environ["MODEL_PATH"] = args.model_path
+    if args.output_dir_suffix:
+        os.environ["OUTPUT_DIR_SUFFIX"] = args.output_dir_suffix
+
     benchmark = CudaGraphBenchmark()
     benchmark.run()
 
