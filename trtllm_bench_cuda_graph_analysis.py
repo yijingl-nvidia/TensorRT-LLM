@@ -389,6 +389,30 @@ class CudaGraphBenchmark:
                 self.monitor_process.wait()
             self.monitor_process = None
 
+    def log_gpu_memory(self, label: str):
+        """Log current GPU memory usage (used/free/total) for all GPUs via nvidia-smi."""
+        try:
+            result = subprocess.run(
+                [
+                    "nvidia-smi",
+                    "--query-gpu=index,memory.used,memory.free,memory.total",
+                    "--format=csv,noheader,nounits",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode == 0:
+                self.logger.info(f"[GPU memory] {label}:")
+                for line in result.stdout.strip().splitlines():
+                    idx, used, free, total = [x.strip() for x in line.split(",")]
+                    self.logger.info(
+                        f"  GPU {idx}: used={used} MiB, free={free} MiB, total={total} MiB"
+                    )
+            else:
+                self.logger.warning(f"[GPU memory] nvidia-smi failed: {result.stderr.strip()}")
+        except Exception as e:
+            self.logger.warning(f"[GPU memory] Could not query nvidia-smi: {e}")
+
     def run_benchmark(
         self,
         config_name: str,
@@ -457,8 +481,10 @@ class CudaGraphBenchmark:
         self.logger.info(f"Executing: {' '.join(cmd)}")
 
         try:
+            self.log_gpu_memory(f"before trtllm-bench {config_name} bs{batch_size}")
             with open(benchmark_log, "w") as f:
                 result = subprocess.run(cmd, stdout=f, stderr=subprocess.STDOUT, text=True)
+            self.log_gpu_memory(f"after trtllm-bench {config_name} bs{batch_size}")
 
             if result.returncode == 0:
                 self.logger.info(

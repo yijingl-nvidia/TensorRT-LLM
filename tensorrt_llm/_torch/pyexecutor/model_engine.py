@@ -921,6 +921,9 @@ class PyTorchModelEngine(ModelEngine):
         graphs_to_capture = self._get_graphs_to_capture(cuda_graph_batch_sizes,
                                                         spec_resource_manager)
         graphs_to_capture = sorted(graphs_to_capture, reverse=True)
+        logger.info(
+            f"[CUDA graph capture] planning to capture {len(graphs_to_capture)} graphs "
+            f"(batch_sizes={[bs for bs, _ in graphs_to_capture]})")
         # Create CUDA graphs for short and long sequences separately for sparse attention.
         # self.max_seq_len is the global max sequence length. For Helix CP each
         # rank only holds max_seq_len / cp_size tokens, so scale accordingly to
@@ -945,6 +948,21 @@ class PyTorchModelEngine(ModelEngine):
         else:
             max_seq_len_list = [effective_max_seq_len]
 
+        # DEBUG: log GPU memory before CUDA graph capture
+        torch.cuda.synchronize()
+        for device_idx in range(torch.cuda.device_count()):
+            reserved = torch.cuda.memory_reserved(device_idx) // (1024**2)
+            allocated = torch.cuda.memory_allocated(device_idx) // (1024**2)
+            _free, _total = torch.cuda.mem_get_info(device_idx)
+            driver_used = (_total - _free) // (1024**2)
+            non_pytorch = driver_used - reserved
+            logger.info(
+                f"[GPU memory before CUDA graph capture] device={device_idx}: "
+                f"allocated={allocated} MiB, reserved={reserved} MiB, "
+                f"driver_used={driver_used} MiB, non_pytorch_overhead={non_pytorch} MiB"
+            )
+
+        _graphs_created = 0
         for bs, draft_len in graphs_to_capture:
             if bs > self.batch_size:
                 continue
@@ -960,6 +978,12 @@ class PyTorchModelEngine(ModelEngine):
                     logger.info(
                         f"Run generation-only CUDA graph warmup for batch size={bs}, draft_len={draft_len}, max_seq_len={max_seq_len}"
                     )
+                    # DEBUG: log GPU memory before each individual graph capture
+                    torch.cuda.synchronize()
+                    _pre_alloc = torch.cuda.memory_allocated(0) // (1024**2)
+                    _pre_res = torch.cuda.memory_reserved(0) // (1024**2)
+                    _pre_free, _total = torch.cuda.mem_get_info(0)
+                    _pre_driver = (_total - _pre_free) // (1024**2)
                     self.enable_spec_decode = draft_len > 0 or self.is_draft_model or (
                         self.spec_config is not None
                         and self.spec_config.spec_dec_mode.use_one_engine())
@@ -970,8 +994,37 @@ class PyTorchModelEngine(ModelEngine):
                                  new_tensors_device=None,
                                  resource_manager=resource_manager)
                     torch.cuda.synchronize()
+                    # DEBUG: log GPU memory after each individual graph capture
+                    _post_alloc = torch.cuda.memory_allocated(0) // (1024**2)
+                    _post_res = torch.cuda.memory_reserved(0) // (1024**2)
+                    _post_free, _ = torch.cuda.mem_get_info(0)
+                    _post_driver = (_total - _post_free) // (1024**2)
+                    _graphs_created += 1
+                    logger.info(
+                        f"[per-graph memory] graph #{_graphs_created} bs={bs} draft_len={draft_len}: "
+                        f"allocated {_pre_alloc}->{_post_alloc} MiB (delta={_post_alloc - _pre_alloc:+d} MiB), "
+                        f"reserved {_pre_res}->{_post_res} MiB (delta={_post_res - _pre_res:+d} MiB), "
+                        f"driver_used {_pre_driver}->{_post_driver} MiB (delta={_post_driver - _pre_driver:+d} MiB, "
+                        f"non_pytorch_overhead={_post_driver - _post_res:+d} MiB)"
+                    )
+        logger.info(
+            f"[CUDA graph capture] actually created {_graphs_created} graphs")
         # Set the value back to the original value after cuda graph warmups are complete
         self.enable_spec_decode = self.is_spec_decode
+
+        # DEBUG: log GPU memory after CUDA graph capture
+        torch.cuda.synchronize()
+        for device_idx in range(torch.cuda.device_count()):
+            reserved = torch.cuda.memory_reserved(device_idx) // (1024**2)
+            allocated = torch.cuda.memory_allocated(device_idx) // (1024**2)
+            _free, _total = torch.cuda.mem_get_info(device_idx)
+            driver_used = (_total - _free) // (1024**2)
+            non_pytorch = driver_used - reserved
+            logger.info(
+                f"[GPU memory after CUDA graph capture] device={device_idx}: "
+                f"allocated={allocated} MiB, reserved={reserved} MiB, "
+                f"driver_used={driver_used} MiB, non_pytorch_overhead={non_pytorch} MiB"
+            )
 
     def _capture_piecewise_cuda_graphs(self, resource_manager: ResourceManager):
         """Captures piecewise CUDA graphs for context/prefill steps via torch.compile."""
