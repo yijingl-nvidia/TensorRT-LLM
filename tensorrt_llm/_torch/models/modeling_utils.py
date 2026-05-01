@@ -1,3 +1,19 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Utilities for the PyTorch-backend model creation."""
+
 import contextlib
 import inspect
 import math
@@ -652,15 +668,41 @@ class DecoderModelForCausalLM(nn.Module,
         return inferred_max_seq_len
 
 
+# ---------------------------------------------------------------------------
+# Architecture-name registries for the PyTorch backend's model auto-dispatch.
+# ---------------------------------------------------------------------------
+
+# arch_name (str, from HF config.json "architectures"[0]) -> nn.Module subclass
 MODEL_CLASS_MAPPING = {}
+# arch_name (str, from HF config.json "architectures"[0]) -> (vision_encoder_cls,
+# vlm_base_model_cls)
 MODEL_CLASS_VISION_ENCODER_MAPPING = {}
+
 MODEL_CLASS_MAPPER_MAPPING = {}
+
 MODEL_CLASS_CHECKPOINT_WEIGHT_LOADER_DEFAULT_MAPPING = {}
+
 MODEL_CLASS_CONFIG_LOADER_DEFAULT_MAPPING = {}
+
 CHECKPOINT_LOADER_FORMAT_DEFAULT_MAPPING = {}
 
 
 def register_auto_model(name: str):
+    """Decorator: register a model class under ``name`` in ``MODEL_CLASS_MAPPING``.
+
+    ``name`` must match the string the model's HF ``config.json`` puts in
+    ``architectures[0]`` (e.g. ``"LlamaForCausalLM"``, ``"Glm4MoeForCausalLM"``);
+    that is the key ``AutoModelForCausalLM._resolve_class`` will look up at load
+    time. Registration happens when Python evaluates the decorator -- which only
+    occurs once the module is imported, so any new ``modeling_*.py`` must also
+    be added to ``tensorrt_llm/_torch/models/__init__.py``.
+
+    Usage::
+
+        @register_auto_model("MyModelForCausalLM")
+        class MyModelForCausalLM(DecoderModelForCausalLM[...]):
+            ...
+    """
 
     def decorator(cls):
         MODEL_CLASS_MAPPING[name] = cls
@@ -675,13 +717,16 @@ def register_vision_encoder(
 ):
     """Decorator to register a vision encoder implementation for a pre-registered model architecture.
 
+    Resolves the target arch by matching the decorated class's ``__name__``
+    against entries already in ``MODEL_CLASS_MAPPING``, so the inner
+    ``@register_auto_model`` must be evaluated first -- decorators apply
+    bottom-up, so ``@register_auto_model`` goes *below* this decorator.
+
     Usage:
         @register_vision_encoder(MyVisionEncoder, MyVLMBaseModel)
         @register_auto_model("SomeVLModel")
         class SomeVLModel(...):
             ...
-    The register_auto_model decorator must be applied (executed) before this one (i.e., placed lower)
-    so that the architecture name is present in MODEL_CLASS_MAPPING.
     """
 
     def wrapper(model_cls: Type[nn.Module]) -> Type[nn.Module]:
