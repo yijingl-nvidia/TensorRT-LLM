@@ -738,7 +738,10 @@ class ExternalCommMoEScheduler(MoEScheduler):
             if workspace is not None:
                 kwargs["workspace"] = workspace
 
-        elif moe.backend.__class__ == TRTLLMGenFusedMoE:
+        elif isinstance(moe.backend, TRTLLMGenFusedMoE):
+            # isinstance() instead of __class__ == so subclasses (e.g.,
+            # Glm5SmallBatchFusedMoE for the GLM-5 small-batch path) inherit
+            # the right backend-kwargs treatment.
             # When the scheduler precomputes top-k for DP/load-balancer paths,
             # the backend must not route again.  Single-rank TRTLLMGen paths do
             # not get precomputed top-k, so they still need router_logits.

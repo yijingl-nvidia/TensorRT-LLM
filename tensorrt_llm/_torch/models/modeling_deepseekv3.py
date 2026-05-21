@@ -850,7 +850,13 @@ class DeepseekV3Gate(nn.Module):
                                                dtype=dtype),
                                    requires_grad=False)
         self.moe_backend = moe_backend
-        if moe_backend == 'TRTLLM':
+        # GLM5_SMALL_BATCH uses v68 which hard-requires bf16 bias (TORCH_CHECK
+        # at mega_kernel_v68.cu:1179). MTP draft layers route through the
+        # vanilla parent backend on the same DeepseekV3Gate instance — to keep
+        # the verifier (v68) and the draft (parent) producing the SAME top-K
+        # decisions (else AL collapses to 1.0), we store bias as bf16 here so
+        # both paths see identical bias precision.
+        if moe_backend in ('TRTLLM', 'GLM5_SMALL_BATCH'):
             bias_dtype = torch.bfloat16
         else:
             bias_dtype = torch.float32
@@ -1760,13 +1766,77 @@ class DeepseekV3Model(DecoderModel):
             dtype=config.torch_dtype,
         )
 
-        self.layers = nn.ModuleList([
-            DeepseekV3DecoderLayer(model_config,
-                                   layer_idx,
-                                   self.aux_stream_dict,
-                                   mapping_with_cp=mapping_with_cp)
-            for layer_idx in range(config.num_hidden_layers)
-        ])
+        # If enable_glm5_small_batch_fused is True, swap to the fused-kernel
+        # decoder layer. Per-kernel feature flags inside Glm5SmallBatchDecoderLayer
+        # then enable each fused kernel independently (default: all off, behaviour
+        # bit-identical to baseline). Lazy import mirrors modeling_llama.py:972.
+        # NOTE: this gate triggers for the GLM-5 path (HF arch `GlmMoeDsaForCausalLM`,
+        # which registers here per modeling_deepseekv3.py:1810). The flag should
+        # only be set in configs for GLM-5; doing so for vanilla DeepseekV3 has
+        # no benefit since the fused kernels are GLM-5-specific.
+        DecoderLayerClass = DeepseekV3DecoderLayer
+        # [iter-13] GLM5_PARENT_LAYERS=N — per-layer ablation diagnostic.
+        # When set (N >= 0), the first N decoder layers use the parent
+        # DeepseekV3DecoderLayer (parent fp8_block_scale_moe backend) and
+        # the rest use Glm5SmallBatchDecoderLayer (v68/v110). This tests the
+        # hypothesis that v68/v110 per-layer noise compounds across 75 MoE
+        # layers into the L77 hidden-state explosion that breaks MTP draft
+        # acceptance. Smaller N = more perf retained.
+        #
+        # GLM-5 has first_k_dense_replace=3 (layers 0-2 are dense MLP, no MoE).
+        # GLM5_PARENT_LAYERS=N means: layers 0..N-1 -> parent, layers N..77 -> v68/v110.
+        # The dense layers 0-2 are unaffected (no MoE either way).
+        # Default (env unset): unchanged behavior — all MoE layers use v68/v110.
+        _per_layer_choice = None  # Optional[Callable[[int], type]]
+        if model_config.enable_glm5_small_batch_fused:
+            # REVERSE-SWAP diagnostic: GLM5_MAIN_USE_PARENT=1 forces the MAIN
+            # 75 MoE layers to use the parent DeepseekV3DecoderLayer (parent
+            # fp8_block_scale_moe backend) while leaving the MTP layer swap
+            # intact downstream. Used to test H1 — whether v68+v110 noise
+            # compounding over main layers is what kills AL.
+            import os as _os
+            _parent_layers_env = _os.environ.get("GLM5_PARENT_LAYERS", "")
+            if _os.environ.get("GLM5_MAIN_USE_PARENT", "0") == "1":
+                print(
+                    "[DeepseekV3Model] GLM5_MAIN_USE_PARENT=1 — main decoder "
+                    "layers using parent DeepseekV3DecoderLayer (reverse swap)",
+                    flush=True)
+            elif _parent_layers_env != "":
+                _parent_layers_n = int(_parent_layers_env)
+                from .modeling_glm_small_batch import Glm5SmallBatchDecoderLayer
+                # Layers [0, N) use parent; layers [N, num_hidden_layers) use
+                # Glm5SmallBatchDecoderLayer (v68/v110).
+                def _per_layer_choice(layer_idx, _n=_parent_layers_n):
+                    if layer_idx < _n:
+                        return DeepseekV3DecoderLayer
+                    return Glm5SmallBatchDecoderLayer
+                print(
+                    f"[DeepseekV3Model] GLM5_PARENT_LAYERS={_parent_layers_n} "
+                    f"— layers [0,{_parent_layers_n}) use parent "
+                    f"DeepseekV3DecoderLayer, layers "
+                    f"[{_parent_layers_n},{config.num_hidden_layers}) use "
+                    f"Glm5SmallBatchDecoderLayer (v68/v110)",
+                    flush=True)
+            else:
+                from .modeling_glm_small_batch import Glm5SmallBatchDecoderLayer
+                DecoderLayerClass = Glm5SmallBatchDecoderLayer
+
+        if _per_layer_choice is not None:
+            self.layers = nn.ModuleList([
+                _per_layer_choice(layer_idx)(model_config,
+                                              layer_idx,
+                                              self.aux_stream_dict,
+                                              mapping_with_cp=mapping_with_cp)
+                for layer_idx in range(config.num_hidden_layers)
+            ])
+        else:
+            self.layers = nn.ModuleList([
+                DecoderLayerClass(model_config,
+                                  layer_idx,
+                                  self.aux_stream_dict,
+                                  mapping_with_cp=mapping_with_cp)
+                for layer_idx in range(config.num_hidden_layers)
+            ])
         self.norm = RMSNorm(hidden_size=config.hidden_size,
                             eps=config.rms_norm_eps,
                             dtype=config.torch_dtype)
@@ -1791,6 +1861,89 @@ class DeepseekV3Model(DecoderModel):
         hidden_states = inputs_embeds
         residual = None
 
+        # ----------------------------------------------------------------
+        # GLM5_DUMP_LAYER_NORMS=1: dump per-layer hidden_state and residual
+        # norms once per process (rank 0, first call), to localize where
+        # the v68+v110 chain corrupts the hidden state. Compared against
+        # the same dump from a parent-main run to identify the layer at
+        # which divergence becomes catastrophic. See AL_DIAG_2026_05_20_iter3.md.
+        # ----------------------------------------------------------------
+        import os as _os
+        _dump_layer_norms = _os.environ.get("GLM5_DUMP_LAYER_NORMS", "0") == "1"
+        # GLM5_DUMP_LAYER_TENSORS=1: in addition to (or instead of) norms,
+        # save the full hidden_state and residual tensor at a specific layer
+        # to a `.pt` file on disk. Rank-0 only. Used for iter-14 N=77 vs
+        # N=78 element-wise hidden-state divergence diagnostic. See
+        # AL_DIAG_2026_05_21_iter14.md. Default off.
+        _dump_layer_tensors = _os.environ.get("GLM5_DUMP_LAYER_TENSORS",
+                                              "0") == "1"
+        # Accept either a single int (legacy) or comma-separated list of
+        # layer indices. e.g. "76,77" dumps the input AND output of L77.
+        _dump_tensor_layer_env = _os.environ.get(
+            "GLM5_DUMP_LAYER_TENSOR_LAYER", "77")
+        try:
+            _dump_tensor_layers = set(
+                int(s.strip()) for s in _dump_tensor_layer_env.split(",")
+                if s.strip())
+        except Exception:
+            _dump_tensor_layers = {77}
+        _dump_tensor_dir = _os.environ.get("GLM5_DUMP_TENSOR_DIR",
+                                            "/tmp/glm5_dump")
+        _emit_dump = False
+        _emit_tensor_dump = False
+        if _dump_layer_norms or _dump_layer_tensors:
+            if not hasattr(self, "_glm5_dumped_layer_norms"):
+                self._glm5_dumped_layer_norms = 0
+            _skip = int(_os.environ.get("GLM5_DUMP_LAYER_NORMS_SKIP", "5"))
+            _lim = int(_os.environ.get("GLM5_DUMP_LAYER_NORMS_LIMIT", "1"))
+            try:
+                import torch.distributed as _dist
+                _rank = _dist.get_rank() if _dist.is_initialized() else 0
+            except Exception:
+                _rank = 0
+            _in_window = (
+                self._glm5_dumped_layer_norms >= _skip
+                and self._glm5_dumped_layer_norms < (_skip + _lim))
+            _emit_dump = _dump_layer_norms and _rank == 0 and _in_window
+            _emit_tensor_dump = (_dump_layer_tensors and _rank == 0
+                                 and _in_window)
+        # Detect cuda graph capture state and avoid breaking it via CPU sync.
+        try:
+            _in_graph_capture = (
+                torch.cuda.is_current_stream_capturing()
+                if hasattr(torch.cuda, "is_current_stream_capturing")
+                else False)
+        except Exception:
+            _in_graph_capture = False
+        if _in_graph_capture:
+            _emit_dump = False
+            _emit_tensor_dump = False
+        if _emit_tensor_dump:
+            try:
+                _os.makedirs(_dump_tensor_dir, exist_ok=True)
+            except Exception as _ex:
+                print(
+                    f"[GLM5_DUMP_LAYER_TENSORS] mkdir {_dump_tensor_dir} "
+                    f"failed: {_ex}", flush=True)
+                _emit_tensor_dump = False
+        if _dump_layer_norms and _emit_dump:
+            try:
+                _hs0 = hidden_states.detach()
+                _norm = float(_hs0.to(torch.float32).norm().item())
+                _absmax = float(_hs0.to(torch.float32).abs().max().item())
+                _isnan = bool(torch.isnan(_hs0).any().item())
+                _isinf = bool(torch.isinf(_hs0).any().item())
+                print(
+                    f"[GLM5_DUMP_LAYER_NORMS call_count={self._glm5_dumped_layer_norms} "
+                    f"layer=pre rank=0] hs_norm={_norm:.6f} hs_absmax={_absmax:.6f} "
+                    f"shape={tuple(_hs0.shape)} dtype={_hs0.dtype} "
+                    f"nan={_isnan} inf={_isinf}", flush=True)
+            except Exception as _ex:
+                print(
+                    f"[GLM5_DUMP_LAYER_NORMS] preface dump failed: {_ex}",
+                    flush=True)
+                _emit_dump = False
+
         for idx, decoder_layer in enumerate(
                 self.layers[:self.num_hidden_layers]):
             hidden_states, residual = decoder_layer(
@@ -1800,6 +1953,63 @@ class DeepseekV3Model(DecoderModel):
                 residual=residual,
                 spec_metadata=spec_metadata,
             )
+            if _dump_layer_norms and _emit_dump:
+                try:
+                    _hs = hidden_states.detach()
+                    _hs_norm = float(_hs.to(torch.float32).norm().item())
+                    _hs_absmax = float(_hs.to(torch.float32).abs().max().item())
+                    _hs_isnan = bool(torch.isnan(_hs).any().item())
+                    _hs_isinf = bool(torch.isinf(_hs).any().item())
+                    if residual is None:
+                        _rs_norm = -1.0
+                        _rs_absmax = -1.0
+                        _rs_isnan = False
+                        _rs_isinf = False
+                    else:
+                        _rs = residual.detach()
+                        _rs_norm = float(_rs.to(torch.float32).norm().item())
+                        _rs_absmax = float(_rs.to(torch.float32).abs().max().item())
+                        _rs_isnan = bool(torch.isnan(_rs).any().item())
+                        _rs_isinf = bool(torch.isinf(_rs).any().item())
+                    print(
+                        f"[GLM5_DUMP_LAYER_NORMS call_count={self._glm5_dumped_layer_norms} "
+                        f"layer={idx} rank=0] hs_norm={_hs_norm:.6f} "
+                        f"hs_absmax={_hs_absmax:.6f} hs_nan={_hs_isnan} hs_inf={_hs_isinf} "
+                        f"rs_norm={_rs_norm:.6f} rs_absmax={_rs_absmax:.6f} "
+                        f"rs_nan={_rs_isnan} rs_inf={_rs_isinf}", flush=True)
+                except Exception as _ex:
+                    print(
+                        f"[GLM5_DUMP_LAYER_NORMS] layer={idx} dump failed: {_ex}",
+                        flush=True)
+                    _emit_dump = False
+            # Full-tensor dump for the targeted layer(s).
+            if _emit_tensor_dump and idx in _dump_tensor_layers:
+                try:
+                    _cc = self._glm5_dumped_layer_norms
+                    _hs_path = (
+                        f"{_dump_tensor_dir}/layer_{idx}_cc{_cc}_hs.pt")
+                    _rs_path = (
+                        f"{_dump_tensor_dir}/layer_{idx}_cc{_cc}_rs.pt")
+                    torch.save(
+                        hidden_states.detach().to(torch.float32).cpu(),
+                        _hs_path)
+                    if residual is not None:
+                        torch.save(
+                            residual.detach().to(torch.float32).cpu(),
+                            _rs_path)
+                    print(
+                        f"[GLM5_DUMP_LAYER_TENSORS call_count={_cc} "
+                        f"layer={idx} rank=0] saved hs="
+                        f"{_hs_path} (shape={tuple(hidden_states.shape)} "
+                        f"dtype={hidden_states.dtype}) rs="
+                        f"{_rs_path if residual is not None else 'None'}",
+                        flush=True)
+                except Exception as _ex:
+                    print(
+                        f"[GLM5_DUMP_LAYER_TENSORS] layer={idx} dump "
+                        f"failed: {_ex}", flush=True)
+        if _dump_layer_norms or _dump_layer_tensors:
+            self._glm5_dumped_layer_norms += 1
 
         hidden_states = maybe_allgather_for_helix_cp(hidden_states,
                                                      attn_metadata,
@@ -1881,6 +2091,57 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
                     self.model_config.quant_config.exclude_modules.extend(
                         extend_exclude_modules)
             self.model.layers.extend(self.draft_model.mtp_layers)
+
+            # When GLM5_SMALL_BATCH is active, the MAIN MoE layers use v68+v110
+            # (via the Glm5SmallBatchDecoderLayer class-swap in DeepseekV3Model.
+            # __init__). For MTP=3 spec decode to actually accept drafts, the
+            # MTP DRAFT layers must use the SAME numerical path — otherwise the
+            # verifier (v68+v110) and the draft (parent fp8_block_scale_moe)
+            # produce slightly different per-token outputs due to FP8 GEMM
+            # precision differences. Compounded over 77 main layers, that
+            # divergence flips top-1 predictions → AR=1.0.
+            #
+            # We apply the same swap to MTP layers here (after they're
+            # constructed) so both paths share the v68+v110 numerical profile.
+            if getattr(model_config, "enable_glm5_small_batch_fused", False):
+                from .modeling_glm_small_batch import (
+                    Glm5SmallBatchFusedMoE,
+                    Glm5SmallBatchMoE,
+                )
+                swapped = 0
+                for layer in self.draft_model.mtp_layers:
+                    if isinstance(getattr(layer, "mlp", None), Deepseekv3MoE):
+                        layer.mlp.__class__ = Glm5SmallBatchMoE
+                        backend = getattr(layer.mlp.experts, "backend",
+                                          layer.mlp.experts)
+                        if isinstance(backend, Glm5SmallBatchFusedMoE):
+                            object.__setattr__(backend,
+                                               "_shared_experts_ref",
+                                               layer.mlp.shared_experts)
+                            # Disable the outer post-MoE fused AR — ONLY if
+                            # v110 will fire (v110 has the AR fused inside).
+                            # If packed weights aren't loaded (which is the
+                            # case for MTP layers — load_weights repack is
+                            # skipped), the runtime falls through to parent
+                            # `super().run_moe()` and we MUST keep the outer
+                            # POST_MOE_FUSION at its default so the layer's
+                            # AR pipeline matches the main verifier layers.
+                            # Setting it to False here when v110 isn't
+                            # firing introduces a non-fused-vs-fused AR
+                            # asymmetry between verifier and draft layers
+                            # that costs ~30% MTP acceptance.
+                            # Note: at __init__ time the load_weights hook
+                            # hasn't yet run, so we can't check
+                            # _v68_w_gate_packed directly here. Defer the
+                            # decision to layer.fusion_config at first
+                            # forward — but since the swap fires here
+                            # before weights load, the safe default is to
+                            # LEAVE POST_MOE_FUSION alone. The Glm5SmallBatchMoE.forward
+                            # override handles both packed/unpacked cases.
+                            swapped += 1
+                print(f"[DeepseekV3ForCausalLM] MTP layer swap to "
+                      f"Glm5SmallBatchMoE: {swapped}/{len(self.draft_model.mtp_layers)}",
+                      flush=True)
 
         # Undo any manipulations done to mapping.
         if self.mapping_with_cp is not None:

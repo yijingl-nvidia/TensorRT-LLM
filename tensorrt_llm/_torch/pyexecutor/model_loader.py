@@ -521,6 +521,7 @@ class ModelLoader:
             trust_remote_code=True,
             mapping=self.mapping,
             enable_min_latency=self.llm_args.enable_min_latency,
+            enable_glm5_small_batch_fused=self.llm_args.enable_glm5_small_batch_fused,
             use_cuda_graph=self.llm_args.cuda_graph_config is not None,
             force_dynamic_quantization=self.llm_args.force_dynamic_quantization,
             spec_config=self.spec_config,

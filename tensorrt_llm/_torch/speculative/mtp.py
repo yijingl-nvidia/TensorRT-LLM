@@ -776,27 +776,50 @@ class MTPWorker(SpecWorkerBase):
         if self.spec_config.use_relaxed_acceptance_for_thinking:
             mtp_relaxed_delta_pool = spec_metadata.mtp_hidden_states_manager.mtp_relaxed_delta_pool
 
+            # GLM5_ALWAYS_RELAX=1: bypass the begin_thinking_phase_token gate
+            # that normally keeps the relaxed-acceptance delta at 0 for
+            # non-reasoning bench inputs. When set, force the entire delta
+            # pool to relaxed_delta on every call AND force every context
+            # slot's delta to relaxed_delta (independent of input content),
+            # so the relaxed top-K acceptance op runs with a non-zero
+            # threshold for every gen request. Added to test whether relaxed
+            # top-K acceptance can mask v68+v110 numerical drift over the
+            # main MoE chain (see AL_DIAG_2026_05_20_iter2.md for details).
+            import os as _os
+            _always_relax = _os.environ.get("GLM5_ALWAYS_RELAX", "0") == "1"
+            if _always_relax:
+                mtp_relaxed_delta_pool.fill_(float(self.spec_config.relaxed_delta))
+
             # context
             con_logits = logits[:num_contexts]
             con_target_tokens = torch.argmax(con_logits, dim=-1)
             accepted_tokens[:num_contexts, 0] = con_target_tokens[:num_contexts]
             last_tokens_idx = torch.cumsum(
                 attn_metadata.seq_lens_cuda, dim=0, dtype=torch.long) - 1
-            ctx_input_ids = input_ids[:attn_metadata.num_ctx_tokens]
-            ctx_is_think = (ctx_input_ids ==
-                            self.spec_config.begin_thinking_phase_token).int()
-            ctx_is_think_cumsum = torch.cumsum(ctx_is_think, dim=0)
-            ctx_last_cumsum = ctx_is_think_cumsum[
-                last_tokens_idx[:num_contexts]]
-            ctx_think_tokens_num = torch.diff(
-                ctx_last_cumsum,
-                dim=0,
-                prepend=torch.zeros(1,
-                                    dtype=torch.int,
-                                    device=ctx_last_cumsum.device))
+            if _always_relax:
+                # Set every context slot to relaxed_delta regardless of token content.
+                ctx_delta = torch.full(
+                    (num_contexts, ),
+                    float(self.spec_config.relaxed_delta),
+                    dtype=torch.float,
+                    device=last_tokens_idx.device,
+                )
+            else:
+                ctx_input_ids = input_ids[:attn_metadata.num_ctx_tokens]
+                ctx_is_think = (ctx_input_ids ==
+                                self.spec_config.begin_thinking_phase_token).int()
+                ctx_is_think_cumsum = torch.cumsum(ctx_is_think, dim=0)
+                ctx_last_cumsum = ctx_is_think_cumsum[
+                    last_tokens_idx[:num_contexts]]
+                ctx_think_tokens_num = torch.diff(
+                    ctx_last_cumsum,
+                    dim=0,
+                    prepend=torch.zeros(1,
+                                        dtype=torch.int,
+                                        device=ctx_last_cumsum.device))
 
-            ctx_delta = (ctx_think_tokens_num
-                         >= 1).int() * self.spec_config.relaxed_delta
+                ctx_delta = (ctx_think_tokens_num
+                             >= 1).int() * self.spec_config.relaxed_delta
             ctx_slot_ids = spec_metadata.slot_ids[:num_contexts]
             mtp_relaxed_delta_pool.index_copy_(0, ctx_slot_ids, ctx_delta)
 
@@ -805,6 +828,92 @@ class MTPWorker(SpecWorkerBase):
             topk_value, topk_indices, draft_tokens = self.topk_kernel(
                 gen_logprobs, num_gens, mtp_num_modules, spec_metadata)
 
+            # ----------------------------------------------------------------
+            # GLM5_DUMP_RELAX_OP=1: Instrument the relaxed-acceptance op.
+            # Dumps draft tokens, verifier top-K indices/values, and per-draft
+            # rank/delta. After the op runs, also dumps the op's
+            # num_accepted_tokens output. Rank-0 only by default; limited to
+            # GLM5_DUMP_RELAX_OP_LIMIT iters (default 15) AFTER
+            # GLM5_DUMP_RELAX_OP_SKIP iters of warmup (default 0).
+            # Purpose: disambiguate (A) drafts outside verifier top-K [kernel
+            # drift] vs (B) op rejecting drafts that are in top-K [op bug].
+            # ----------------------------------------------------------------
+            _dump_relax_op = _os.environ.get("GLM5_DUMP_RELAX_OP", "0") == "1"
+            if _dump_relax_op and num_gens > 0:
+                if not hasattr(self, "_glm5_dump_relax_op_count"):
+                    self._glm5_dump_relax_op_count = 0
+                    self._glm5_dump_relax_op_skip = int(
+                        _os.environ.get("GLM5_DUMP_RELAX_OP_SKIP", "0"))
+                    self._glm5_dump_relax_op_limit = int(
+                        _os.environ.get("GLM5_DUMP_RELAX_OP_LIMIT", "15"))
+                # Rank-0 only filter
+                try:
+                    import torch.distributed as _dist
+                    _rank = _dist.get_rank() if _dist.is_initialized() else 0
+                except Exception:
+                    _rank = 0
+                _total = (self._glm5_dump_relax_op_skip
+                          + self._glm5_dump_relax_op_limit)
+                if (_rank == 0
+                        and self._glm5_dump_relax_op_count >= self._glm5_dump_relax_op_skip
+                        and self._glm5_dump_relax_op_count < _total):
+                    # Pull op inputs to CPU.
+                    _it = self._glm5_dump_relax_op_count
+                    _topk_val_cpu = topk_value.detach().to(
+                        dtype=torch.float32).cpu()
+                    _topk_idx_cpu = topk_indices.detach().cpu()
+                    _draft_cpu = draft_tokens.detach().cpu()
+                    _delta_cpu = mtp_relaxed_delta_pool.detach().cpu()
+                    _slot_cpu = spec_metadata.slot_ids.detach().cpu()
+                    print(
+                        f"[GLM5_DUMP_RELAX_OP it={_it} rank={_rank}] "
+                        f"num_gens={num_gens} num_ctx={num_contexts} "
+                        f"mtp_num_modules={mtp_num_modules} "
+                        f"relaxed_topk={self.spec_config.relaxed_topk} "
+                        f"relaxed_delta={self.spec_config.relaxed_delta}",
+                        flush=True)
+                    # Iterate over gen requests (typically 1 for this bench).
+                    for _gi in range(num_gens):
+                        _slot = int(_slot_cpu[num_contexts + _gi].item())
+                        _dlt = float(_delta_cpu[_slot].item())
+                        _draft_g = _draft_cpu[_gi].tolist()
+                        print(
+                            f"[GLM5_DUMP_RELAX_OP it={_it} gen={_gi}] "
+                            f"slot={_slot} pool_delta={_dlt} "
+                            f"draft={_draft_g}", flush=True)
+                        # Walk each draft-validation position
+                        for _pi in range(mtp_num_modules):
+                            _top_v = _topk_val_cpu[_gi, _pi].tolist()
+                            _top_i = _topk_idx_cpu[_gi, _pi].tolist()
+                            _draft_t = int(_draft_g[_pi])
+                            # Find rank of draft in top-K (-1 if not present)
+                            _rank_in_topk = -1
+                            for _ki, _ti in enumerate(_top_i):
+                                if int(_ti) == _draft_t:
+                                    _rank_in_topk = _ki
+                                    break
+                            _top1_v = float(_top_v[0])
+                            if _rank_in_topk >= 0:
+                                _delta_from_top1 = (_top1_v
+                                                    - float(_top_v[_rank_in_topk]))
+                                _would_accept = (_delta_from_top1
+                                                 <= _dlt + 1e-9)
+                            else:
+                                _delta_from_top1 = float("inf")
+                                _would_accept = False
+                            print(
+                                f"[GLM5_DUMP_RELAX_OP it={_it} gen={_gi} "
+                                f"pos={_pi}] draft={_draft_t} "
+                                f"rank_in_topk={_rank_in_topk} "
+                                f"delta_from_top1={_delta_from_top1:.6f} "
+                                f"pool_delta={_dlt} "
+                                f"would_accept={_would_accept} "
+                                f"top1=({int(_top_i[0])},{_top1_v:.6f}) "
+                                f"top_idx={[int(x) for x in _top_i]} "
+                                f"top_val={[round(x,6) for x in _top_v]}",
+                                flush=True)
+                self._glm5_dump_relax_op_count += 1
+
             accepted_tokens, num_accepted_tokens = torch.ops.trtllm.mtp_relaxed_acceptance_op(
                 spec_metadata.slot_ids, topk_value, topk_indices, draft_tokens,
                 mtp_relaxed_delta_pool, num_accepted_tokens, accepted_tokens,
@@ -812,6 +921,27 @@ class MTPWorker(SpecWorkerBase):
                 self.spec_config.relaxed_topk, self.spec_config.relaxed_delta,
                 self.spec_config.begin_thinking_phase_token,
                 self.spec_config.end_thinking_phase_token)
+
+            if _dump_relax_op and num_gens > 0:
+                try:
+                    import torch.distributed as _dist
+                    _rank = _dist.get_rank() if _dist.is_initialized() else 0
+                except Exception:
+                    _rank = 0
+                _it_post = self._glm5_dump_relax_op_count - 1
+                _total = (self._glm5_dump_relax_op_skip
+                          + self._glm5_dump_relax_op_limit)
+                if (_rank == 0
+                        and _it_post >= self._glm5_dump_relax_op_skip
+                        and _it_post < _total):
+                    _nat = num_accepted_tokens.detach().cpu().tolist()
+                    _at = accepted_tokens.detach().cpu()
+                    _at_gen = _at[num_contexts:].tolist()
+                    print(
+                        f"[GLM5_DUMP_RELAX_OP it={_it_post} rank={_rank} POST] "
+                        f"num_accepted_tokens={_nat} "
+                        f"accepted_tokens[gen]={_at_gen}",
+                        flush=True)
 
             # Apply force override for relaxed acceptance path
             num_accepted_tokens = self._apply_force_accepted_tokens(

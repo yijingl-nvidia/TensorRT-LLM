@@ -140,6 +140,12 @@ class ModelConfig(Generic[TConfig]):
     # If true, enable min-latency mode. Currently only used for Llama4.
     enable_min_latency: bool = False
 
+    # If true, enable the GLM-5 small-batch fused-kernel decoder-layer path.
+    # Swaps Glm4DecoderLayer for Glm4SmallBatchDecoderLayer; per-kernel
+    # feature flags inside the subclass then enable each fused kernel
+    # independently. See nvbugs/6108841/revisit_moe_mega_kernel/INTEGRATION_PLAN.md.
+    enable_glm5_small_batch_fused: bool = False
+
     # Allow models to select op according to whether CUDA Graphs are used.
     use_cuda_graph: bool = False
 
