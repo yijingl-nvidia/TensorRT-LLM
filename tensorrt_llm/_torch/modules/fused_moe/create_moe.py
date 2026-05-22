@@ -80,6 +80,16 @@ def get_moe_cls(
                 f"Check out details in quant_config: {quant_config}. Using CutlassFusedMoE instead."
             )
             return CutlassFusedMoE
+    elif moe_backend.upper() == "GLM5_SMALL_BATCH":
+        # GLM-5 small-batch fused-kernel backend. Pairs v68
+        # ExpertSelectUpGateSiLU and v110 ExpertDownAllReduce; falls back to
+        # the parent TRTLLMGenFusedMoE for M > 4 or non-matching configs.
+        # Lives in tensorrt_llm/_torch/models/modeling_glm_small_batch.py so
+        # the GLM-5 decoder-layer subclass can import it directly.
+        from tensorrt_llm._torch.models.modeling_glm_small_batch import (
+            Glm5SmallBatchFusedMoE,
+        )
+        return Glm5SmallBatchFusedMoE
     elif moe_backend.upper() == "WIDEEP":
         return WideEPMoE
     elif moe_backend.upper() == "TRITON":
@@ -239,7 +249,13 @@ def create_moe_backend(
                 "clamp) only; per-expert swiglu_limit tensor is not "
                 "supported. Set swiglu_limit=None.")
 
-    if moe_cls == TRTLLMGenFusedMoE:
+    # Local import to avoid an upfront cost and a circular dependency with
+    # tensorrt_llm._torch.models (Glm5SmallBatchFusedMoE inherits TRTLLMGenFusedMoE
+    # and lives in that models package).
+    from tensorrt_llm._torch.models.modeling_glm_small_batch import (
+        Glm5SmallBatchFusedMoE,
+    )
+    if moe_cls in (TRTLLMGenFusedMoE, Glm5SmallBatchFusedMoE):
         assert not apply_router_weight_on_input, "apply_router_weight_on_input is not supported in TRTLLMGenFusedMoE."
 
         return moe_cls(
@@ -483,8 +499,14 @@ def create_moe(
     enable_configurable_moe = os.environ.get("ENABLE_CONFIGURABLE_MOE",
                                              "1") == "1"
     if enable_configurable_moe or moe_cls == CuteDslFusedMoE:
+        # Allow GLM5SmallBatchFusedMoE through ConfigurableMoE the same way as
+        # the parent TRTLLMGenFusedMoE (subclass). Local import to avoid cycle.
+        from tensorrt_llm._torch.models.modeling_glm_small_batch import (
+            Glm5SmallBatchFusedMoE,
+        )
         if moe_cls in (DeepGemmFusedMoE, TRTLLMGenFusedMoE, CuteDslFusedMoE,
-                       CutlassFusedMoE, DenseGEMMFusedMoE, MegaMoEDeepGemm):
+                       CutlassFusedMoE, DenseGEMMFusedMoE, MegaMoEDeepGemm,
+                       Glm5SmallBatchFusedMoE):
             return ConfigurableMoE(
                 routing_method=routing_method,
                 num_experts=num_experts,

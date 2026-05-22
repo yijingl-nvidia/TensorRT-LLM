@@ -61,6 +61,11 @@ list(FILTER SRC_CPP EXCLUDE REGEX "mhcKernels/.*")
 list(FILTER SRC_CU EXCLUDE REGEX "mhcKernels/.*")
 list(FILTER SRC_CPP EXCLUDE REGEX "compressorKernels/.*")
 list(FILTER SRC_CU EXCLUDE REGEX "compressorKernels/.*")
+# glm5SmallBatch mega kernels (ExpertSelectUpGateSiLU v68, ExpertDownAllReduce
+# v110) include <torch/extension.h> directly and are compiled into th_common
+# (the torch-linked op layer), not into the headerless kernels_src static lib.
+list(FILTER SRC_CPP EXCLUDE REGEX "glm5SmallBatch/.*")
+list(FILTER SRC_CU EXCLUDE REGEX "glm5SmallBatch/.*")
 
 if(NOT ENABLE_MULTI_DEVICE)
   list(FILTER SRC_CU EXCLUDE REGEX "customAllReduceKernels*.*cu$")

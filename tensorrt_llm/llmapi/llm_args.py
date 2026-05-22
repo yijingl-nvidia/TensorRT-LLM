@@ -626,7 +626,8 @@ class MoeConfig(StrictBaseModel):
     """
     backend: Literal[
         "AUTO", "CUTLASS", "CUTEDSL", "WIDEEP", "TRTLLM", "DEEPGEMM",
-        "DENSEGEMM", "VANILLA", "TRITON", "MEGAMOE_DEEPGEMM"] = Field(
+        "DENSEGEMM", "VANILLA", "TRITON", "MEGAMOE_DEEPGEMM",
+        "GLM5_SMALL_BATCH"] = Field(
             default='AUTO',
             description="MoE backend to use. "
             "AUTO selects default backend based on model. It currently doesn\'t always give the best choice for all scenarios. The capabilities of auto selection will be improved in future releases."
@@ -3947,6 +3948,16 @@ class TorchLlmArgs(BaseLlmArgs):
         default=False,
         description=
         "If true, enable min-latency mode. Currently only used for Llama4.",
+        status="beta",
+    )
+
+    enable_glm5_small_batch_fused: bool = Field(
+        default=False,
+        description=
+        "If true, enable the GLM-5 small-batch fused-kernel decoder-layer path "
+        "(swaps DeepseekV3DecoderLayer → Glm5SmallBatchDecoderLayer in "
+        "DeepseekV3Model when the registered model_type is glm_moe_dsa). "
+        "TP=4 only — v110 ExpertDownAllReduce kernel hard-codes 4 peers.",
         status="beta",
     )
 
