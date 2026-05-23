@@ -1209,6 +1209,54 @@ class Deepseekv3MoE(nn.Module):
 
 
 class DeepseekV3DecoderLayer(DecoderLayer):
+    """
+    One decoder layer in DeepSeekV3, made by mostly MLA and MoE modules.
+
+    A vanilla pre-norm decoder layer is conceptually this:
+                x_in ──────────────┐
+                  │                │
+                RMSNorm            │ (skip)
+                  │                │
+                Attention          │
+                  │                │
+                  ▼                │
+                  + ◄──────────────┘  residual add
+                  │
+                  x_mid ───────────┐
+                  │                │
+                RMSNorm            │ (skip)
+                  │                │
+                  MLP              │
+                  │                │
+                  ▼                │
+                  + ◄──────────────┘  residual add
+                  │
+                x_out  →  goes to next layer
+
+    DeepseekV3DecoderLayer uses the post-norm pattern to allow fusion of AllReduce (AR), residual add, and RMS norm.
+
+            hidden_states       residual                                  hidden_states       residual
+                  │                │                                            │                │
+               Attention           │                                     Attention (no AR)       │
+                  │                │                                            │                │
+                  ▼                │                                          ┌─┴────────────────┴─┐
+                  + ◄──────────────┘  residual add                            │    Fused kernel    │
+                  │                                                           └─┬────────────────┬─┘
+                x_mid ─────────────┐                     Fuse kernels           │                │
+                  │                │                     ═══════════►           │                │
+                RMSNorm            │ (skip)                                 MLP (no AR)          │  residual
+                  │                │                                            │                │
+                 MLP               │                                            │                │
+                  │                │                                            │                │
+                  ▼                │                                          ┌─┴────────────────┴─┐
+                  + ◄──────────────┘  residual add                            │    Fused kernel    │
+                  │                                                           └─┬────────────────┬─┘
+                x_out  ────────────┐                                            │                │
+                  |                │                                            │                │
+               RMSNorm             │                                            │                │
+                  |                │                                            │                │
+            hidden_states      residual  outputs to next layer            hidden_states      residual
+    """
 
     def __init__(self,
                  model_config: ModelConfig[PretrainedConfig],
@@ -1407,7 +1455,14 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         spec_metadata: Optional[SpecMetadata] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # On most layers, DeepseekV3DecoderLayer starts at attention.
+        # The RMS norm is done in the previous layer.
+        # so the input to forward() has:
+        # residual: un-RMS-normalized hidden states from the previous layer
+        # hidden_states: RMS-normalized hidden states from the previous layer
         if residual is None:
+            # For the first decoder layer, there is no residual
+            # We need to add the initial RMS norm here.
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
         # Self Attention
@@ -1432,7 +1487,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                 residual=residual,
                 spec_metadata=spec_metadata,
             )
-        else:
+        else:  # Dense MLP layer, no MoE
             if spec_metadata is not None and spec_metadata.is_layer_capture(
                     self.layer_idx):
                 self.fusion_config.POST_MLP_FUSION = False
@@ -1450,6 +1505,27 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         residual: torch.Tensor,
         spec_metadata: Optional[SpecMetadata] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Given hidden states from self attention and residual as
+        un-RMS-normalized hidden states from the previous layer, the forward_MoE()
+        performs:
+        - Add residual to the hidden states
+        - RMS norm on the updated hidden states
+        - Run MoE (includes all reduce)
+        - Add residual to the hidden states (this residual is the input of the RMS norm above)
+        - RMS norm on the newest hidden states
+
+        if self.fusion_config.PRE_MOE_FUSION:
+            attention does not do all-reduce. The pre-MoE fused kernel do all-reduce + residual-add + RMS norm
+            by calling self.allreduce() with pre-MoE fusion settings.
+        if self.fusion_config.POST_MOE_FUSION:
+            MoE does not do all-redue. The post-MoE fused kernel do all-reduce + residual-add + RMS norm
+            by calling self.allreduce() with post-MoE fusion settings.
+            In a narrow case (single-node, NVFP4-quantized TRTLLM MoE backend, small token count),
+            MoE does not finalize its output: its four intermediate result,
+            (shared_output, fc2_output, expert_scale_factor, expanded_idx_to_permuted_idx) are passed to a
+            bigger post-MoE fused kernel to combine with rest of the operations, by calling self.moe_allreduce().
+        """
 
         def _run_MoE(hidden_states, hidden_states_fp4, do_finalize):
             return self.mlp(
