@@ -1175,6 +1175,96 @@ def fp8_block_scaling_bmm_out(
 
 
 class MLA(nn.Module):
+    """
+    Multi-head Latent Attention module.
+
+                              ┌──────────────────────────────┐
+                              │   x ∈ ℝ⁶¹⁴⁴   (1 token in)   │
+                              └───────────────┬──────────────┘
+                                              │
+                              x̃ = γ_in ⊙ x / √(⟨x²⟩ + ε)         RMSNorm
+                                              │
+                                              ▼
+                              ┌──────────────────────────────┐
+                              │   x̃ ∈ ℝ⁶¹⁴⁴                  │
+                              └───────────────┬──────────────┘
+                                              │
+                             W_qkvia : ℝ⁶¹⁴⁴ ─► ℝ²⁶²⁴ "down-projection"
+                                              │
+                                              ▼
+                    ┌──────────────────────────┬─────────────────────┐
+                    ▼                          ▼                     ▼
+             q_a ∈ ℝ²⁰⁴⁸                c_kv ∈ ℝ⁵¹²             k_pe ∈ ℝ⁶⁴
+                    │                          │                     │
+              γ_q ⊙·/‖·‖                 γ_kv ⊙·/‖·‖             R_t (RoPE)
+                    │                          │                     │
+                    ▼                          ▼                     ▼
+              q̇_a ∈ ℝ²⁰⁴⁸                ċ_kv ∈ ℝ⁵¹²           k̂_pe ∈ ℝ⁶⁴
+                    │                          │                     │
+        W_qib:ℝ²⁰⁴⁸─►ℝ²⁰⁴⁸⁽¹⁶³⁸⁴⁾              └──────────┬──────────┘
+          "Q up-projection"                               │
+                    │                                     ▼
+                    ▼                         ┌─────────────────────────┐
+             q ∈ ℝ⁸⁽⁶⁴⁾ˣ²⁵⁶                   │   c_t = [ċ_kv ‖ k̂_pe]   │
+                    │                         │   ∈ ℝ⁵⁷⁶                │
+            split [192 | 64]                  │                         │
+                    │                         │   write to cache:       │
+            ┌───────┴────────┐                │   cache[seq, pos] := c_t│
+            ▼                ▼                └───────────┬─────────────┘
+     q_nope ∈ ℝ⁸⁽⁶⁴⁾ˣ¹⁹² q_rope ∈ ℝ⁸⁽⁶⁴⁾ˣ⁶⁴               │
+            │                │                            │
+            │         per-h R_t (RoPE)                    │
+            │                │                            │
+            │                ▼                            │
+            │         q̂_rope ∈ ℝ⁸⁽⁶⁴⁾ˣ⁶⁴                  │
+            │                │                            │
+per head h ∈ {0..7(63)}:     │                            │
+q̃_h^lat = W_uk,h · q_nope_h  │                            │
+∈ ℝ⁵¹²                       │                            │
+(absorption: K-up folded     │                            │
+into Q)                      │                            │
+            │                │                            │
+            └────────┬───────┘                            │
+                     ▼                                    │
+              q̃ ∈ ℝ⁸⁽⁶⁴⁾ˣ⁵⁷⁶                              │
+              (per-h: [q̃^lat ‖ q̂_rope])                   │
+                     │                                    │
+                     └──────────────────┬─────────────────┘
+                                        ▼
+                       for each past token j ∈ {0..T_kv}:
+                         s_h(j) = ⟨ q̃_h , cache[seq, j] ⟩ / √256
+                                        │
+                                        ▼
+                             p_h(·) = softmax( s_h(·) )         ∈ ℝ^(T_kv+1)
+                                        │
+                                        ▼
+                           o_h^lat = Σ_j  p_h(j) · cache[seq, j, :512]   ∈ ℝ⁵¹²
+                                        │            └──── V = first 512 of K
+                                        │
+                                        ▼
+                            per head h:   o_h = W_uv,h · o_h^lat  ∈ ℝ²⁵⁶
+                                                  (V-up, also absorbed)
+                                        │
+                                        ▼
+                                   o ∈ ℝ⁸⁽⁶⁴⁾ˣ²⁵⁶
+                                        │
+                                     flatten
+                                        │
+                                        ▼
+                                o ∈ ℝ²⁰⁴⁸⁽¹⁶³⁸⁴⁾
+                                        │
+                             W_o : ℝ²⁰⁴⁸⁽¹⁶³⁸⁴⁾ ─► ℝ⁶¹⁴⁴
+                                        │
+                                        ▼
+                                     y ∈ ℝ⁶¹⁴⁴
+                                        │
+                            Σ_rank  (AllReduce, TP=8)
+                                        │
+                                        ▼
+                         ┌──────────────────────────────┐
+                         │   y_out ∈ ℝ⁶¹⁴⁴  (1 token)   │
+                         └──────────────────────────────┘
+    """
 
     def __init__(
         self,
@@ -1251,7 +1341,7 @@ class MLA(nn.Module):
 
         if self.q_lora_rank is None:
             self.q_lora_rank = hidden_size
-            self.is_lite = True
+            self.is_lite = True  # DeepSeek-V2-Lite-style
         else:
             self.is_lite = False
 
