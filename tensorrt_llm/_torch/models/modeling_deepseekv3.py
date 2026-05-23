@@ -697,8 +697,8 @@ class DeepseekV3Linear(Linear):
     def apply_linear(self,
                      input,
                      bias,
-                     lora_params: Optional[dict] | None = None,
-                     layer_idx: Optional[int] | None = None):
+                     lora_params: dict | None = None,
+                     layer_idx: int | None = None):
         num_tokens = input.shape[0]
         if (not self.has_any_quant and 1 <= num_tokens <= 16
                 and get_sm_version() not in [120, 121]):
@@ -808,6 +808,11 @@ class DeepseekV32Attention(MLA):
 
 
 class DeepseekV3Gate(nn.Module):
+    """
+    MoE router / gating module for DeepSeek-V3's mixture-of-experts (MoE) layers.
+
+    It produces the logits over experts that the MoE block then uses to dispatch tokens.
+    """
 
     def __init__(
         self,
@@ -900,18 +905,20 @@ class DeepseekV3Gate(nn.Module):
 
 class Deepseekv3MoE(nn.Module):
 
-    def __init__(self,
-                 *,
-                 num_experts: int,
-                 top_k: int,
-                 hidden_size: int,
-                 intermediate_size: int,
-                 shared_expert_intermediate_size: int,
-                 aux_stream_dict: Dict[AuxStreamType, torch.cuda.Stream],
-                 dtype: Optional[torch.dtype] = None,
-                 model_config: ModelConfig = ModelConfig(),
-                 override_quant_config: Optional[QuantConfig] = None,
-                 layer_idx: Optional[int] = None):
+    def __init__(
+        self,
+        *,
+        num_experts: int,
+        top_k: int,
+        hidden_size: int,
+        intermediate_size: int,
+        shared_expert_intermediate_size: int,
+        aux_stream_dict: Dict[AuxStreamType, torch.cuda.Stream],
+        layer_idx: int,
+        dtype: Optional[torch.dtype] = None,
+        model_config: ModelConfig = ModelConfig(),
+        override_quant_config: Optional[QuantConfig] = None,
+    ):
         from ..distributed import AllReduce
 
         super().__init__()
@@ -924,6 +931,7 @@ class Deepseekv3MoE(nn.Module):
         gate_cls = DeepseekV3Gate
         if hasattr(model_config.pretrained_config, "gate_cls"):
             gate_cls = model_config.pretrained_config.gate_cls
+        # gate module that creates the expert router logits
         self.gate = gate_cls(
             hidden_size,
             num_experts,
@@ -936,7 +944,9 @@ class Deepseekv3MoE(nn.Module):
             apply_routing=False,
             moe_backend=model_config.moe_backend,
             use_cute_dsl_bf16_gemm=model_config.use_cute_dsl_bf16_gemm)
-        self.experts = create_moe(
+        # Fused MoE module. It can be different MoE backends based on
+        # `model_config.moe_backend`.
+        self.experts: MoE = create_moe(
             num_experts=num_experts,
             routing_method=self.gate.routing_method,
             hidden_size=hidden_size,
@@ -958,10 +968,10 @@ class Deepseekv3MoE(nn.Module):
                 else MoEWeightLoadingMode.VANILLA),
             swiglu_limit=self.swiglu_limit,
         )
+        # mapping about how this model is sharded across GPUs/nodes.
+        self.mapping: Mapping = model_config.mapping
 
-        self.mapping = model_config.mapping
-
-        shared_quant_config = self._get_shared_experts_quant_config(
+        shared_quant_config: QuantConfig = self._get_shared_experts_quant_config(
             model_config, layer_idx)
         shared_model_config = model_config
         if shared_quant_config is not model_config.quant_config:
@@ -988,11 +998,11 @@ class Deepseekv3MoE(nn.Module):
             reduce_output=False,
             use_cute_dsl_blockscaling_mm=self.use_cute_dsl_blockscaling_mm,
         )
-        self.shared_experts_use_fp4 = (
+        self.shared_experts_use_fp4: bool = (
             shared_quant_config is not None
             and shared_quant_config.layer_quant_mode.has_nvfp4())
 
-        self.allreduce = None
+        self.allreduce: AllReduce | None = None
         if not self.use_dp and self.mapping.tp_size > 1:
             self.allreduce = AllReduce(mapping=model_config.mapping,
                                        strategy=model_config.allreduce_strategy)
@@ -1101,21 +1111,34 @@ class Deepseekv3MoE(nn.Module):
                 kv_cache_quant_algo=quant_config.kv_cache_quant_algo)
         return quant_config
 
-    def compute_routed_output(self, hidden_states, hidden_states_fp4,
-                              all_rank_num_tokens, do_finalize):
+    def compute_routed_output(self, hidden_states: torch.Tensor,
+                              hidden_states_fp4: Fp4QuantizedTensor | None,
+                              all_rank_num_tokens: list[int] | None,
+                              do_finalize: bool) -> list[torch.Tensor]:
+        """
+        Run the routed experts of MoE.
+        Args:
+            hidden_states (torch.Tensor): Input RMS-normalied hidden states of MoE.
+            hidden_states_fp4 (Fp4QuantizedTensor | None): Optional: input RMS-normalized hidden states of MoE in FP4 format.
+            all_rank_num_tokens (list[int] | None): Optional: the number of tokens in each rank.
+            do_finalize (bool): whether to finalize the output.
+
+        Returns:
+            list[torch.Tensor]: The routed experts outputs
+        """
         # max-throughput
         use_dp_padding = False
-        # Add DP padding on SM120 for context comm performance
+        # Add DP padding on SM120 (Blackwell) for context comm performance
         # TODO: Move this model-agonostic part to MoE
         if self.use_dp and self.mapping.tp_size > 1 and get_sm_version() == 120:
+            assert all_rank_num_tokens is not None, "all_rank_num_tokens is required when using attention DP and TP > 1 on Blackwell"
             use_dp_padding = True
             hidden_states = torch.nn.functional.pad(
                 hidden_states,
                 (0, 0, 0, max(all_rank_num_tokens) - hidden_states.shape[0]))
 
-        router_logits = self.gate(hidden_states)
-
-        routed_output = self.experts(
+        router_logits: torch.Tensor = self.gate(hidden_states)
+        return self.experts(
             hidden_states_fp4
             if hidden_states_fp4 is not None else hidden_states,
             router_logits,
@@ -1128,15 +1151,13 @@ class Deepseekv3MoE(nn.Module):
             } if isinstance(self.experts, WideEPMoE) else {}),
         )
 
-        return routed_output
-
     def forward(
         self,
         hidden_states: torch.Tensor,
-        hidden_states_fp4: Optional[Fp4QuantizedTensor] = None,
-        all_rank_num_tokens: Optional[list[int]] = None,
-        final_all_reduce_params: Optional[AllReduceParams] = None,
-        do_finalize: Optional[bool] = True,
+        hidden_states_fp4: Fp4QuantizedTensor | None = None,
+        all_rank_num_tokens: list[int] | None = None,
+        final_all_reduce_params: AllReduceParams | None = None,
+        do_finalize: bool | None = True,
     ) -> torch.Tensor:
         if not do_finalize:
             assert not self.use_dp
@@ -1454,9 +1475,9 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
         residual: torch.Tensor,
-        spec_metadata: Optional[SpecMetadata] = None,
+        spec_metadata: SpecMetadata | None = None,
         **kwargs,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         # On most layers, DeepseekV3DecoderLayer starts at attention.
         # The RMS norm is done in the previous layer.
         # so the input to forward() has:
@@ -1558,7 +1579,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                 hidden_states, residual)
 
         # Note: this fusion pattern is only supported for single-node TRTLLM-nvfp4 backend now
-        do_finalize = self.mapping.is_multi_node() or (
+        do_finalize: bool = self.mapping.is_multi_node() or (
             not (self.fusion_config.POST_MOE_FUSION
                  and hidden_states.shape[0] <= self.moe_allreduce.max_token
                  and self.model_config.moe_backend == "TRTLLM"
