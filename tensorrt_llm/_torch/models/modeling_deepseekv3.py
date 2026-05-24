@@ -28,6 +28,7 @@
 import copy
 import math
 import os
+from collections import defaultdict
 from typing import Dict, List, Optional
 
 import torch
@@ -74,7 +75,7 @@ from ..utils import (AuxStreamType, EventType, Fp4QuantizedTensor,
                      create_lm_head_tp_mapping)
 from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import (DecoderModel, EagerFusionConfig, filter_weights,
-                             register_auto_model)
+                             register_auto_model, run_concurrently)
 
 
 @triton.jit
@@ -169,6 +170,63 @@ class DeepseekV3WeightLoader:
     def load_weights(self,
                      weights: ConsumableWeightsDict,
                      skip_modules: List[str] = []):
+
+        def module_group_key(name: str) -> str:
+            """
+            Given a module name, find its parent layer name.
+
+            This is used to group modules by layer so we can parallelize weight loading across layers.
+
+            e.g. model.layers.5.self_attn.kv_a_proj_with_mqa -> model.layers.5
+            """
+            names = name.split('.')
+            if (len(names) > 2 and names[0] == "model" and names[1] == "layers"
+                    and names[2].isdigit()):
+                layer_idx = int(names[2])
+                if layer_idx >= self.config.num_hidden_layers:
+                    # This is an MTP layer. Since we may load the same weights for multiple layers
+                    # we will group all MTP layers together
+                    return "model.layers.mtp"
+                return f"model.layers.{layer_idx}"
+            return name
+
+        all_named_modules: dict[str,
+                                nn.Module] = dict(self.model.named_modules())
+
+        module_groups: dict[str, list[tuple[str,
+                                            nn.Module]]] = defaultdict(list)
+        for name, module in all_named_modules.items():
+            if len(module._parameters) <= 0 or name.startswith("draft_model"):
+                # skip empty modules and draft models
+                # draft models will be loaded elsewhere
+                continue
+            if any(skip_module in name for skip_module in skip_modules):
+                continue
+            module_groups[module_group_key(name)].append((name, module))
+
+        module_group_list = list(module_groups.values())
+
+        def load_module_group(
+                module_group: list[tuple[str, nn.Module]]) -> None:
+            for name, module in module_group:
+                self._load_single_module(name, module, all_named_modules,
+                                         weights)
+
+        if os.environ.get("TRT_LLM_DISABLE_LOAD_WEIGHTS_IN_PARALLEL",
+                          "False") in ["True", "true", "1", "yes", "y"]:
+            for module_group in tqdm(module_group_list, desc="Loading weights"):
+                load_module_group(module_group)
+        else:
+            with tqdm(total=len(module_group_list),
+                      desc="Loading weight groups concurrently") as pbar:
+                run_concurrently(load_module_group,
+                                 [(module_group, )
+                                  for module_group in module_group_list],
+                                 pbar=pbar)
+
+    def _load_single_module(self, name: str, module: nn.Module,
+                            all_named_modules: dict[str, nn.Module],
+                            weights: ConsumableWeightsDict):
 
         def requantize_weight_with_new_scale(
                 weight: torch.Tensor, weight_scale: torch.Tensor,
@@ -359,21 +417,12 @@ class DeepseekV3WeightLoader:
         cp_size = self.model_config.mapping.cp_size
 
         params_map = {'gate_up_proj': ['gate_proj', 'up_proj']}
-        all_named_modules: dict[str,
-                                nn.Module] = dict(self.model.named_modules())
 
         # Check if weights supports mark_consumed (ConsumableWeightsDict)
         can_mark_consumed = hasattr(weights, 'mark_consumed')
 
-        for name, module in tqdm(all_named_modules.items(),
-                                 desc="Loading weights"):
-            if len(module._parameters) <= 0 or name.startswith("draft_model"):
-                # skip empty modules and draft models
-                # draft models will be loaded elsewhere
-                continue
-            elif any(skip_module in name for skip_module in skip_modules):
-                continue
-            else:
+        if True:
+            if True:
                 names: list[str] = name.split('.')
                 parent_module_name = '.'.join(names[:-1])
                 if "model.layers" in name and int(
@@ -642,9 +691,9 @@ class DeepseekV3WeightLoader:
                     if can_mark_consumed:
                         weights.mark_consumed(parent_name)
                 elif names[-1] == "self_attn":
-                    continue
+                    return
                 elif names[-1] == "next_layer_layernorm":
-                    continue
+                    return
                 else:
                     module_weights = filter_weights(name, weights)
                     if hasattr(module, 'load_weights'):
