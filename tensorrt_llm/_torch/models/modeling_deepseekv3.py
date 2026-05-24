@@ -135,7 +135,21 @@ def weight_dequant(x: torch.Tensor,
 
 
 @torch.compile(dynamic=True)
-def moe_reduce_add_shared_output(routed_output, shared_output, out=None):
+def moe_reduce_add_shared_output(
+        routed_output: torch.Tensor,
+        shared_output: torch.Tensor,
+        out: torch.Tensor | None = None) -> torch.Tensor:
+    """
+    Reduce the routed output along the expert dimension and add it to the shared output.
+
+    Args:
+        routed_output (torch.Tensor): [num_total_tokens, num_topk_experts, hidden_size]
+        shared_output (torch.Tensor): [num_total_tokens, hidden_size]
+        out (torch.Tensor | None): [num_total_tokens, hidden_size]
+
+    Returns:
+        torch.Tensor: [num_total_tokens, hidden_size]
+    """
     routed_reduced = torch.sum(routed_output, dim=1, keepdim=False)
     if out is not None:
         torch.add(shared_output, routed_reduced, out=out)
@@ -1111,10 +1125,11 @@ class Deepseekv3MoE(nn.Module):
                 kv_cache_quant_algo=quant_config.kv_cache_quant_algo)
         return quant_config
 
-    def compute_routed_output(self, hidden_states: torch.Tensor,
-                              hidden_states_fp4: Fp4QuantizedTensor | None,
-                              all_rank_num_tokens: list[int] | None,
-                              do_finalize: bool) -> list[torch.Tensor]:
+    def compute_routed_output(
+            self, hidden_states: torch.Tensor,
+            hidden_states_fp4: Fp4QuantizedTensor | None,
+            all_rank_num_tokens: list[int] | None,
+            do_finalize: bool) -> torch.Tensor | list[torch.Tensor]:
         """
         Run the routed experts of MoE.
         Args:
@@ -1124,7 +1139,8 @@ class Deepseekv3MoE(nn.Module):
             do_finalize (bool): whether to finalize the output.
 
         Returns:
-            list[torch.Tensor]: The routed experts outputs
+            torch.Tensor | list[torch.Tensor]: The routed experts outputs if do_finalize is True, otherwise returns a list
+            of non-combined routed expert outputs for a downstream fused kernel.
         """
         # max-throughput
         use_dp_padding = False
@@ -1137,6 +1153,7 @@ class Deepseekv3MoE(nn.Module):
                 hidden_states,
                 (0, 0, 0, max(all_rank_num_tokens) - hidden_states.shape[0]))
 
+        # dtype usually float32, [num_total_tokens, num_experts]
         router_logits: torch.Tensor = self.gate(hidden_states)
         return self.experts(
             hidden_states_fp4
@@ -1162,17 +1179,20 @@ class Deepseekv3MoE(nn.Module):
         if not do_finalize:
             assert not self.use_dp
 
-        def _compute_shared_output():
+        def _compute_shared_output() -> torch.Tensor:
             shared_input = (hidden_states_fp4 if
                             (hidden_states_fp4 is not None
                              and self.shared_experts_use_fp4) else
                             hidden_states)
+            # [num_total_tokens, hidden_size]
             shared_output = self.shared_experts(shared_input)
             if self.shared_output_scale is not None:
                 shared_output *= self.shared_output_scale
             return shared_output
 
         def _compute_routed_output():
+            # if do_finalize: return torch.Tensor of shape [num_total_tokens, hidden_size]
+            # else, return a list of non-combined router expert outputs for a downstream fused kernel.
             routed_output = self.compute_routed_output(hidden_states,
                                                        hidden_states_fp4,
                                                        all_rank_num_tokens,
@@ -1190,8 +1210,12 @@ class Deepseekv3MoE(nn.Module):
             disable_on_compile=True)
 
         if not do_finalize:
+            # shared_output: [num_total_tokens, hidden_size]
+            # routed_outputs: a list of non-combined router expert outputs for a downstream fused kernel.
             return [shared_output, *routed_output]
         else:
+            # shared_output: [num_total_tokens, hidden_size]
+            # routed_outputs: [num_total_tokens, (num_topk_experts,) hidden_size]
             if not isinstance(shared_output, torch.Tensor):
                 final_hidden_states = shared_output + routed_output
                 if not self.use_dp and self.mapping.tp_size > 1:
@@ -1201,18 +1225,23 @@ class Deepseekv3MoE(nn.Module):
                 return final_hidden_states
             output_tensor = None
             if not self.use_dp and self.mapping.tp_size > 1:
+                # w: [num_total_tokens, hidden_size]
                 w, actual_kind = torch.ops.trtllm.allocate_output(
                     shared_output, self.allreduce.output_buffer_kind,
                     self.mapping.tp_group)
                 if actual_kind == int(BufferKind.NCCL_WINDOW):
                     output_tensor = w
             if routed_output.dim() == 3:
+                # routed_output: [num_total_tokens, num_topk_experts, hidden_size]
                 assert shared_output.numel(
                 ) * self.top_k == routed_output.numel(
                 ), 'unmatched tensor shape'
+                # reduce along the topk expert dimension:
+                # final_hidden_states: [num_total_tokens, hidden_size]
                 final_hidden_states = moe_reduce_add_shared_output(
                     routed_output, shared_output, out=output_tensor)
             else:
+                # routed_output: [num_total_tokens, hidden_size]
                 assert shared_output.size() == routed_output.size(
                 ), 'unmatched tensor shape'
                 if output_tensor is not None:
@@ -1478,6 +1507,17 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         spec_metadata: SpecMetadata | None = None,
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            position_ids (torch.IntTensor): [batch_size, seq_len] Position ids of the input tokens.
+            hidden_states (torch.Tensor): [num_total_tokens, hidden_size] Hidden states of the input tokens.
+            attn_metadata (AttentionMetadata): attention metadata.
+            residual (torch.Tensor): [num_total_tokens, hidden_size] The residual of the input tokens.
+            spec_metadata (SpecMetadata): The spec metadata of the input tokens.
+
+        Returns:
+            tuple[torch.Tensor, torch.Tensor]: The hidden states and residual of the output tokens.
+        """
         # On most layers, DeepseekV3DecoderLayer starts at attention.
         # The RMS norm is done in the previous layer.
         # so the input to forward() has:
