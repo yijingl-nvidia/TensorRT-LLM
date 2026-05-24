@@ -861,7 +861,10 @@ def rename_weights_with_regex(pattern_mapping: Dict[str, str], weights: Dict):
     return renamed_weights
 
 
-def filter_weights(prefix, weights: Dict):
+def filter_weights(prefix: str, weights: dict) -> dict:
+    """
+    Return only weights that start with the prefix (and with the prefix removed)
+    """
     result = {}
     for k, v in weights.items():
         if k.startswith(prefix):

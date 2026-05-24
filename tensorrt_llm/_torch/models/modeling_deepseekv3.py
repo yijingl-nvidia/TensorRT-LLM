@@ -28,7 +28,7 @@
 import copy
 import math
 import os
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import torch
 import triton
@@ -170,8 +170,10 @@ class DeepseekV3WeightLoader:
                      weights: ConsumableWeightsDict,
                      skip_modules: List[str] = []):
 
-        def requantize_weight_with_new_scale(weight, weight_scale, old_scale_2,
-                                             new_scale_2, device):
+        def requantize_weight_with_new_scale(
+                weight: torch.Tensor, weight_scale: torch.Tensor,
+                old_scale_2: torch.Tensor, new_scale_2: torch.Tensor,
+                device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
             """
             Dequantize FP4 weights and requantize with a new scale.
 
@@ -183,7 +185,7 @@ class DeepseekV3WeightLoader:
                 device: target device for computation
 
             Returns:
-                (requantized_weight, new_weight_scale)
+                (requantized_weight, new_weight_scale), both on cpu
             """
             # Remember original dtype of weight_scale
             original_scale_dtype = weight_scale.dtype
@@ -208,7 +210,7 @@ class DeepseekV3WeightLoader:
             return weight_requant.cpu(), weight_scale_requant.reshape(
                 original_scale_shape).view(original_scale_dtype).cpu()
 
-        def rename_moe_weight(weights: Dict, rename_rules: Dict):
+        def rename_moe_weight(weights: Dict, rename_rules: Dict) -> Dict:
             result = {}
             for key, value in weights.items():
                 new_key = key
@@ -217,19 +219,29 @@ class DeepseekV3WeightLoader:
                 result[new_key] = value
             return result
 
-        ## Prepare weights for TP
-        def split(v, tp_size, idx, dim=0):
-            if tp_size == 1:
+        def split_matrix_tp(v: torch.Tensor, tensor_parallel: int, rank: int,
+                            dim: int) -> torch.Tensor:
+            """
+            return a slice of the tensor for tensor parallelism
+
+            Args:
+                v: tensor to split
+                tensor_parallel: tensor parallelism (tp) size
+                rank: rank of the current process
+                dim: dimension to split along
+
+            Returns:
+                split tensor
+            """
+            if tensor_parallel == 1:
                 return v
             if len(v.shape) == 1:
-                return torch.chunk(v, tp_size)[idx].contiguous()
-            return torch.chunk(v, tp_size, dim=dim)[idx].contiguous()
+                return torch.chunk(v, tensor_parallel)[rank].contiguous()
+            return torch.chunk(v, tensor_parallel, dim=dim)[rank].contiguous()
 
-        def split_matrix_tp(v, tensor_parallel, rank, dim):
-            return split(v, tensor_parallel, rank, dim=dim)
-
-        def load_kv_b_proj_and_k_b_proj_trans(module_name: str,
-                                              is_scale: bool) -> torch.Tensor:
+        def load_kv_b_proj_and_k_b_proj_trans(
+                module_name: str,
+                is_scale: bool) -> tuple[torch.Tensor, torch.Tensor]:
             weight_name = "weight" if not is_scale else "weight_scale_inv"
             local_qk_nope_head_dim = qk_nope_head_dim if not is_scale else qk_nope_head_dim // 128
             local_v_head_dim = v_head_dim if not is_scale else v_head_dim // 128
@@ -265,7 +277,7 @@ class DeepseekV3WeightLoader:
             return kv_b_proj, k_nope_weight_trans
 
         def load_kv_b_proj_and_k_b_proj_trans_dequant(
-                module_name: str) -> torch.Tensor:
+                module_name: str) -> tuple[torch.Tensor, torch.Tensor]:
             weight_name = "weight"
             local_qk_nope_head_dim = qk_nope_head_dim
             local_v_head_dim = v_head_dim
@@ -305,8 +317,12 @@ class DeepseekV3WeightLoader:
 
             return kv_b_proj, k_nope_weight_trans
 
-        def split_kv_b_proj(kv_b_proj: torch.Tensor,
-                            is_scale: bool) -> torch.Tensor:
+        def split_kv_b_proj(
+                kv_b_proj: torch.Tensor,
+                is_scale: bool) -> tuple[torch.Tensor, torch.Tensor]:
+            """
+            Split kv_b_proj (or its 128-block scale weight) into k_b_proj and v_b_proj components.
+            """
             local_qk_nope_head_dim = qk_nope_head_dim if not is_scale else qk_nope_head_dim // 128
             local_v_head_dim = v_head_dim if not is_scale else v_head_dim // 128
 
@@ -331,7 +347,7 @@ class DeepseekV3WeightLoader:
 
             return k_b_proj, v_b_proj
 
-        is_lite = self.config.q_lora_rank is None
+        is_lite = self.config.q_lora_rank is None  # DeepSeek V3-Lite has no q_a_proj; full V3/R1/V3.2 do
         num_heads = self.config.num_attention_heads
         qk_nope_head_dim = self.config.qk_nope_head_dim
         v_head_dim = self.config.v_head_dim
@@ -343,7 +359,8 @@ class DeepseekV3WeightLoader:
         cp_size = self.model_config.mapping.cp_size
 
         params_map = {'gate_up_proj': ['gate_proj', 'up_proj']}
-        all_named_modules = dict(self.model.named_modules())
+        all_named_modules: dict[str,
+                                nn.Module] = dict(self.model.named_modules())
 
         # Check if weights supports mark_consumed (ConsumableWeightsDict)
         can_mark_consumed = hasattr(weights, 'mark_consumed')
@@ -351,14 +368,17 @@ class DeepseekV3WeightLoader:
         for name, module in tqdm(all_named_modules.items(),
                                  desc="Loading weights"):
             if len(module._parameters) <= 0 or name.startswith("draft_model"):
+                # skip empty modules and draft models
+                # draft models will be loaded elsewhere
                 continue
             elif any(skip_module in name for skip_module in skip_modules):
                 continue
             else:
-                names = name.split('.')
+                names: list[str] = name.split('.')
                 parent_module_name = '.'.join(names[:-1])
                 if "model.layers" in name and int(
                         names[2]) >= self.config.num_hidden_layers:
+                    # this is an MTP layer
                     mtp_layer_idx = int(
                         names[2]) - self.config.num_hidden_layers
                     names[2] = str(mtp_layer_idx %
@@ -528,7 +548,7 @@ class DeepseekV3WeightLoader:
                             fused_a_scale = kv_a_proj_with_mqa_scale
                         module.weight_scale.data[0:fused_a_scale.
                                                  shape[0]].copy_(fused_a_scale)
-                    else:
+                    else:  # not nvfp4_fused_a
                         fused_a = weights[
                             f"{'.'.join(names[:-1])}.kv_a_proj_with_mqa.weight"][:]
                         if not is_lite:
@@ -1567,7 +1587,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         attn_metadata: AttentionMetadata,
         residual: torch.Tensor,
         spec_metadata: Optional[SpecMetadata] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Given hidden states from self attention and residual as
         un-RMS-normalized hidden states from the previous layer, the forward_MoE()
@@ -1676,7 +1696,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         hidden_states: torch.Tensor,
         residual: torch.Tensor,
         spec_metadata: Optional[SpecMetadata] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
 
         if self.fusion_config.PRE_MLP_FUSION:
             act_fp4, act_sf, residual = self.allreduce(
