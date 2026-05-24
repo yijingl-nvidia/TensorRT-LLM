@@ -386,8 +386,19 @@ class DeepseekV3WeightLoader:
                                    self.config.num_hidden_layers)
                     name = '.'.join(names)
                 if names[-1] == "kv_b_proj":
+                    # For the self_attn.kv_b_proj module, split it into k_b_proj and v_b_proj
+                    # Assigns:
+                    # - self_attn.kv_b_proj.weight = kv_b_proj
+                    # - self_attn.v_b_proj = v_b_proj
+                    # - self_attn.k_b_proj_trans = k_b_proj_trans
+                    # - self_attn.kv_b_proj.weight_scale = kv_b_proj_scale
+                    # - self_attn.v_b_proj_scale = v_b_proj_scale
+                    # - self_attn.k_b_proj_trans_scale = k_b_proj_trans_scale
+                    # - self_attn.k_b_proj_trans_dequant = dequant(k_b_proj_trans)
+                    # - self_attn.v_b_proj_dequant = dequant(v_b_proj)
+
                     # TODO: remove weight_dequant after enabling fp8_bmm
-                    dequant_kv_b_proj = self.model_config.quant_config.is_module_excluded_from_quantization(
+                    dequant_kv_b_proj: bool = self.model_config.quant_config.is_module_excluded_from_quantization(
                         names[-1])
                     if dequant_kv_b_proj:
                         kv_b_proj, k_b_proj_trans = load_kv_b_proj_and_k_b_proj_trans_dequant(
@@ -447,6 +458,19 @@ class DeepseekV3WeightLoader:
                     if can_mark_consumed:
                         weights.mark_consumed(name)
                 elif names[-1] == "kv_a_proj_with_mqa":
+                    # For the self_attn.kv_a_proj_with_mqa module, combine it with q_a_proj
+                    # Assigns:
+                    # if use nvfp4_fused_a:
+                    # - self_attn.kv_a_proj_with_mqa.input_scale = kv_a_proj_with_mqa.input_scale
+                    # - self_attn.kv_a_proj_with_mqa.inv_input_scale = 1.0 / kv_a_proj_with_mqa.input_scale
+                    # - self_attn.kv_a_proj_with_mqa.alpha = kv_a_proj_with_mqa.input_scale * kv_a_proj_with_mqa.weight_scale_2
+                    # - self_attn.kv_a_proj_with_mqa.scalar_alpha = ...alpha.item()
+                    # - self_attn.kv_a_proj_with_mqa.weight = q_a_proj.weight | kv_a_proj_with_mqa.weight
+                    # - self_attn.kv_a_proj_with_mqa.weight_scale = q_a_proj.weight_scale | kv_a_proj_with_mqa.weight_scale
+                    # else:
+                    # - self_attn.kv_a_proj_with_mqa.weight = q_a_proj.weight | kv_a_proj_with_mqa.weight
+                    # - self_attn.kv_a_proj_with_mqa.weight_scale = q_a_proj.weight_scale_inv | kv_a_proj_with_mqa.weight_scale_inv
+
                     nvfp4_fused_a = self.model_config.get_quant_config(
                     ).layer_quant_mode.has_nvfp4() and weights[
                         f"{'.'.join(names[:-1])}.kv_a_proj_with_mqa.weight"].dtype == fp4_utils.float4_e2m1x2
@@ -576,6 +600,7 @@ class DeepseekV3WeightLoader:
                         if not is_lite:
                             weights.mark_consumed(f"{parent_prefix}.q_a_proj")
                 elif names[-1] in params_map:
+                    # For the mlp.shared_experts.gate_up_proj module, combine gate_proj and up_proj
                     module_weights = []
                     for new_name in params_map[names[-1]]:
                         module_weights.append(
@@ -599,7 +624,7 @@ class DeepseekV3WeightLoader:
                     if can_mark_consumed:
                         weights.mark_consumed(name)
                 elif names[-1] == "backend" and isinstance(module, MoE):
-                    # Special case: ConfigurableMoE.backend (TRTLLMGenFusedMoE)
+                    # Special case: ConfigurableMoE.backend (TRTLLMGenFusedMoE) as mlp.experts.backend:
                     # Currently saved MoE weights don't include 'backend' in their names.
                     # After MoE refactoring, ConfigurableMoE now has a backend submodule,
                     # and weights loading is done in the backend, so module name includes '.backend'.

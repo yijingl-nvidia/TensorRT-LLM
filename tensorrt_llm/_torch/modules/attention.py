@@ -1189,7 +1189,7 @@ class MLA(nn.Module):
                               │   x̃ ∈ ℝ⁶¹⁴⁴                  │
                               └───────────────┬──────────────┘
                                               │
-                             W_qkvia : ℝ⁶¹⁴⁴ ─► ℝ²⁶²⁴ "down-projection"
+            W_qkvia : ℝ⁶¹⁴⁴ ─► ℝ²⁶²⁴ "Combine q_a_proj and kv_a_proj_with_mqa, QKV down-projection"
                                               │
                                               ▼
                     ┌──────────────────────────┬─────────────────────┐
@@ -1221,8 +1221,8 @@ class MLA(nn.Module):
 per head h ∈ {0..7(63)}:     │                            │
 q̃_h^lat = W_uk,h · q_nope_h  │                            │
 ∈ ℝ⁵¹²                       │                            │
-(absorption: K-up folded     │                            │
-into Q)                      │                            │
+(absorption: k_b_proj,       │                            │
+K-up folded into Q)          │                            │
             │                │                            │
             └────────┬───────┘                            │
                      ▼                                    │
@@ -1243,7 +1243,7 @@ into Q)                      │                            │
                                         │
                                         ▼
                             per head h:   o_h = W_uv,h · o_h^lat  ∈ ℝ²⁵⁶
-                                                  (V-up, also absorbed)
+                                                  (v_b_proj, V-up, also absorbed)
                                         │
                                         ▼
                                    o ∈ ℝ⁸⁽⁶⁴⁾ˣ²⁵⁶
