@@ -480,9 +480,8 @@ class DeepseekV3WeightLoader:
         # Once related feature branches are merged, we can remove this indentation.
         if True:
             if True:
-                name = name.replace(
-                    "._old_moe",
-                    "")  # hack for finding correct weight names for MoE modules
+                # hack for finding correct weight names for MoE modules
+                name = name.replace("._old_moe", "")
                 names: list[str] = name.split('.')
                 parent_module_name = '.'.join(names[:-1])
                 if "model.layers" in name and int(
@@ -1100,6 +1099,7 @@ class Deepseekv3MegaMoE(nn.Module):
             model_config=model_config,
             override_quant_config=override_quant_config,
         )
+        self.layer_idx = layer_idx
 
     @property
     def experts(self) -> MoE:
@@ -1118,12 +1118,39 @@ class Deepseekv3MegaMoE(nn.Module):
         old_moe = self._old_moe
         assert do_finalize is True, "Deepseekv3MegaMoE only supports do_finalize=True"
 
-        # compute shared output
+        # Direct Blackwell DeepGEMM replacement for shared_experts.gate_up_proj.
         shared_experts = old_moe.shared_experts
-        # Kernel input to shared_experts.gate_up_proj:
-        # FP8-block scale path uses Linear -> FP8BlockScalesLinearMethod.apply,
-        # which calls fp8_swap_ab_gemm/fp8_block_scaling_gemm depending on SM.
-        shared_gate_up_output = shared_experts.gate_up_proj(hidden_states)
+        shared_gate_up_proj = shared_experts.gate_up_proj
+        assert hidden_states.ndim == 2, (
+            f"hidden_states must be 2D, got {hidden_states.shape}")
+        assert hidden_states.dtype == torch.bfloat16, (
+            f"hidden_states must be bfloat16, got {hidden_states.dtype}")
+        assert shared_gate_up_proj.has_fp8_block_scales
+        assert shared_gate_up_proj.bias is None, (
+            f"shared_gate_up_proj.bias must be None, got "
+            f"{shared_gate_up_proj.bias}")
+        shared_gate_up_output = torch.ops.trtllm.fp8_swap_ab_gemm(
+            hidden_states,
+            shared_gate_up_proj.weight,
+            shared_gate_up_proj.weight_scale,
+        )
+
+        # # DEBUG: uniform noise in [-0.02, 0.02] has E(abs(noise)) = 0.01.
+        # shared_gate_up_noise_mean_abs = 5.0
+        # shared_gate_up_noise_generator = torch.Generator(
+        #     device=shared_gate_up_output.device)
+        # shared_gate_up_noise_generator.manual_seed(6108841 + self.layer_idx)
+        # shared_gate_up_noise = torch.empty(
+        #     shared_gate_up_output.shape,
+        #     device=shared_gate_up_output.device,
+        #     dtype=shared_gate_up_output.dtype,
+        # ).uniform_(
+        #     -2 * shared_gate_up_noise_mean_abs,
+        #     2 * shared_gate_up_noise_mean_abs,
+        #     generator=shared_gate_up_noise_generator,
+        # )
+        # shared_gate_up_output = (
+        #     shared_gate_up_output + shared_gate_up_noise)
 
         # Kernel input to torch.ops.trtllm.silu_and_mul.
         shared_swiglu_output = shared_experts._apply_activation(
