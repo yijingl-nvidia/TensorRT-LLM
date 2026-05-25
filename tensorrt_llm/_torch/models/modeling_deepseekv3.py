@@ -28,6 +28,7 @@
 import copy
 import math
 import os
+import threading
 from collections import defaultdict
 from typing import Dict, List, Optional
 
@@ -169,15 +170,21 @@ class DeepseekV3WeightLoader:
 
     def load_weights(self,
                      weights: ConsumableWeightsDict,
-                     skip_modules: List[str] = []):
+                     skip_modules: List[str] = []) -> None:
+        """
+        Load `weights` into `model`.
+
+        By default, it parallelizes weight loading across layers.
+        """
 
         def module_group_key(name: str) -> str:
             """
-            Given a module name, find its parent layer name.
+            Given a module name, return its parent layer name.
 
             This is used to group modules by layer so we can parallelize weight loading across layers.
 
-            e.g. model.layers.5.self_attn.kv_a_proj_with_mqa -> model.layers.5
+            e.g. "model.layers.5.self_attn.kv_a_proj_with_mqa" -> "model.layers.5"
+            If name is not part of a layer, return the original name.
             """
             names = name.split('.')
             if (len(names) > 2 and names[0] == "model" and names[1] == "layers"
@@ -193,6 +200,7 @@ class DeepseekV3WeightLoader:
         all_named_modules: dict[str,
                                 nn.Module] = dict(self.model.named_modules())
 
+        # group name -> list of (module name, nn.Module)
         module_groups: dict[str, list[tuple[str,
                                             nn.Module]]] = defaultdict(list)
         for name, module in all_named_modules.items():
@@ -206,14 +214,48 @@ class DeepseekV3WeightLoader:
 
         module_group_list = list(module_groups.values())
 
+        disable_parallel_loading = os.environ.get(
+            "TRTLLM_DEEPSEEKV3_DISABLE_PARALLEL_WEIGHTS_LOADING",
+            "False") in ["True", "true", "1", "yes", "y"]
+
+        cur_device = torch.cuda.current_device()
+        # each weight loading stream uses its own stream to improve parallelism
+        weight_loading_stream_local = threading.local()
+        # a list to collect all streams to synchronize at the end
+        weight_loading_streams: list[torch.cuda.Stream] = []
+        # lock to guard against race condition when updating `weight_loading_streams`
+        weight_loading_stream_lock = threading.Lock()
+
+        def get_weight_loading_stream() -> torch.cuda.Stream:
+            """
+            Called within a weight loading thread to get a unique stream for the thread.
+            """
+            if disable_parallel_loading:
+                return torch.cuda.current_stream()
+
+            stream = getattr(weight_loading_stream_local, "stream", None)
+            if stream is None:
+                stream = torch.cuda.Stream()
+                weight_loading_stream_local.stream = stream
+                with weight_loading_stream_lock:
+                    weight_loading_streams.append(stream)
+            return stream
+
         def load_module_group(
                 module_group: list[tuple[str, nn.Module]]) -> None:
-            for name, module in module_group:
-                self._load_single_module(name, module, all_named_modules,
-                                         weights)
+            """
+            Load one layer of modules.
 
-        if os.environ.get("TRT_LLM_DISABLE_LOAD_WEIGHTS_IN_PARALLEL",
-                          "False") in ["True", "true", "1", "yes", "y"]:
+            This is the function to be parallelized during weight loading.
+            """
+            torch.cuda.set_device(cur_device)
+            stream = get_weight_loading_stream()
+            with torch.cuda.stream(stream):
+                for name, module in module_group:
+                    self._load_single_module(name, module, all_named_modules,
+                                             weights)
+
+        if disable_parallel_loading:
             for module_group in tqdm(module_group_list, desc="Loading weights"):
                 load_module_group(module_group)
         else:
@@ -223,10 +265,22 @@ class DeepseekV3WeightLoader:
                                  [(module_group, )
                                   for module_group in module_group_list],
                                  pbar=pbar)
+            for stream in weight_loading_streams:
+                stream.synchronize()
 
     def _load_single_module(self, name: str, module: nn.Module,
                             all_named_modules: dict[str, nn.Module],
-                            weights: ConsumableWeightsDict):
+                            weights: ConsumableWeightsDict) -> None:
+        """
+        Called by `load_weights()` to load a single module.
+
+        Args:
+            name: name of the module
+            module: the module to load weights into
+            all_named_modules: a dictionary of all named modules in the model, used to find the parent module
+                for some special handling (self_attn.kv_b_proj will update its parent module's data).
+            weights: weight dict
+        """
 
         def requantize_weight_with_new_scale(
                 weight: torch.Tensor, weight_scale: torch.Tensor,
@@ -421,6 +475,9 @@ class DeepseekV3WeightLoader:
         # Check if weights supports mark_consumed (ConsumableWeightsDict)
         can_mark_consumed = hasattr(weights, 'mark_consumed')
 
+        # The two `if True` here is to indent the main data loading code block the same as the original
+        # unparallelized code to avoid too many lines of change on git.
+        # Once related feature branches are merged, we can remove this indentation.
         if True:
             if True:
                 names: list[str] = name.split('.')
