@@ -1123,27 +1123,71 @@ class Deepseekv3MegaMoE(nn.Module):
         # ========= Shared experts gate_up_proj  =========
         shared_experts = old_moe.shared_experts
         shared_gate_up_proj = shared_experts.gate_up_proj
-        assert hidden_states.ndim == 2, (
-            f"hidden_states must be 2D, got {hidden_states.shape}")
-        assert hidden_states.dtype == torch.bfloat16, (
-            f"hidden_states must be bfloat16, got {hidden_states.dtype}")
+
+        def check_data(tensor: torch.Tensor, name: str, dtype: torch.dtype,
+                       shape: tuple[int, ...]) -> None:
+            assert tensor.dtype == dtype, (
+                f"{name} must have dtype {dtype}, got {tensor.dtype}")
+            assert tensor.ndim == len(shape), (
+                f"{name} must have {len(shape)} dims, got {tensor.shape}")
+            for dim, expected_dim in enumerate(shape):
+                if expected_dim == -1:
+                    continue
+                assert tensor.shape[dim] == expected_dim, (
+                    f"{name} dim {dim} must be {expected_dim}, got "
+                    f"{tensor.shape[dim]} for shape {tensor.shape}")
+
+        check_data(hidden_states, "hidden_states", torch.bfloat16, (-1, 6144))
         assert shared_gate_up_proj.has_fp8_block_scales
         assert shared_gate_up_proj.bias is None, (
             f"shared_gate_up_proj.bias must be None, got "
             f"{shared_gate_up_proj.bias}")
         assert is_sm_100f(), (
             "fp8_quantize_1x128_packed_ue8m0 requires SM100-family Blackwell")
+
+        assert isinstance(
+            shared_gate_up_proj.weight, torch.Tensor
+        ), f"shared_gate_up_proj.weight must be a tensor, got {type(shared_gate_up_proj.weight)}"
+        assert isinstance(
+            shared_gate_up_proj.weight_scale, torch.Tensor
+        ), f"shared_gate_up_proj.weight_scale must be a tensor, got {type(shared_gate_up_proj.weight_scale)}"
+
+        num_tokens: int = hidden_states.size(0)
+        hidden_size: int = hidden_states.size(1)
+        block_scale_int32_hidden_size: int = int(
+            triton.cdiv(hidden_size, 128 * 4))
+        num_router_experts: int = 256
+        # The weight combines gate and up projection matrices.
+        expert_intermediate_size: int = shared_gate_up_proj.weight.size(0) // 2
+        gate_up_output_size: int = 2 * expert_intermediate_size
+
         shared_gate_up_output = torch.empty(
-            (hidden_states.size(0), shared_gate_up_proj.weight.size(0)),
+            (num_tokens, gate_up_output_size),
             device=hidden_states.device,
             dtype=torch.bfloat16,
         )
+
+        shared_gate_up_input_fp8, shared_gate_up_input_scale = (
+            torch.ops.trtllm.fp8_quantize_1x128_packed_ue8m0(hidden_states))
+        check_data(shared_gate_up_input_fp8, "shared_gate_up_input_fp8",
+                   torch.float8_e4m3fn, tuple(hidden_states.shape))
+        check_data(shared_gate_up_input_scale, "shared_gate_up_input_scale",
+                   torch.int32, (num_tokens, block_scale_int32_hidden_size))
+        check_data(shared_gate_up_proj.weight, "shared_gate_up_weight",
+                   torch.float8_e4m3fn, (gate_up_output_size, hidden_size))
+        check_data(shared_gate_up_proj.weight_scale,
+                   "shared_gate_up_weight_scale", torch.int32,
+                   (gate_up_output_size, block_scale_int32_hidden_size))
+
+        # ========== Shared experts gate_up_proj  =========
         # JIT CUDA template: cpp/include/tensorrt_llm/deep_gemm/fp8_gemm_impl.cuh
         # Launch helper: cpp/include/tensorrt_llm/deep_gemm/fp8_gemm.cuh
         deep_gemm.fp8_gemm_nt(
             # Op wrapper at cpp/tensorrt_llm/thop/fp8Quantize.cpp
             # cpp/tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_quant_packed.cu
-            torch.ops.trtllm.fp8_quantize_1x128_packed_ue8m0(hidden_states),
+            (shared_gate_up_input_fp8, shared_gate_up_input_scale),
+            # weight: [2 * expert_intermediate_size, hidden_size] fp8_e4m3
+            # weight_scale: [2 * expert_intermediate_size, hidden_size / 128 / 4] packed UE8M0 int32
             (shared_gate_up_proj.weight, shared_gate_up_proj.weight_scale),
             shared_gate_up_output,
         )
@@ -1164,11 +1208,15 @@ class Deepseekv3MegaMoE(nn.Module):
         # Torch op wrapper: cpp/tensorrt_llm/thop/dsv3RouterGemmOp.cpp
         # cpp/tensorrt_llm/kernels/dsv3MinLatencyKernels/dsv3RouterGemm.cu
         # Launcher: cpp/tensorrt_llm/kernels/dsv3MinLatencyKernels/dsv3RouterGemm.cu
+        check_data(old_moe.gate.weight, "shared_experts.gate.weight",
+                   torch.bfloat16, (num_router_experts, hidden_size))
         router_logits = torch.ops.trtllm.dsv3_router_gemm_op(
             hidden_states,
             old_moe.gate.weight.t(),
             bias=None,
             out_dtype=torch.float32)
+        check_data(router_logits, "router_logits", torch.float32,
+                   (num_tokens, num_router_experts))
         # ========= End of Experts router logits  =========
 
         # Outer call to the routed-experts backend. With fp8_log_old_tp4.yaml
