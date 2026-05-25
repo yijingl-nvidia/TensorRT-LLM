@@ -40,6 +40,7 @@ from tqdm import tqdm
 from transformers import PretrainedConfig
 
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
+from tensorrt_llm import deep_gemm
 from tensorrt_llm._ipc_utils import can_access_peer
 from tensorrt_llm._torch.models.checkpoints.base_weight_loader import \
     ConsumableWeightsDict
@@ -1119,6 +1120,7 @@ class Deepseekv3MegaMoE(nn.Module):
         assert do_finalize is True, "Deepseekv3MegaMoE only supports do_finalize=True"
 
         # Direct Blackwell DeepGEMM replacement for shared_experts.gate_up_proj.
+        # ========= Shared experts gate_up_proj  =========
         shared_experts = old_moe.shared_experts
         shared_gate_up_proj = shared_experts.gate_up_proj
         assert hidden_states.ndim == 2, (
@@ -1129,48 +1131,45 @@ class Deepseekv3MegaMoE(nn.Module):
         assert shared_gate_up_proj.bias is None, (
             f"shared_gate_up_proj.bias must be None, got "
             f"{shared_gate_up_proj.bias}")
-        shared_gate_up_output = torch.ops.trtllm.fp8_swap_ab_gemm(
-            hidden_states,
-            shared_gate_up_proj.weight,
-            shared_gate_up_proj.weight_scale,
+        assert is_sm_100f(), (
+            "fp8_quantize_1x128_packed_ue8m0 requires SM100-family Blackwell")
+        shared_gate_up_output = torch.empty(
+            (hidden_states.size(0), shared_gate_up_proj.weight.size(0)),
+            device=hidden_states.device,
+            dtype=torch.bfloat16,
         )
+        # JIT CUDA template: cpp/include/tensorrt_llm/deep_gemm/fp8_gemm_impl.cuh
+        # Launch helper: cpp/include/tensorrt_llm/deep_gemm/fp8_gemm.cuh
+        deep_gemm.fp8_gemm_nt(
+            # Op wrapper at cpp/tensorrt_llm/thop/fp8Quantize.cpp
+            # cpp/tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_quant_packed.cu
+            torch.ops.trtllm.fp8_quantize_1x128_packed_ue8m0(hidden_states),
+            (shared_gate_up_proj.weight, shared_gate_up_proj.weight_scale),
+            shared_gate_up_output,
+        )
+        # ========= End of Shared experts gate_up_proj  =========
 
-        # # DEBUG: uniform noise in [-0.02, 0.02] has E(abs(noise)) = 0.01.
-        # shared_gate_up_noise_mean_abs = 5.0
-        # shared_gate_up_noise_generator = torch.Generator(
-        #     device=shared_gate_up_output.device)
-        # shared_gate_up_noise_generator.manual_seed(6108841 + self.layer_idx)
-        # shared_gate_up_noise = torch.empty(
-        #     shared_gate_up_output.shape,
-        #     device=shared_gate_up_output.device,
-        #     dtype=shared_gate_up_output.dtype,
-        # ).uniform_(
-        #     -2 * shared_gate_up_noise_mean_abs,
-        #     2 * shared_gate_up_noise_mean_abs,
-        #     generator=shared_gate_up_noise_generator,
-        # )
-        # shared_gate_up_output = (
-        #     shared_gate_up_output + shared_gate_up_noise)
+        # ========= Shared experts SwiGLU activation  =========
+        assert shared_experts.activation == torch.nn.functional.silu
+        assert not shared_experts.down_proj.has_fp8_qdq
+        assert not shared_experts.down_proj.has_w4a8_nvfp4_fp8
 
-        # Kernel input to torch.ops.trtllm.silu_and_mul.
-        shared_swiglu_output = shared_experts._apply_activation(
-            shared_gate_up_output)
+        # tensorrt_llm/_torch/modules/swiglu.py
+        shared_swiglu_output = torch.ops.trtllm.silu_and_mul(
+            shared_gate_up_output, swiglu_limit=shared_experts.swiglu_limit)
+        # ========= End of Shared experts SwiGLU activation  =========
 
-        # Kernel input to shared_experts.down_proj:
-        # FP8-block scale path uses Linear -> FP8BlockScalesLinearMethod.apply.
-        shared_output = shared_experts.down_proj(
-            shared_swiglu_output,
-            all_reduce_params=None,
-            layer_idx=shared_experts.layer_idx)
-        if old_moe.shared_output_scale is not None:
-            shared_output *= old_moe.shared_output_scale
-
+        # ========= Experts router logits  =========
         # compute routed output
+        # Torch op wrapper: cpp/tensorrt_llm/thop/dsv3RouterGemmOp.cpp
+        # cpp/tensorrt_llm/kernels/dsv3MinLatencyKernels/dsv3RouterGemm.cu
+        # Launcher: cpp/tensorrt_llm/kernels/dsv3MinLatencyKernels/dsv3RouterGemm.cu
         router_logits = torch.ops.trtllm.dsv3_router_gemm_op(
             hidden_states,
             old_moe.gate.weight.t(),
             bias=None,
             out_dtype=torch.float32)
+        # ========= End of Experts router logits  =========
 
         # Outer call to the routed-experts backend. With fp8_log_old_tp4.yaml
         # this resolves to ConfigurableMoE -> TRTLLMGenFusedMoE. The tuned
@@ -1179,7 +1178,6 @@ class Deepseekv3MegaMoE(nn.Module):
         routed_experts_kwargs = ({
             "alltoall_result_do_sum": False
         } if isinstance(old_moe.experts, WideEPMoE) else {})
-
         routed_output = old_moe.experts(
             hidden_states,
             router_logits,
@@ -1189,6 +1187,19 @@ class Deepseekv3MegaMoE(nn.Module):
             use_dp_padding=False,
             **routed_experts_kwargs,
         )
+
+        # ========== Shared experts down_proj  =========
+        # Kernel input to shared_experts.down_proj:
+        # FP8-block scale path uses Linear -> FP8BlockScalesLinearMethod.apply.
+        shared_output = shared_experts.down_proj(
+            shared_swiglu_output,
+            all_reduce_params=None,
+            layer_idx=shared_experts.layer_idx)
+
+        assert old_moe.shared_output_scale is None, f"shared_output_scale must be None, got {old_moe.shared_output_scale}"
+        # if old_moe.shared_output_scale is not None:
+        #     shared_output *= old_moe.shared_output_scale
+        # ========= End of Shared experts down_proj  =========
 
         output_tensor = None
         if not old_moe.use_dp and old_moe.mapping.tp_size > 1:
