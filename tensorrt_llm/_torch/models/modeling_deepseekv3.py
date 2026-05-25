@@ -1154,11 +1154,16 @@ class Deepseekv3MegaMoE(nn.Module):
 
         num_tokens: int = hidden_states.size(0)
         hidden_size: int = hidden_states.size(1)
+        block_scale_fp32_hidden_Size: int = int(triton.cdiv(hidden_size, 128))
         block_scale_int32_hidden_size: int = int(
             triton.cdiv(hidden_size, 128 * 4))
         num_router_experts: int = 256
         # The weight combines gate and up projection matrices.
         expert_intermediate_size: int = shared_gate_up_proj.weight.size(0) // 2
+        block_scale_fp32_expert_intermediate_size: int = int(
+            triton.cdiv(expert_intermediate_size, 128))
+        block_scale_int32_expert_intermediate_size: int = int(
+            triton.cdiv(expert_intermediate_size, 128 * 4))
         gate_up_output_size: int = 2 * expert_intermediate_size
 
         shared_gate_up_output = torch.empty(
@@ -1219,22 +1224,101 @@ class Deepseekv3MegaMoE(nn.Module):
                    (num_tokens, num_router_experts))
         # ========= End of Experts router logits  =========
 
-        # Outer call to the routed-experts backend. With fp8_log_old_tp4.yaml
-        # this resolves to ConfigurableMoE -> TRTLLMGenFusedMoE. The tuned
-        # kernel is reached under TRTLLMGenFusedMoE.run_moe(), which calls
-        # torch.ops.trtllm.fp8_block_scale_moe_runner for FP8 block scales.
-        routed_experts_kwargs = ({
-            "alltoall_result_do_sum": False
-        } if isinstance(old_moe.experts, WideEPMoE) else {})
-        routed_output = old_moe.experts(
-            hidden_states,
-            router_logits,
-            do_finalize=do_finalize,
-            output_dtype=hidden_states.dtype,
-            all_rank_num_tokens=all_rank_num_tokens,
-            use_dp_padding=False,
-            **routed_experts_kwargs,
+        # ========= Routed experts TRTLLMGen FP8 block-scale MoE  =========
+        routed_experts = old_moe.experts
+        assert routed_experts.__class__.__name__ == "ConfigurableMoE", (
+            f"expected ConfigurableMoE, got {type(routed_experts)}")
+        assert routed_experts.comm is None, (
+            f"expected no routed-experts communication, got {routed_experts.comm}"
         )
+        assert not routed_experts.enable_alltoall
+        assert not routed_experts.apply_router_weight_on_input
+        assert not routed_experts._using_load_balancer()
+        assert not routed_experts.backend._supports_load_balancer()
+        assert not routed_experts.routing_method.requires_separated_routing
+
+        routed_all_rank_num_tokens = (all_rank_num_tokens if all_rank_num_tokens
+                                      is not None else [num_tokens])
+        assert routed_experts.calculate_num_chunks(
+            routed_all_rank_num_tokens) == 1
+
+        moe_backend = routed_experts.backend
+        assert moe_backend.__class__.__name__ == "TRTLLMGenFusedMoE", (
+            f"expected TRTLLMGenFusedMoE, got {type(moe_backend)}")
+        assert not moe_backend.use_flashinfer
+        assert moe_backend.has_deepseek_fp8_block_scales
+        assert moe_backend.num_experts == num_router_experts
+        assert moe_backend.num_slots == num_router_experts
+        assert moe_backend.hidden_size == hidden_size
+        assert num_router_experts == moe_backend.w3_w1_weight.size(0)
+
+        routed_input_fp8, routed_input_scale = torch.ops.trtllm.fp8_quantize_1x128(
+            hidden_states)
+        check_data(routed_input_fp8, "routed_moe_input_fp8",
+                   torch.float8_e4m3fn, tuple(hidden_states.shape))
+        check_data(routed_input_scale, "routed_moe_input_scale", torch.float32,
+                   (block_scale_fp32_hidden_Size, num_tokens))
+
+        routing_params = moe_backend._extract_routing_params()
+        routing_bias = routing_params.routing_bias
+        check_data(routing_bias, "routed_moe_routing_bias", torch.bfloat16,
+                   (num_router_experts, ))
+
+        # w1: gate proj
+        # w2: down proj
+        # w3: up proj
+        check_data(
+            moe_backend.w3_w1_weight, "routed_moe_w3_w1_weight",
+            torch.float8_e4m3fn,
+            (num_router_experts, 2 * expert_intermediate_size, hidden_size))
+        check_data(
+            moe_backend.w3_w1_weight_scaling_factor,
+            "routed_moe_w3_w1_weight_scaling_factor", torch.float32,
+            (num_router_experts, 2 * block_scale_fp32_expert_intermediate_size,
+             block_scale_fp32_hidden_Size))
+        check_data(moe_backend.w2_weight, "routed_moe_w2_weight",
+                   torch.float8_e4m3fn,
+                   (num_router_experts, hidden_size, expert_intermediate_size))
+        check_data(moe_backend.w2_weight_scaling_factor,
+                   "routed_moe_w2_weight_scaling_factor", torch.float32,
+                   (num_router_experts, block_scale_fp32_hidden_Size,
+                    block_scale_fp32_expert_intermediate_size))
+
+        routed_output = torch.ops.trtllm.fp8_block_scale_moe_runner(
+            router_logits,
+            routing_bias,
+            routed_input_fp8,
+            routed_input_scale,
+            moe_backend.w3_w1_weight,
+            moe_backend.w3_w1_weight_scaling_factor,
+            moe_backend.w2_weight,
+            moe_backend.w2_weight_scaling_factor,
+            moe_backend.num_slots,
+            routing_params.top_k,
+            routing_params.n_group,
+            routing_params.topk_group,
+            moe_backend.intermediate_size_per_partition,
+            moe_backend.slot_start,
+            num_router_experts,
+            routing_params.routed_scaling_factor,
+            moe_backend.routing_method.routing_method_type,
+            topk_weights=None,
+            topk_ids=None,
+            act_type=0,
+            gemm1_clamp_limit=moe_backend.swiglu_limit_scalar,
+            output=None,
+            tune_max_num_tokens=moe_backend.max_num_tokens,
+            use_dp=moe_backend.use_dp,
+        )
+        check_data(routed_output, "routed_moe_output", torch.bfloat16,
+                   tuple(hidden_states.shape))
+
+        if routed_experts.enable_dwdp:
+            routed_experts.dwdp_manager.record_compute_and_prefetch_next(
+                routed_experts.layer_idx)
+        routed_experts.repeat_idx = ((routed_experts.repeat_idx + 1) %
+                                     routed_experts.repeat_count)
+        # ========= End of Routed experts TRTLLMGen FP8 block-scale MoE  =========
 
         # ========== Shared experts down_proj  =========
         # Kernel input to shared_experts.down_proj:
