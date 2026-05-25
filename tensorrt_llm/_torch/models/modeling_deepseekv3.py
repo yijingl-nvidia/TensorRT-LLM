@@ -480,6 +480,9 @@ class DeepseekV3WeightLoader:
         # Once related feature branches are merged, we can remove this indentation.
         if True:
             if True:
+                name = name.replace(
+                    "._old_moe",
+                    "")  # hack for finding correct weight names for MoE modules
                 names: list[str] = name.split('.')
                 parent_module_name = '.'.join(names[:-1])
                 if "model.layers" in name and int(
@@ -1068,6 +1071,55 @@ class DeepseekV3Gate(nn.Module):
         return self.routing_method.top_k
 
 
+class Deepseekv3MegaMoE(nn.Module):
+
+    def __init__(
+        self,
+        *,
+        num_experts: int,
+        top_k: int,
+        hidden_size: int,
+        intermediate_size: int,
+        shared_expert_intermediate_size: int,
+        aux_stream_dict: Dict[AuxStreamType, torch.cuda.Stream],
+        layer_idx: int,
+        dtype: Optional[torch.dtype] = None,
+        model_config: ModelConfig = ModelConfig(),
+        override_quant_config: Optional[QuantConfig] = None,
+    ):
+        super().__init__()
+        self._old_moe = Deepseekv3MoE(
+            num_experts=num_experts,
+            top_k=top_k,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            shared_expert_intermediate_size=shared_expert_intermediate_size,
+            aux_stream_dict=aux_stream_dict,
+            layer_idx=layer_idx,
+            dtype=dtype,
+            model_config=model_config,
+            override_quant_config=override_quant_config,
+        )
+
+    @property
+    def experts(self) -> MoE:
+        return self._old_moe.experts
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        hidden_states_fp4: Fp4QuantizedTensor | None = None,
+        all_rank_num_tokens: list[int] | None = None,
+        final_all_reduce_params: AllReduceParams | None = None,
+        do_finalize: bool | None = True,
+    ) -> torch.Tensor:
+        # if self._old_moe.mapping.rank == 0:
+        #     print("Using old MoE forward!")
+        return self._old_moe(hidden_states, hidden_states_fp4,
+                             all_rank_num_tokens, final_all_reduce_params,
+                             do_finalize)
+
+
 class Deepseekv3MoE(nn.Module):
 
     def __init__(
@@ -1542,7 +1594,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
             self.fusion_config.PRE_MOE_FUSION = self.enable_fusion and has_tp
             self.fusion_config.POST_MOE_FUSION = self.fusion_config.PRE_MOE_FUSION
 
-            self.mlp = Deepseekv3MoE(
+            self.mlp = Deepseekv3MegaMoE(
                 num_experts=self.num_experts,
                 top_k=self.top_k,
                 hidden_size=self.hidden_size,
@@ -1691,7 +1743,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         residual = maybe_slice_for_helix_cp(residual, attn_metadata,
                                             self.mapping_with_cp,
                                             self.layer_idx)
-        if isinstance(self.mlp, Deepseekv3MoE):
+        if isinstance(self.mlp, (Deepseekv3MoE, Deepseekv3MegaMoE)):
             if spec_metadata is not None and spec_metadata.is_layer_capture(
                     self.layer_idx):
                 self.fusion_config.POST_MOE_FUSION = False
