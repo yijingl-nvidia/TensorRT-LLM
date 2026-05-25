@@ -1115,9 +1115,75 @@ class Deepseekv3MegaMoE(nn.Module):
     ) -> torch.Tensor:
         # if self._old_moe.mapping.rank == 0:
         #     print("Using old MoE forward!")
-        return self._old_moe(hidden_states, hidden_states_fp4,
-                             all_rank_num_tokens, final_all_reduce_params,
-                             do_finalize)
+        old_moe = self._old_moe
+        assert do_finalize is True, "Deepseekv3MegaMoE only supports do_finalize=True"
+
+        # compute shared output
+        shared_experts = old_moe.shared_experts
+        # Kernel input to shared_experts.gate_up_proj:
+        # FP8-block scale path uses Linear -> FP8BlockScalesLinearMethod.apply,
+        # which calls fp8_swap_ab_gemm/fp8_block_scaling_gemm depending on SM.
+        shared_gate_up_output = shared_experts.gate_up_proj(hidden_states)
+
+        # Kernel input to torch.ops.trtllm.silu_and_mul.
+        shared_swiglu_output = shared_experts._apply_activation(
+            shared_gate_up_output)
+
+        # Kernel input to shared_experts.down_proj:
+        # FP8-block scale path uses Linear -> FP8BlockScalesLinearMethod.apply.
+        shared_output = shared_experts.down_proj(
+            shared_swiglu_output,
+            all_reduce_params=None,
+            layer_idx=shared_experts.layer_idx)
+        if old_moe.shared_output_scale is not None:
+            shared_output *= old_moe.shared_output_scale
+
+        # compute routed output
+        router_logits = torch.ops.trtllm.dsv3_router_gemm_op(
+            hidden_states,
+            old_moe.gate.weight.t(),
+            bias=None,
+            out_dtype=torch.float32)
+
+        # Outer call to the routed-experts backend. With fp8_log_old_tp4.yaml
+        # this resolves to ConfigurableMoE -> TRTLLMGenFusedMoE. The tuned
+        # kernel is reached under TRTLLMGenFusedMoE.run_moe(), which calls
+        # torch.ops.trtllm.fp8_block_scale_moe_runner for FP8 block scales.
+        routed_experts_kwargs = ({
+            "alltoall_result_do_sum": False
+        } if isinstance(old_moe.experts, WideEPMoE) else {})
+
+        routed_output = old_moe.experts(
+            hidden_states,
+            router_logits,
+            do_finalize=do_finalize,
+            output_dtype=hidden_states.dtype,
+            all_rank_num_tokens=all_rank_num_tokens,
+            use_dp_padding=False,
+            **routed_experts_kwargs,
+        )
+
+        output_tensor = None
+        if not old_moe.use_dp and old_moe.mapping.tp_size > 1:
+            allocate_output_input = shared_output
+            allocate_output_buffer_kind = old_moe.allreduce.output_buffer_kind
+            allocate_output_tp_group = old_moe.mapping.tp_group
+            w, actual_kind = torch.ops.trtllm.allocate_output(
+                allocate_output_input, allocate_output_buffer_kind,
+                allocate_output_tp_group)
+            if actual_kind == int(BufferKind.NCCL_WINDOW):
+                output_tensor = w
+
+        assert shared_output.size() == routed_output.size(
+        ), 'unmatched tensor shape'
+        if output_tensor is not None:
+            final_hidden_states = torch.add(shared_output,
+                                            routed_output,
+                                            out=output_tensor)
+        else:
+            final_hidden_states = shared_output.add_(routed_output)
+
+        return final_hidden_states
 
 
 class Deepseekv3MoE(nn.Module):
@@ -1792,6 +1858,13 @@ class DeepseekV3DecoderLayer(DecoderLayer):
             (shared_output, fc2_output, expert_scale_factor, expanded_idx_to_permuted_idx) are passed to a
             bigger post-MoE fused kernel to combine with rest of the operations, by calling self.moe_allreduce().
         """
+
+        # if self.mapping.rank == 0 and self.layer_idx == 10:
+        #     print(
+        #         f"[DeepseekV3DecoderLayer] layer_idx={self.layer_idx} "
+        #         f"PRE_MOE_FUSION={self.fusion_config.PRE_MOE_FUSION} "
+        #         f"POST_MOE_FUSION={self.fusion_config.POST_MOE_FUSION}",
+        #         flush=True)
 
         def _run_MoE(hidden_states, hidden_states_fp4, do_finalize):
             return self.mlp(
