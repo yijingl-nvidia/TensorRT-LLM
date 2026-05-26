@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -398,6 +398,16 @@ public:
 
     void run(
         MoERunnerArgs const& args, MoEWorkspace const& workspace, int device, cudaStream_t stream, int64_t configIndex);
+
+    void runPermuteGemm1(
+        MoERunnerArgs const& args, MoEWorkspace const& workspace, int device, cudaStream_t stream, int64_t configIndex);
+
+    void runActivation(MoERunnerArgs const& args, MoEWorkspace const& workspace, cudaStream_t stream);
+
+    void runGemm2(
+        MoERunnerArgs const& args, MoEWorkspace const& workspace, int device, cudaStream_t stream, int64_t configIndex);
+
+    void runFinalize(MoERunnerArgs const& args, MoEWorkspace const& workspace, cudaStream_t stream);
 
     [[nodiscard]] std::tuple<int32_t, int32_t> getWorkspaceSizeInBytes(
         MoERunnerArgs const& args, int64_t configIndex) const;

@@ -1250,6 +1250,7 @@ class Deepseekv3MegaMoE(nn.Module):
         assert moe_backend.num_experts == num_router_experts
         assert moe_backend.num_slots == num_router_experts
         assert moe_backend.hidden_size == hidden_size
+        assert moe_backend.intermediate_size_per_partition == expert_intermediate_size
         assert num_router_experts == moe_backend.w3_w1_weight.size(0)
 
         routed_input_fp8, routed_input_scale = torch.ops.trtllm.fp8_quantize_1x128(
@@ -1284,15 +1285,10 @@ class Deepseekv3MegaMoE(nn.Module):
                    (num_router_experts, block_scale_fp32_hidden_Size,
                     block_scale_fp32_expert_intermediate_size))
 
-        routed_output = torch.ops.trtllm.fp8_block_scale_moe_runner(
-            router_logits,
-            routing_bias,
-            routed_input_fp8,
-            routed_input_scale,
-            moe_backend.w3_w1_weight,
-            moe_backend.w3_w1_weight_scaling_factor,
-            moe_backend.w2_weight,
-            moe_backend.w2_weight_scaling_factor,
+        from tensorrt_llm._torch.custom_ops.trtllm_gen_custom_ops import (
+            AutoTuner, FP8BlockScaleMoERunner, prepare_dummy_topk_and_hook)
+
+        fp8_moe_runner = FP8BlockScaleMoERunner(
             moe_backend.num_slots,
             routing_params.top_k,
             routing_params.n_group,
@@ -1302,13 +1298,220 @@ class Deepseekv3MegaMoE(nn.Module):
             num_router_experts,
             routing_params.routed_scaling_factor,
             moe_backend.routing_method.routing_method_type,
-            topk_weights=None,
-            topk_ids=None,
             act_type=0,
-            gemm1_clamp_limit=moe_backend.swiglu_limit_scalar,
-            output=None,
             tune_max_num_tokens=moe_backend.max_num_tokens,
             use_dp=moe_backend.use_dp,
+            gemm1_clamp_limit_value=moe_backend.swiglu_limit_scalar,
+        )
+        fp8_moe_tuner = AutoTuner.get()
+        routing_method_type = moe_backend.routing_method.routing_method_type
+        (routing_logits_for_tuner, topk_weights_for_tuner, topk_ids_for_tuner,
+         tuning_config_with_hook) = (prepare_dummy_topk_and_hook(
+             routing_method_type=routing_method_type,
+             topk_weights=None,
+             topk_ids=None,
+             hidden_states=routed_input_fp8,
+             routing_logits=router_logits,
+             base_tuning_config=fp8_moe_runner.tuning_config,
+             top_k=routing_params.top_k,
+             num_experts=moe_backend.num_slots,
+             local_num_experts=num_router_experts,
+             n_group=routing_params.n_group,
+             topk_group=routing_params.topk_group,
+             routed_scaling_factor=routing_params.routed_scaling_factor,
+             hidden_states_index=2,
+             local_expert_offset=moe_backend.slot_start,
+             use_dp=moe_backend.use_dp,
+         ))
+        input_tensors_for_tuner = [
+            routing_logits_for_tuner,
+            routing_bias,
+            routed_input_fp8,
+            routed_input_scale,
+            moe_backend.w3_w1_weight,
+            moe_backend.w3_w1_weight_scaling_factor,
+            moe_backend.w2_weight,
+            moe_backend.w2_weight_scaling_factor,
+            topk_weights_for_tuner,
+            topk_ids_for_tuner,
+        ]
+        fp8_moe_runner, best_tactic = fp8_moe_tuner.choose_one(
+            "trtllm::fp8_block_scale_moe_runner",
+            [fp8_moe_runner],
+            tuning_config_with_hook,
+            input_tensors_for_tuner,
+        )
+        tactic = [-1, -1] if best_tactic == -1 else best_tactic
+        fp8_moe_cpp_runner = fp8_moe_runner.get_runner()
+        resolved_tactic = fp8_moe_cpp_runner.resolve_tactic(
+            routing_params.top_k,
+            hidden_size,
+            moe_backend.intermediate_size_per_partition,
+            num_router_experts,
+            num_tokens,
+            tactic,
+        )
+
+        def ceil_div(x: int, y: int) -> int:
+            return (x + y - 1) // y
+
+        def get_max_num_ctas_in_batch_dim(num_tokens: int, top_k: int,
+                                          num_experts: int,
+                                          tile_tokens_dim: int) -> int:
+            num_remaining_tokens = num_tokens * top_k
+            max_num_ctas = min(num_experts, num_remaining_tokens)
+            num_remaining_tokens -= max_num_ctas
+            if num_remaining_tokens > 0:
+                max_num_ctas += num_remaining_tokens // tile_tokens_dim
+            return max_num_ctas
+
+        def maybe_get_min_token_count(num_padded_tokens: int, hidden_dim: int,
+                                      dtype_size_bits: int) -> int:
+            min_num_tokens_required = ceil_div(128 * 1024 * 8,
+                                               hidden_dim * dtype_size_bits)
+            return max(num_padded_tokens, min_num_tokens_required)
+
+        tile_tokens_dim = int(resolved_tactic[0])
+        max_num_ctas = get_max_num_ctas_in_batch_dim(num_tokens,
+                                                     routing_params.top_k,
+                                                     moe_backend.num_slots,
+                                                     tile_tokens_dim)
+        max_num_padded_tokens = max_num_ctas * tile_tokens_dim
+        max_num_padded_tokens_gemm1 = maybe_get_min_token_count(
+            max_num_padded_tokens,
+            2 * moe_backend.intermediate_size_per_partition, 8)
+        max_num_padded_tokens_gemm2 = maybe_get_min_token_count(
+            max_num_padded_tokens, hidden_size, 16)
+
+        # Routed experts routing.
+        routing_outputs = fp8_moe_cpp_runner.run_routing(
+            router_logits,
+            routing_bias,
+            routed_input_fp8,
+            moe_backend.num_slots,
+            routing_params.top_k,
+            routing_params.n_group,
+            routing_params.topk_group,
+            moe_backend.intermediate_size_per_partition,
+            moe_backend.slot_start,
+            num_router_experts,
+            routing_params.routed_scaling_factor,
+            routing_method_type,
+            resolved_tactic,
+            None,
+            None,
+        )
+        (routing_expert_indexes, expert_count_histogram,
+         total_num_padded_tokens, expanded_idx_to_permuted_idx,
+         permuted_idx_to_token_idx, expert_weights, num_tokens_per_expert,
+         cta_idx_xy_to_batch_idx, cta_idx_xy_to_mn_limit,
+         num_non_exiting_ctas) = routing_outputs
+        check_data(routing_expert_indexes, "routed_moe_routing_expert_indexes",
+                   torch.int32, (num_tokens, routing_params.top_k))
+        check_data(expert_count_histogram, "routed_moe_expert_count_histogram",
+                   torch.int32, (max(num_router_experts * 2, 256 * 2), ))
+        check_data(total_num_padded_tokens,
+                   "routed_moe_total_num_padded_tokens", torch.int32, ())
+        check_data(expanded_idx_to_permuted_idx,
+                   "routed_moe_expanded_idx_to_permuted_idx", torch.int32,
+                   (num_tokens * routing_params.top_k, ))
+        check_data(permuted_idx_to_token_idx,
+                   "routed_moe_permuted_idx_to_token_idx", torch.int32,
+                   (max_num_padded_tokens, ))
+        check_data(expert_weights, "routed_moe_expert_weights", torch.bfloat16,
+                   (num_tokens, routing_params.top_k))
+        check_data(num_tokens_per_expert, "routed_moe_num_tokens_per_expert",
+                   torch.int32, (num_router_experts, ))
+        check_data(cta_idx_xy_to_batch_idx,
+                   "routed_moe_cta_idx_xy_to_batch_idx", torch.int32,
+                   (max_num_ctas, ))
+        check_data(cta_idx_xy_to_mn_limit, "routed_moe_cta_idx_xy_to_mn_limit",
+                   torch.int32, (max_num_ctas, ))
+        check_data(num_non_exiting_ctas, "routed_moe_num_non_exiting_ctas",
+                   torch.int32, ())
+
+        # Routed experts permute + GEMM1.
+        gemm1_output, gemm1_output_scale = (
+            fp8_moe_cpp_runner.run_permute_gemm1(
+                routed_input_fp8,
+                routed_input_scale,
+                moe_backend.w3_w1_weight,
+                moe_backend.w3_w1_weight_scaling_factor,
+                expert_weights,
+                permuted_idx_to_token_idx,
+                total_num_padded_tokens,
+                cta_idx_xy_to_batch_idx,
+                cta_idx_xy_to_mn_limit,
+                num_non_exiting_ctas,
+                moe_backend.num_slots,
+                routing_params.top_k,
+                moe_backend.intermediate_size_per_partition,
+                num_router_experts,
+                resolved_tactic,
+            ))
+        check_data(gemm1_output, "routed_moe_gemm1_output", torch.float8_e4m3fn,
+                   (max_num_padded_tokens_gemm1,
+                    2 * moe_backend.intermediate_size_per_partition))
+        check_data(gemm1_output_scale, "routed_moe_gemm1_output_scale",
+                   torch.float32,
+                   (2 * block_scale_fp32_expert_intermediate_size,
+                    max_num_padded_tokens_gemm1))
+
+        # Routed experts SwiGLU activation.
+        activation_output, activation_output_scale = (
+            fp8_moe_cpp_runner.run_activation(
+                gemm1_output,
+                gemm1_output_scale,
+                expanded_idx_to_permuted_idx,
+                total_num_padded_tokens,
+                routing_params.top_k,
+                num_tokens,
+                moe_backend.intermediate_size_per_partition,
+                resolved_tactic,
+                moe_backend.swiglu_limit_scalar,
+            ))
+        check_data(activation_output, "routed_moe_activation_output",
+                   torch.float8_e4m3fn,
+                   (max_num_padded_tokens_gemm1,
+                    moe_backend.intermediate_size_per_partition))
+        check_data(activation_output_scale,
+                   "routed_moe_activation_output_scale", torch.float32,
+                   (block_scale_fp32_expert_intermediate_size,
+                    max_num_padded_tokens_gemm1))
+
+        # Routed experts GEMM2.
+        gemm2_output = fp8_moe_cpp_runner.run_gemm2(
+            activation_output,
+            activation_output_scale,
+            moe_backend.w2_weight,
+            moe_backend.w2_weight_scaling_factor,
+            total_num_padded_tokens,
+            cta_idx_xy_to_batch_idx,
+            cta_idx_xy_to_mn_limit,
+            num_non_exiting_ctas,
+            moe_backend.num_slots,
+            routing_params.top_k,
+            num_tokens,
+            hidden_size,
+            moe_backend.intermediate_size_per_partition,
+            num_router_experts,
+            resolved_tactic,
+        )
+        check_data(gemm2_output, "routed_moe_gemm2_output", torch.bfloat16,
+                   (max_num_padded_tokens_gemm2, hidden_size))
+
+        # Routed experts finalize.
+        routed_output = fp8_moe_cpp_runner.run_finalize(
+            gemm2_output,
+            expert_weights,
+            expanded_idx_to_permuted_idx,
+            total_num_padded_tokens,
+            moe_backend.num_slots,
+            routing_params.top_k,
+            num_tokens,
+            hidden_size,
+            resolved_tactic,
+            None,
         )
         check_data(routed_output, "routed_moe_output", torch.bfloat16,
                    tuple(hidden_states.shape))

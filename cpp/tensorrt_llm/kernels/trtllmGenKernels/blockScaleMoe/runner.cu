@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -763,16 +763,9 @@ int64_t Runner::getDefaultValidConfigIndex(int32_t topK, int32_t hiddenSize, int
     return std::distance(mPassingConfigs.begin(), it);
 }
 
-void Runner::run(
+void Runner::runPermuteGemm1(
     MoERunnerArgs const& args, MoEWorkspace const& workspace, int device, cudaStream_t stream, int64_t configIndex)
 {
-    // Setup all operation data
-    moe::dev::activation::Data activationData;
-    moe::dev::finalize::Data finalizeData;
-    moe::dev::convertsf::Data convertSfData;
-    sync_check_cuda_error(stream);
-    setOpsData(args, workspace, convertSfData, activationData, finalizeData);
-
     void* hidden_states_scale_linear{args.hidden_states_scale};
 
     auto const& config = mPassingConfigs[configIndex];
@@ -786,20 +779,36 @@ void Runner::run(
         args.mUseRoutingScalesOnInput, device, stream, config.gemm1Config,
         args.valid_hidden_size.value_or(args.hidden_size),
         args.valid_intermediate_size.value_or(args.intermediate_size));
+}
+
+void Runner::runActivation(MoERunnerArgs const& args, MoEWorkspace const& workspace, cudaStream_t stream)
+{
+    moe::dev::activation::Data activationData;
+    moe::dev::finalize::Data finalizeData;
+    moe::dev::convertsf::Data convertSfData;
+    setOpsData(args, workspace, convertSfData, activationData, finalizeData);
 
     // We do not fuse activation with FC1 for DeepSeek FP8 due to the weights shuffling constraint.
-    void* gemm2_input = workspace.gemm1_output;
-    void* gemm2_input_scale = workspace.gemm1_output_scale;
     // We do activation only for DeepSeek FP8, as cubins do not have fused activation.
     if (args.mDtypeElt == btg::Dtype::E4m3 && args.mUseDeepSeekFp8)
     {
-        // Run activation
         moe::dev::activation::run(activationData, stream);
+    }
+}
+
+void Runner::runGemm2(
+    MoERunnerArgs const& args, MoEWorkspace const& workspace, int device, cudaStream_t stream, int64_t configIndex)
+{
+    void* gemm2_input = workspace.gemm1_output;
+    void* gemm2_input_scale = workspace.gemm1_output_scale;
+    if (args.mDtypeElt == btg::Dtype::E4m3 && args.mUseDeepSeekFp8)
+    {
         gemm2_input = workspace.activation_output;
         gemm2_input_scale = workspace.activation_output_scale;
     }
 
-    // Run gemm2
+    auto const& config = mPassingConfigs[configIndex];
+
     mGemm2.run(gemm2_input, gemm2_input_scale, args.gemm2_weights, args.gemm2_weights_scale, args.output2_scales_scalar,
         args.gemm2_bias, workspace.gemm2_output, workspace.gemm2_output_scale, args.top_k,
         args.output_hidden_size.value_or(args.hidden_size), args.intermediate_size, args.local_num_experts,
@@ -807,13 +816,38 @@ void Runner::run(
         workspace.cta_idx_xy_to_batch_idx, workspace.cta_idx_xy_to_mn_limit, workspace.bmm2_workspace, device, stream,
         config.gemm2Config, args.valid_hidden_size.value_or(args.hidden_size),
         args.valid_intermediate_size.value_or(args.intermediate_size));
+}
 
-    // Run finalize
+void Runner::runFinalize(MoERunnerArgs const& args, MoEWorkspace const& workspace, cudaStream_t stream)
+{
+    moe::dev::activation::Data activationData;
+    moe::dev::finalize::Data finalizeData;
+    moe::dev::convertsf::Data convertSfData;
+    setOpsData(args, workspace, convertSfData, activationData, finalizeData);
+
     if (args.do_finalize)
     {
-        // Run finalize
         moe::dev::finalize::run(finalizeData, stream);
         sync_check_cuda_error(stream);
+    }
+}
+
+void Runner::run(
+    MoERunnerArgs const& args, MoEWorkspace const& workspace, int device, cudaStream_t stream, int64_t configIndex)
+{
+    sync_check_cuda_error(stream);
+    runPermuteGemm1(args, workspace, device, stream, configIndex);
+
+    if (args.mDtypeElt == btg::Dtype::E4m3 && args.mUseDeepSeekFp8)
+    {
+        runActivation(args, workspace, stream);
+    }
+
+    runGemm2(args, workspace, device, stream, configIndex);
+
+    if (args.do_finalize)
+    {
+        runFinalize(args, workspace, stream);
     }
 }
 } // namespace MoE
