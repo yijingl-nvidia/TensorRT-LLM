@@ -37,7 +37,8 @@ from ..modules.qk_norm_attention import QKNormRoPEAttention
 from ..modules.rms_norm import RMSNorm
 from ..speculative import SpecMetadata
 from ..utils import AuxStreamType, EventType, Fp4QuantizedTensor
-from .modeling_deepseekv3 import DeepseekV3Gate, DeepseekV3MTPHead, moe_reduce_add_shared_output
+from .modeling_deepseekv3 import DeepseekV3MTPHead
+from .modeling_deepseekv3_moe import DeepseekV3Gate, moe_reduce_add_shared_output
 from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import (
     DecoderModel,
