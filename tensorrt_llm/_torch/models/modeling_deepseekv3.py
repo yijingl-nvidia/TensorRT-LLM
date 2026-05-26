@@ -1106,10 +1106,41 @@ class Deepseekv3MegaMoE(nn.Module):
     def experts(self) -> MoE:
         return self._old_moe.experts
 
-    @staticmethod
-    def _use_pytorch_ref_mega_kernel() -> bool:
-        return os.environ.get("TRTLLM_DEEPSEEKV3_MEGAMOE_PYTORCH_REF",
-                              "").lower() in ("1", "true", "yes", "on")
+    _MEGA_MOE_MODE_BASELINE = "baseline"
+    _MEGA_MOE_MODE_PYTORCH_REF = "pytorch_ref"
+    _MEGA_MOE_MODE_WIP = "wip_mega_kernel"
+
+    @classmethod
+    def _mega_moe_mode(cls) -> str:
+        mode = os.environ.get("TRTLLM_DEEPSEEKV3_MEGAMOE_MODE",
+                              "").strip().lower()
+        if not mode:
+            return cls._MEGA_MOE_MODE_BASELINE
+
+        mode_aliases = {
+            "baseline": cls._MEGA_MOE_MODE_BASELINE,
+            "trtllm": cls._MEGA_MOE_MODE_BASELINE,
+            "trtllm_baseline": cls._MEGA_MOE_MODE_BASELINE,
+            "ref": cls._MEGA_MOE_MODE_PYTORCH_REF,
+            "reference": cls._MEGA_MOE_MODE_PYTORCH_REF,
+            "torch": cls._MEGA_MOE_MODE_PYTORCH_REF,
+            "pytorch": cls._MEGA_MOE_MODE_PYTORCH_REF,
+            "pytorch_ref": cls._MEGA_MOE_MODE_PYTORCH_REF,
+            "mega": cls._MEGA_MOE_MODE_WIP,
+            "mega_kernel": cls._MEGA_MOE_MODE_WIP,
+            "wip": cls._MEGA_MOE_MODE_WIP,
+            "wip_mega_kernel": cls._MEGA_MOE_MODE_WIP,
+        }
+        if mode not in mode_aliases:
+            allowed_modes = ", ".join((
+                cls._MEGA_MOE_MODE_BASELINE,
+                cls._MEGA_MOE_MODE_PYTORCH_REF,
+                cls._MEGA_MOE_MODE_WIP,
+            ))
+            raise ValueError(
+                f"Unsupported TRTLLM_DEEPSEEKV3_MEGAMOE_MODE={mode!r}; "
+                f"expected one of: {allowed_modes}")
+        return mode_aliases[mode]
 
     @staticmethod
     def _pytorch_ref_chunk_size() -> int:
@@ -1190,6 +1221,21 @@ class Deepseekv3MegaMoE(nn.Module):
     def _fp8_quantize_dequantize_1x128_pytorch(
             cls, tensor: torch.Tensor, use_ue8m0_scale: bool,
             clamp_min_scale: bool) -> torch.Tensor:
+        """Reference quantization-dequantiziation for 1x128 activation quantization kernels.
+
+        Args:
+            tensor: Input activation tensor with shape [num_tokens, hidden_size].
+                It is converted to FP32 before quantization.
+            use_ue8m0_scale: Whether to round each 1x128 block scale up to the
+                UE8M0 power-of-two scale used by the shared-expert input path.
+            clamp_min_scale: Whether to clamp the block amax to a small positive
+                value before computing the dequantization scale.
+
+        Returns:
+            FP32 tensor with the same shape as ``tensor``. The returned values
+            are quantized to FP8 E4M3 per 1x128 block and immediately
+            dequantized, so PyTorch matmul can reproduce fused-kernel numerics.
+        """
         rows, cols = tensor.shape
         num_blocks = (cols + 127) // 128
         padded_cols = num_blocks * 128
@@ -1310,16 +1356,24 @@ class Deepseekv3MegaMoE(nn.Module):
             routed_scaling_factor,
         )
 
+        # shared_weight: fp32, [2 * expert_intermediate_size, hidden_size]
         shared_weight = cls._dequantize_fp8_1x128_packed_ue8m0_weight(
             shared_gate_up_weight, shared_gate_up_weight_scale)
+        # quantize into float8_e4m3fn with UE8M0 scale, then dequantize back to fp32
+        # hidden_states: bf16, [num_tokens, hidden_size]
+        # shared_hidden_states: fp32, [num_tokens, hidden_size]
         shared_hidden_states = cls._fp8_quantize_dequantize_1x128_pytorch(
             hidden_states,
             use_ue8m0_scale=True,
             clamp_min_scale=True,
         )
+        # shared_gate_up_output: bf16, [num_tokens, 2 * expert_intermediate_size]
         shared_gate_up_output = cls._matmul_fp32_no_tf32(
             shared_hidden_states, shared_weight.t()).to(hidden_states.dtype)
+        # shared_gate: bf16, [num_tokens, expert_intermediate_size]
+        # shared_up: bf16, [num_tokens, expert_intermediate_size]
         shared_gate, shared_up = shared_gate_up_output.chunk(2, dim=-1)
+        # fp32 casted to fb16, [num_tokens, expert_intermediate_size]
         shared_swiglu_output = cls._silu_and_mul_pytorch(
             shared_gate, shared_up, shared_swiglu_limit).to(hidden_states.dtype)
 
@@ -1560,6 +1614,37 @@ class Deepseekv3MegaMoE(nn.Module):
 
         return final_hidden_states
 
+    def _forward_wip_mega_kernel(
+        self,
+        hidden_states: torch.Tensor,
+        all_rank_num_tokens: list[int] | None,
+        check_data,
+        num_tokens: int,
+        hidden_size: int,
+        num_router_experts: int,
+        expert_intermediate_size: int,
+        block_scale_fp32_hidden_size: int,
+        block_scale_int32_hidden_size: int,
+        block_scale_fp32_expert_intermediate_size: int,
+        gate_up_output_size: int,
+    ) -> torch.Tensor:
+        # Staging hook: replace pieces of this path with the CUDA mega kernel while
+        # keeping the externally visible math identical to the PyTorch reference.
+        return self._forward_pytorch_ref_mega_kernel(
+            hidden_states=hidden_states,
+            all_rank_num_tokens=all_rank_num_tokens,
+            check_data=check_data,
+            num_tokens=num_tokens,
+            hidden_size=hidden_size,
+            num_router_experts=num_router_experts,
+            expert_intermediate_size=expert_intermediate_size,
+            block_scale_fp32_hidden_size=block_scale_fp32_hidden_size,
+            block_scale_int32_hidden_size=block_scale_int32_hidden_size,
+            block_scale_fp32_expert_intermediate_size=(
+                block_scale_fp32_expert_intermediate_size),
+            gate_up_output_size=gate_up_output_size,
+        )
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -1622,8 +1707,24 @@ class Deepseekv3MegaMoE(nn.Module):
 
         # Debug reference for the first mega-kernel candidate:
         # router logits + shared/routed gate-up projections + SwiGLU.
-        if self._use_pytorch_ref_mega_kernel():
+        mega_moe_mode = self._mega_moe_mode()
+        if mega_moe_mode == self._MEGA_MOE_MODE_PYTORCH_REF:
             return self._forward_pytorch_ref_mega_kernel(
+                hidden_states=hidden_states,
+                all_rank_num_tokens=all_rank_num_tokens,
+                check_data=check_data,
+                num_tokens=num_tokens,
+                hidden_size=hidden_size,
+                num_router_experts=num_router_experts,
+                expert_intermediate_size=expert_intermediate_size,
+                block_scale_fp32_hidden_size=block_scale_fp32_hidden_Size,
+                block_scale_int32_hidden_size=block_scale_int32_hidden_size,
+                block_scale_fp32_expert_intermediate_size=(
+                    block_scale_fp32_expert_intermediate_size),
+                gate_up_output_size=gate_up_output_size,
+            )
+        if mega_moe_mode == self._MEGA_MOE_MODE_WIP:
+            return self._forward_wip_mega_kernel(
                 hidden_states=hidden_states,
                 all_rank_num_tokens=all_rank_num_tokens,
                 check_data=check_data,
