@@ -1446,7 +1446,7 @@ class Deepseekv3MegaMoE(nn.Module):
                 routed_output[token_start:token_end] += expert_down_output
         return routed_output.to(output_dtype)
 
-    def _forward_pytorch_ref_mega_kernel(
+    def _forward_pytorch_ref(
         self,
         hidden_states: torch.Tensor,
         all_rank_num_tokens: list[int] | None,
@@ -1460,6 +1460,9 @@ class Deepseekv3MegaMoE(nn.Module):
         block_scale_fp32_expert_intermediate_size: int,
         gate_up_output_size: int,
     ) -> torch.Tensor:
+        """
+        Reference PyTorch implementation of forward()
+        """
         old_moe = self._old_moe
         shared_experts = old_moe.shared_experts
         shared_gate_up_proj = shared_experts.gate_up_proj
@@ -1630,7 +1633,7 @@ class Deepseekv3MegaMoE(nn.Module):
     ) -> torch.Tensor:
         # Staging hook: replace pieces of this path with the CUDA mega kernel while
         # keeping the externally visible math identical to the PyTorch reference.
-        return self._forward_pytorch_ref_mega_kernel(
+        return self._forward_pytorch_ref(
             hidden_states=hidden_states,
             all_rank_num_tokens=all_rank_num_tokens,
             check_data=check_data,
@@ -1709,7 +1712,7 @@ class Deepseekv3MegaMoE(nn.Module):
         # router logits + shared/routed gate-up projections + SwiGLU.
         mega_moe_mode = self._mega_moe_mode()
         if mega_moe_mode == self._MEGA_MOE_MODE_PYTORCH_REF:
-            return self._forward_pytorch_ref_mega_kernel(
+            return self._forward_pytorch_ref(
                 hidden_states=hidden_states,
                 all_rank_num_tokens=all_rank_num_tokens,
                 check_data=check_data,
