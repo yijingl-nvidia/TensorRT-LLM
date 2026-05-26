@@ -787,6 +787,14 @@ class PyTorchModelEngine(ModelEngine):
         Orchestrates the warmup process by calling specialized warmup methods for
         torch.compile, the autotuner, and CUDA graphs.
         """
+        if os.environ.get("TRTLLM_SKIP_PYEXECUTOR_WARMUP",
+                          "").lower() in ("1", "true", "yes", "on"):
+            logger.warning(
+                "Skipping PyExecutor warmup because "
+                "TRTLLM_SKIP_PYEXECUTOR_WARMUP is set. This is intended for "
+                "debugging only and may reduce runtime performance.")
+            return
+
         kv_cache_manager = resource_manager.get_resource_manager(
             self.kv_cache_manager_key)
 
