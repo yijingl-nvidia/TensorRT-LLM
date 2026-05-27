@@ -17,6 +17,22 @@ from ..utils import AuxStreamType, Fp4QuantizedTensor
 from .modeling_deepseekv3_moe import Deepseekv3MoE
 
 
+def check_data(tensor: torch.Tensor, name: str, dtype: torch.dtype, shape: tuple[int, ...]) -> None:
+    """
+    Debug function call to assert input tensor shape and dtype
+    Tensor shape value can have -1, meaning no assert on that dimension
+    """
+    assert tensor.dtype == dtype, f"{name} must have dtype {dtype}, got {tensor.dtype}"
+    assert tensor.ndim == len(shape), f"{name} must have {len(shape)} dims, got {tensor.shape}"
+    for dim, expected_dim in enumerate(shape):
+        if expected_dim == -1:
+            continue
+        assert tensor.shape[dim] == expected_dim, (
+            f"{name} dim {dim} must be {expected_dim}, got "
+            f"{tensor.shape[dim]} for shape {tensor.shape}"
+        )
+
+
 class Deepseekv3MegaMoE(nn.Module):
     def __init__(
         self,
@@ -220,25 +236,6 @@ class Deepseekv3MegaMoE(nn.Module):
         dequantized_tensor = quantized_tensor.to(torch.float32) * dequant_scale
         return dequantized_tensor.reshape(rows, padded_cols)[:, :cols]
 
-    @staticmethod
-    def _deepseekv3_routing_reference(
-        router_logits: torch.Tensor,
-        routing_bias: torch.Tensor,
-        top_k: int,
-        n_group: int,
-        topk_group: int,
-        routed_scaling_factor: float,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        topk_values, topk_indices = torch.ops.trtllm.noaux_tc_op(
-            router_logits.clone(),
-            routing_bias,
-            n_group,
-            topk_group,
-            top_k,
-            routed_scaling_factor,
-        )
-        return topk_indices.to(torch.int32), topk_values.to(torch.float32)
-
     @classmethod
     def _routed_gate_up_swiglu_pytorch(
         cls,
@@ -308,7 +305,7 @@ class Deepseekv3MegaMoE(nn.Module):
         routed_scaling_factor: float,
         shared_swiglu_limit: Optional[float],
         routed_swiglu_limit: Optional[float],
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Reference PyTorch implementation of the mega expert select up gate silu kernel.
 
@@ -342,9 +339,6 @@ class Deepseekv3MegaMoE(nn.Module):
             - from Deepseekv3MoE.experts.backend.w3_w1_weight_scaling_factor
 
         Returns:
-        router_logits
-            - fp32
-            - [num_tokens, num_router_experts]
         expert_indices
             - int32
             - [num_tokens, top_k]
@@ -357,19 +351,51 @@ class Deepseekv3MegaMoE(nn.Module):
         routed_swiglu_output
             - fp32
             - [num_tokens, top_k, expert_intermediate_size]
+
+
+        Computation Accuracy:
+        - Router GEMM: dsv3_router_gemm_op, computes in fp32 and returns as fp32
+        - Routing: noaux_tc_op, computes in fp32 and returns as int32 selected expert indices and fp32 expert weights
+        - Shared expert gate & up proj: input quantized to FP8 E4M3 with packed UE8M0 scales.
+          DeepGEMM uses FP8 operands + block scales, accumulates in fp32, then returns as bf16
+        - Shared expert SwiGLU: silu_and_mul_pytorch, computes in fp32, returns as bf16
+        - Routed experts:
+           - GEMM1: up & gate proj: FP8 activation/weights, FP32 block scales, accumulates in fp32, returns FP8 plus
+             FP32 output scale
+           - SwiGLU: dequantizes FP8 GEMM1 output to FP32, does SwiGLU in FP32, requantizes to FP8 plus FP32 scale
+           - [not in this mega kernel] GEMM2: down proj: FP8 activation/weight, FP32 accumulation, output BF16.
+           - [not in this mega kernel] run_finalize: weighted sum of top-k expert outputs, computes in fp32, returns
+             as bf16
+           - Source: cpp/tensorrt_llm/thop/fp8BlockScaleMoe.cpp:302,
+             cpp/tensorrt_llm/kernels/trtllmGenKernels/blockScaleMoe/DevKernel.cu:313
         """
+        # fp32, [num_tokens, num_router_experts]
         router_logits = torch.ops.trtllm.dsv3_router_gemm_op(
             hidden_states, router_weight.t(), bias=None, out_dtype=torch.float32
         )
-        expert_indices, expert_weights = cls._deepseekv3_routing_reference(
+        num_tokens = hidden_states.shape[0]
+        num_router_experts = 256
+        check_data(
             router_logits,
-            routing_bias,
-            top_k,
-            n_group,
-            topk_group,
-            routed_scaling_factor,
+            "ref_mega_kernels.router_logits",
+            torch.float32,
+            (num_tokens, num_router_experts),
         )
 
+        expert_weights, expert_indices = torch.ops.trtllm.noaux_tc_op(
+            router_logits,
+            routing_bias,
+            n_group,
+            topk_group,
+            top_k,
+            routed_scaling_factor,
+        )
+        check_data(
+            expert_indices, "ref_mega_kernels.expert_indices", torch.int32, (num_tokens, top_k)
+        )
+        check_data(
+            expert_weights, "ref_mega_kernels.expert_weights", torch.float32, (num_tokens, top_k)
+        )
         # shared_weight: fp32, [2 * expert_intermediate_size, hidden_size]
         shared_weight = cls._dequantize_fp8_1x128_packed_ue8m0_weight(
             shared_gate_up_weight, shared_gate_up_weight_scale
@@ -410,7 +436,6 @@ class Deepseekv3MegaMoE(nn.Module):
         )
 
         return (
-            router_logits,
             expert_indices,
             expert_weights.to(torch.bfloat16),
             shared_swiglu_output,
@@ -427,7 +452,7 @@ class Deepseekv3MegaMoE(nn.Module):
         routed_w2_weight_scale: torch.Tensor,
         output_dtype: torch.dtype,
     ) -> torch.Tensor:
-        num_tokens, top_k, intermediate_size = routed_swiglu_output.shape
+        num_tokens, top_k, _ = routed_swiglu_output.shape
         hidden_size = routed_w2_weight.shape[1]
         routed_output = torch.zeros(
             (num_tokens, hidden_size),
@@ -467,7 +492,6 @@ class Deepseekv3MegaMoE(nn.Module):
         self,
         hidden_states: torch.Tensor,
         all_rank_num_tokens: list[int] | None,
-        check_data,
         num_tokens: int,
         hidden_size: int,
         num_router_experts: int,
@@ -579,7 +603,6 @@ class Deepseekv3MegaMoE(nn.Module):
         )
 
         (
-            router_logits,
             expert_indices,
             expert_weights,
             shared_swiglu_output,
@@ -598,12 +621,6 @@ class Deepseekv3MegaMoE(nn.Module):
             routing_params.routed_scaling_factor,
             shared_experts.swiglu_limit,
             moe_backend.swiglu_limit_scalar,
-        )
-        check_data(
-            router_logits,
-            "pytorch_ref_mega_router_logits",
-            torch.float32,
-            (num_tokens, num_router_experts),
         )
         check_data(
             expert_indices,
@@ -686,7 +703,6 @@ class Deepseekv3MegaMoE(nn.Module):
         self,
         hidden_states: torch.Tensor,
         all_rank_num_tokens: list[int] | None,
-        check_data,
         num_tokens: int,
         hidden_size: int,
         num_router_experts: int,
@@ -701,7 +717,6 @@ class Deepseekv3MegaMoE(nn.Module):
         return self._forward_pytorch_ref(
             hidden_states=hidden_states,
             all_rank_num_tokens=all_rank_num_tokens,
-            check_data=check_data,
             num_tokens=num_tokens,
             hidden_size=hidden_size,
             num_router_experts=num_router_experts,
@@ -729,21 +744,6 @@ class Deepseekv3MegaMoE(nn.Module):
         # ========= Shared experts gate_up_proj  =========
         shared_experts = old_moe.shared_experts
         shared_gate_up_proj = shared_experts.gate_up_proj
-
-        def check_data(
-            tensor: torch.Tensor, name: str, dtype: torch.dtype, shape: tuple[int, ...]
-        ) -> None:
-            assert tensor.dtype == dtype, f"{name} must have dtype {dtype}, got {tensor.dtype}"
-            assert tensor.ndim == len(shape), (
-                f"{name} must have {len(shape)} dims, got {tensor.shape}"
-            )
-            for dim, expected_dim in enumerate(shape):
-                if expected_dim == -1:
-                    continue
-                assert tensor.shape[dim] == expected_dim, (
-                    f"{name} dim {dim} must be {expected_dim}, got "
-                    f"{tensor.shape[dim]} for shape {tensor.shape}"
-                )
 
         check_data(hidden_states, "hidden_states", torch.bfloat16, (-1, 6144))
         assert shared_gate_up_proj.has_fp8_block_scales
@@ -778,7 +778,6 @@ class Deepseekv3MegaMoE(nn.Module):
             return self._forward_pytorch_ref(
                 hidden_states=hidden_states,
                 all_rank_num_tokens=all_rank_num_tokens,
-                check_data=check_data,
                 num_tokens=num_tokens,
                 hidden_size=hidden_size,
                 num_router_experts=num_router_experts,
@@ -794,7 +793,6 @@ class Deepseekv3MegaMoE(nn.Module):
             return self._forward_wip_mega_kernel(
                 hidden_states=hidden_states,
                 all_rank_num_tokens=all_rank_num_tokens,
-                check_data=check_data,
                 num_tokens=num_tokens,
                 hidden_size=hidden_size,
                 num_router_experts=num_router_experts,
