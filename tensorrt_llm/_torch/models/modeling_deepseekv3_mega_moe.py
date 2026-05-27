@@ -767,20 +767,225 @@ class Deepseekv3MegaMoE(nn.Module):
         block_scale_fp32_expert_intermediate_size: int,
         gate_up_output_size: int,
     ) -> torch.Tensor:
-        # Staging hook: replace pieces of this path with the CUDA mega kernel while
-        # keeping the externally visible math identical to the PyTorch reference.
-        return self._forward_pytorch_ref(
-            hidden_states=hidden_states,
-            all_rank_num_tokens=all_rank_num_tokens,
-            num_tokens=num_tokens,
-            hidden_size=hidden_size,
-            num_router_experts=num_router_experts,
-            expert_intermediate_size=expert_intermediate_size,
-            block_scale_fp32_hidden_size=block_scale_fp32_hidden_size,
-            block_scale_int32_hidden_size=block_scale_int32_hidden_size,
-            block_scale_fp32_expert_intermediate_size=(block_scale_fp32_expert_intermediate_size),
-            gate_up_output_size=gate_up_output_size,
+        """
+        Reference PyTorch implementation of forward()
+        """
+        old_moe = self._old_moe
+        shared_experts = old_moe.shared_experts
+        shared_gate_up_proj = shared_experts.gate_up_proj
+        routed_experts = old_moe.experts
+
+        assert routed_experts.__class__.__name__ == "ConfigurableMoE", (
+            f"expected ConfigurableMoE, got {type(routed_experts)}"
         )
+        assert routed_experts.comm is None, (
+            f"expected no routed-experts communication, got {routed_experts.comm}"
+        )
+        assert not routed_experts.enable_alltoall
+        assert not routed_experts.apply_router_weight_on_input
+        assert not routed_experts._using_load_balancer()
+        assert not routed_experts.backend._supports_load_balancer()
+        assert not routed_experts.routing_method.requires_separated_routing
+
+        routed_all_rank_num_tokens = (
+            all_rank_num_tokens if all_rank_num_tokens is not None else [num_tokens]
+        )
+        assert routed_experts.calculate_num_chunks(routed_all_rank_num_tokens) == 1
+
+        moe_backend = routed_experts.backend
+        assert moe_backend.__class__.__name__ == "TRTLLMGenFusedMoE", (
+            f"expected TRTLLMGenFusedMoE, got {type(moe_backend)}"
+        )
+        assert not moe_backend.use_flashinfer
+        assert moe_backend.has_deepseek_fp8_block_scales
+        assert moe_backend.num_experts == num_router_experts
+        assert moe_backend.num_slots == num_router_experts
+        assert moe_backend.hidden_size == hidden_size
+        assert moe_backend.intermediate_size_per_partition == expert_intermediate_size
+        assert num_router_experts == moe_backend.w3_w1_weight.size(0)
+
+        routing_params = moe_backend._extract_routing_params()
+        routing_bias = routing_params.routing_bias
+        assert routing_bias is not None
+        assert routing_params.n_group is not None
+        assert routing_params.topk_group is not None
+        assert routing_params.routed_scaling_factor is not None
+
+        check_data(
+            old_moe.gate.weight,
+            "pytorch_ref_mega_router_weight",
+            torch.bfloat16,
+            (num_router_experts, hidden_size),
+        )
+        check_data(
+            routing_bias,
+            "pytorch_ref_mega_router_logit_offset",
+            torch.bfloat16,
+            (num_router_experts,),
+        )
+        check_data(
+            shared_gate_up_proj.weight,
+            "pytorch_ref_mega_shared_gate_up_weight",
+            torch.float8_e4m3fn,
+            (gate_up_output_size, hidden_size),
+        )
+        check_data(
+            shared_gate_up_proj.weight_scale,
+            "pytorch_ref_mega_shared_gate_up_weight_scale",
+            torch.int32,
+            (gate_up_output_size, block_scale_int32_hidden_size),
+        )
+        shared_gate_up_weight_org = getattr(shared_gate_up_proj, "weight_org", None)
+        shared_gate_up_weight_scale_org = getattr(shared_gate_up_proj, "weight_scale_org", None)
+        if self._pytorch_ref_use_shared_gate_up_weight_org():
+            if shared_gate_up_weight_org is None or shared_gate_up_weight_scale_org is None:
+                raise RuntimeError(
+                    "TRTLLM_DEEPSEEKV3_MEGAMOE_REF_USE_SHARED_GATE_UP_WEIGHT_ORG requires "
+                    "shared_experts.gate_up_proj.weight_org and weight_scale_org to be retained"
+                )
+            check_data(
+                shared_gate_up_weight_org,
+                "pytorch_ref_mega_shared_gate_up_weight_org",
+                torch.float8_e4m3fn,
+                (gate_up_output_size, hidden_size),
+            )
+            check_data(
+                shared_gate_up_weight_scale_org,
+                "pytorch_ref_mega_shared_gate_up_weight_scale_org",
+                torch.float32,
+                (-1, block_scale_fp32_hidden_size),
+            )
+        check_data(
+            moe_backend.w3_w1_weight,
+            "pytorch_ref_mega_routed_w3_w1_weight",
+            torch.float8_e4m3fn,
+            (num_router_experts, 2 * expert_intermediate_size, hidden_size),
+        )
+        check_data(
+            moe_backend.w3_w1_weight_scaling_factor,
+            "pytorch_ref_mega_routed_w3_w1_weight_scaling_factor",
+            torch.float32,
+            (
+                num_router_experts,
+                2 * block_scale_fp32_expert_intermediate_size,
+                block_scale_fp32_hidden_size,
+            ),
+        )
+        check_data(
+            moe_backend.w2_weight,
+            "pytorch_ref_mega_routed_w2_weight",
+            torch.float8_e4m3fn,
+            (num_router_experts, hidden_size, expert_intermediate_size),
+        )
+        check_data(
+            moe_backend.w2_weight_scaling_factor,
+            "pytorch_ref_mega_routed_w2_weight_scaling_factor",
+            torch.float32,
+            (
+                num_router_experts,
+                block_scale_fp32_hidden_size,
+                block_scale_fp32_expert_intermediate_size,
+            ),
+        )
+
+        (
+            expert_indices,
+            expert_weights,
+            shared_swiglu_output,
+            routed_swiglu_output,
+        ) = self._run_pytorch_ref_mega_kernel(
+            hidden_states,
+            old_moe.gate.weight,
+            routing_bias,
+            shared_gate_up_proj.weight,
+            shared_gate_up_proj.weight_scale,
+            shared_gate_up_weight_org,
+            shared_gate_up_weight_scale_org,
+            moe_backend.w3_w1_weight,
+            moe_backend.w3_w1_weight_scaling_factor,
+            routing_params.top_k,
+            routing_params.n_group,
+            routing_params.topk_group,
+            routing_params.routed_scaling_factor,
+            shared_experts.swiglu_limit,
+            moe_backend.swiglu_limit_scalar,
+        )
+        check_data(
+            expert_indices,
+            "pytorch_ref_mega_expert_indices",
+            torch.int32,
+            (num_tokens, routing_params.top_k),
+        )
+        check_data(
+            expert_weights,
+            "pytorch_ref_mega_expert_weights",
+            torch.bfloat16,
+            (num_tokens, routing_params.top_k),
+        )
+        check_data(
+            shared_swiglu_output,
+            "pytorch_ref_mega_shared_swiglu",
+            torch.bfloat16,
+            (num_tokens, expert_intermediate_size),
+        )
+        check_data(
+            routed_swiglu_output,
+            "pytorch_ref_mega_routed_swiglu",
+            torch.float32,
+            (num_tokens, routing_params.top_k, expert_intermediate_size),
+        )
+
+        routed_output = self._routed_down_project_pytorch(
+            routed_swiglu_output,
+            expert_indices,
+            expert_weights,
+            moe_backend.w2_weight,
+            moe_backend.w2_weight_scaling_factor,
+            hidden_states.dtype,
+        )
+        check_data(
+            routed_output,
+            "pytorch_ref_mega_routed_output",
+            torch.bfloat16,
+            tuple(hidden_states.shape),
+        )
+
+        if routed_experts.enable_dwdp:
+            routed_experts.dwdp_manager.record_compute_and_prefetch_next(routed_experts.layer_idx)
+        routed_experts.repeat_idx = (routed_experts.repeat_idx + 1) % routed_experts.repeat_count
+
+        shared_output = shared_experts.down_proj(
+            shared_swiglu_output, all_reduce_params=None, layer_idx=shared_experts.layer_idx
+        )
+        check_data(
+            shared_output,
+            "pytorch_ref_mega_shared_output",
+            torch.bfloat16,
+            tuple(hidden_states.shape),
+        )
+
+        assert old_moe.shared_output_scale is None, (
+            f"shared_output_scale must be None, got {old_moe.shared_output_scale}"
+        )
+
+        output_tensor = None
+        if not old_moe.use_dp and old_moe.mapping.tp_size > 1:
+            allocate_output_input = shared_output
+            allocate_output_buffer_kind = old_moe.allreduce.output_buffer_kind
+            allocate_output_tp_group = old_moe.mapping.tp_group
+            w, actual_kind = torch.ops.trtllm.allocate_output(
+                allocate_output_input, allocate_output_buffer_kind, allocate_output_tp_group
+            )
+            if actual_kind == int(BufferKind.NCCL_WINDOW):
+                output_tensor = w
+
+        assert shared_output.size() == routed_output.size(), "unmatched tensor shape"
+        if output_tensor is not None:
+            final_hidden_states = torch.add(shared_output, routed_output, out=output_tensor)
+        else:
+            final_hidden_states = shared_output.add_(routed_output)
+
+        return final_hidden_states
 
     def forward(
         self,
