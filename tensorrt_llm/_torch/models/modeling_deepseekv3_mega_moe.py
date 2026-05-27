@@ -112,6 +112,22 @@ class Deepseekv3MegaMoE(nn.Module):
     def _dequantize_fp8_1x128_packed_ue8m0_weight(
         cls, weight: torch.Tensor, packed_scale: torch.Tensor
     ) -> torch.Tensor:
+        """Dequantize FP8 weights that use 1x128 block scales in packed UE8M0 format.
+
+        Each row has one UE8M0 scale byte for every 128 contiguous columns of
+        ``weight``. The scale tensor stores four scale bytes in each int32
+        element, unpacked from least significant byte to most significant byte.
+        A UE8M0 byte of zero is treated as an exact zero scale; otherwise the
+        scale value is ``2 ** (byte - 127)``.
+
+        Args:
+            weight: FP8 E4M3 weight tensor with shape ``[rows, cols]``.
+            packed_scale: Int32 packed scale tensor with shape
+                ``[rows, ceil(ceil(cols / 128) / 4)]``.
+
+        Returns:
+            Dequantized FP32 weight tensor with shape ``[rows, cols]``.
+        """
         rows, cols = weight.shape
         num_scale_cols = (cols + 127) // 128
         scales = cls._unpack_ue8m0_scales(packed_scale, num_scale_cols)
@@ -123,16 +139,16 @@ class Deepseekv3MegaMoE(nn.Module):
     def _dequantize_fp8_128x128_block_weight(
         weight: torch.Tensor, weight_scale: torch.Tensor
     ) -> torch.Tensor:
-        rows, cols = weight.shape
-        scales = weight_scale.repeat_interleave(128, dim=0)[:rows, :]
-        scales = scales.repeat_interleave(128, dim=1)[:, :cols]
-        assert scales.shape == (rows, cols)
-        return weight.to(torch.float32) * scales
+        """Dequantize FP8 weights that use 128x128 block scales.
 
-    @staticmethod
-    def _dequantize_fp8_128x128_block_weight_batched(
-        weight: torch.Tensor, weight_scale: torch.Tensor
-    ) -> torch.Tensor:
+        Args:
+            weight: FP8 E4M3 weight tensor with shape `[..., rows, cols]`.
+            weight_scale: FP32 weight scale tensor with shape
+                `[..., rows / 128, cols / 128]`.
+
+        Returns:
+            Dequantized FP32 weight tensor with shape `[...,rows, cols]`.
+        """
         rows, cols = weight.shape[-2:]
         scales = weight_scale.repeat_interleave(128, dim=-2)[..., :rows, :]
         scales = scales.repeat_interleave(128, dim=-1)[..., :, :cols]
@@ -253,7 +269,7 @@ class Deepseekv3MegaMoE(nn.Module):
                 selected_expert_weight_scale = torch.index_select(
                     routed_w3_w1_weight_scale, 0, route_expert_indices
                 )
-                selected_expert_weight = cls._dequantize_fp8_128x128_block_weight_batched(
+                selected_expert_weight = cls._dequantize_fp8_128x128_block_weight(
                     selected_expert_weight, selected_expert_weight_scale
                 )
 
@@ -292,7 +308,56 @@ class Deepseekv3MegaMoE(nn.Module):
         routed_scaling_factor: float,
         shared_swiglu_limit: Optional[float],
         routed_swiglu_limit: Optional[float],
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Reference PyTorch implementation of the mega expert select up gate silu kernel.
+
+        hidden_states:
+            - bf16
+            - [num_tokens, 6144]
+            - input activation
+        router_weight:
+            - bf16
+            - [num_router_experts, hidden_size]
+            - from Deepseekv3MoE.gate.weight
+        routing_bias:
+            - bf16
+            - [num_router_experts,]
+            - from Deepseekv3MoE.experts.backend._extract_routing_params().routing_bias
+        shared_gate_up_weight: gate & up proj (in this order) weight
+            - fp8_e4m3
+            - [2*expert_immidiate_size, hidden_size]
+            - Deepseekv3MoE.shared_experts.gate_up_proj.weight
+        shared_gate_up_weight_scale:
+            - 4 ue8m0 packed as int32
+            - [2*expert_immidiate_size, hidden_size / 128 / 4]
+            - from Deepseekv3MoE.shared_experts.gate_up_proj.weight_scale
+        routed_w3_w1_weight: up proj & gate (in this order) weight
+            - fp8_e4m3
+            - [num_router_experts, 2*expert_immidiate_size, hidden_size]
+            - from Deepseekv3MoE.experts.backend.w3_w1_weight
+        routed_w3_w1_weight_scale:
+            - fp32
+            - [num_router_experts, 2*expert_immidiate_size / 128, hidden_size / 128]
+            - from Deepseekv3MoE.experts.backend.w3_w1_weight_scaling_factor
+
+        Returns:
+        router_logits
+            - fp32
+            - [num_tokens, num_router_experts]
+        expert_indices
+            - int32
+            - [num_tokens, top_k]
+        expert_weights
+            - bf16
+            - [num_tokens, top_k]
+        shared_swiglu_output
+            - bf16
+            - [num_tokens, expert_intermediate_size]
+        routed_swiglu_output
+            - fp32
+            - [num_tokens, top_k, expert_intermediate_size]
+        """
         router_logits = torch.ops.trtllm.dsv3_router_gemm_op(
             hidden_states, router_weight.t(), bias=None, out_dtype=torch.float32
         )
@@ -344,19 +409,10 @@ class Deepseekv3MegaMoE(nn.Module):
             routed_swiglu_limit,
         )
 
-        expert_intermediates = torch.empty(
-            (hidden_states.shape[0], top_k + 1, expert_intermediate_size),
-            device=hidden_states.device,
-            dtype=torch.float32,
-        )
-        expert_intermediates[:, 0, :] = shared_swiglu_output.to(torch.float32)
-        expert_intermediates[:, 1:, :] = routed_swiglu_output
-
         return (
             router_logits,
             expert_indices,
             expert_weights.to(torch.bfloat16),
-            expert_intermediates,
             shared_swiglu_output,
             routed_swiglu_output,
         )
@@ -391,7 +447,7 @@ class Deepseekv3MegaMoE(nn.Module):
                 selected_expert_weight_scale = torch.index_select(
                     routed_w2_weight_scale, 0, route_expert_indices
                 )
-                selected_expert_weight = cls._dequantize_fp8_128x128_block_weight_batched(
+                selected_expert_weight = cls._dequantize_fp8_128x128_block_weight(
                     selected_expert_weight, selected_expert_weight_scale
                 )
 
@@ -526,7 +582,6 @@ class Deepseekv3MegaMoE(nn.Module):
             router_logits,
             expert_indices,
             expert_weights,
-            expert_intermediates,
             shared_swiglu_output,
             routed_swiglu_output,
         ) = self._run_pytorch_ref_mega_kernel(
@@ -561,12 +616,6 @@ class Deepseekv3MegaMoE(nn.Module):
             "pytorch_ref_mega_expert_weights",
             torch.bfloat16,
             (num_tokens, routing_params.top_k),
-        )
-        check_data(
-            expert_intermediates,
-            "pytorch_ref_mega_expert_intermediates",
-            torch.float32,
-            (num_tokens, routing_params.top_k + 1, expert_intermediate_size),
         )
         check_data(
             shared_swiglu_output,
