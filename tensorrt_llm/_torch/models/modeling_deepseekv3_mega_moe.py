@@ -61,6 +61,7 @@ class Deepseekv3MegaMoE(nn.Module):
             model_config=model_config,
             override_quant_config=override_quant_config,
         )
+        self._old_moe.shared_experts.gate_up_proj.retain_pre_deep_gemm_weight = True
         self.layer_idx = layer_idx
 
     @property
@@ -109,6 +110,11 @@ class Deepseekv3MegaMoE(nn.Module):
     def _pytorch_ref_chunk_size() -> int:
         chunk_size = os.environ.get("TRTLLM_DEEPSEEKV3_MEGAMOE_PYTORCH_REF_CHUNK_SIZE", "8")
         return max(1, int(chunk_size))
+
+    @staticmethod
+    def _pytorch_ref_use_shared_gate_up_weight_org() -> bool:
+        value = os.environ.get("TRTLLM_DEEPSEEKV3_MEGAMOE_REF_USE_SHARED_GATE_UP_WEIGHT_ORG", "0")
+        return value.strip().lower() in ("1", "true", "yes", "on")
 
     @staticmethod
     def _unpack_ue8m0_scales(packed_scale: torch.Tensor, num_scale_cols: int) -> torch.Tensor:
@@ -297,6 +303,8 @@ class Deepseekv3MegaMoE(nn.Module):
         routing_bias: torch.Tensor,
         shared_gate_up_weight: torch.Tensor,
         shared_gate_up_weight_scale: torch.Tensor,
+        shared_gate_up_weight_org: torch.Tensor | None,
+        shared_gate_up_weight_scale_org: torch.Tensor | None,
         routed_w3_w1_weight: torch.Tensor,
         routed_w3_w1_weight_scale: torch.Tensor,
         top_k: int,
@@ -329,6 +337,14 @@ class Deepseekv3MegaMoE(nn.Module):
             - 4 ue8m0 packed as int32
             - [2*expert_immidiate_size, hidden_size / 128 / 4]
             - from Deepseekv3MoE.shared_experts.gate_up_proj.weight_scale
+        shared_gate_up_weight_org:
+            - fp8_e4m3
+            - [2*expert_immidiate_size, hidden_size]
+            - Deepseekv3MoE.shared_experts.gate_up_proj.weight before DeepGEMM post-load resmoothing
+        shared_gate_up_weight_scale_org:
+            - fp32
+            - [ceil(2*expert_immidiate_size / 128), hidden_size / 128]
+            - Deepseekv3MoE.shared_experts.gate_up_proj.weight_scale before DeepGEMM post-load resmoothing
         routed_w3_w1_weight: up proj & gate (in this order) weight
             - fp8_e4m3
             - [num_router_experts, 2*expert_immidiate_size, hidden_size]
@@ -396,18 +412,35 @@ class Deepseekv3MegaMoE(nn.Module):
         check_data(
             expert_weights, "ref_mega_kernels.expert_weights", torch.float32, (num_tokens, top_k)
         )
-        # shared_weight: fp32, [2 * expert_intermediate_size, hidden_size]
-        shared_weight = cls._dequantize_fp8_1x128_packed_ue8m0_weight(
-            shared_gate_up_weight, shared_gate_up_weight_scale
-        )
-        # quantize into float8_e4m3fn with UE8M0 scale, then dequantize back to fp32
-        # hidden_states: bf16, [num_tokens, hidden_size]
-        # shared_hidden_states: fp32, [num_tokens, hidden_size]
-        shared_hidden_states = cls._fp8_quantize_dequantize_1x128_pytorch(
-            hidden_states,
-            use_ue8m0_scale=True,
-            clamp_min_scale=True,
-        )
+        if cls._pytorch_ref_use_shared_gate_up_weight_org():
+            if shared_gate_up_weight_org is None or shared_gate_up_weight_scale_org is None:
+                raise RuntimeError(
+                    "TRTLLM_DEEPSEEKV3_MEGAMOE_REF_USE_SHARED_GATE_UP_WEIGHT_ORG requires "
+                    "shared_experts.gate_up_proj.weight_org and weight_scale_org to be retained"
+                )
+            # shared_weight: fp32, [2 * expert_intermediate_size, hidden_size]
+            shared_weight = cls._dequantize_fp8_128x128_block_weight(
+                shared_gate_up_weight_org, shared_gate_up_weight_scale_org
+            )
+            # Match the routed GEMM1 activation quantization: FP8 E4M3 with FP32 1x128 scales.
+            shared_hidden_states = cls._fp8_quantize_dequantize_1x128_pytorch(
+                hidden_states,
+                use_ue8m0_scale=False,
+                clamp_min_scale=True,
+            )
+        else:
+            # shared_weight: fp32, [2 * expert_intermediate_size, hidden_size]
+            shared_weight = cls._dequantize_fp8_1x128_packed_ue8m0_weight(
+                shared_gate_up_weight, shared_gate_up_weight_scale
+            )
+            # quantize into float8_e4m3fn with UE8M0 scale, then dequantize back to fp32
+            # hidden_states: bf16, [num_tokens, hidden_size]
+            # shared_hidden_states: fp32, [num_tokens, hidden_size]
+            shared_hidden_states = cls._fp8_quantize_dequantize_1x128_pytorch(
+                hidden_states,
+                use_ue8m0_scale=True,
+                clamp_min_scale=True,
+            )
         # shared_gate_up_output: bf16, [num_tokens, 2 * expert_intermediate_size]
         shared_gate_up_output = cls._matmul_fp32_no_tf32(
             shared_hidden_states, shared_weight.t()
@@ -569,6 +602,26 @@ class Deepseekv3MegaMoE(nn.Module):
             torch.int32,
             (gate_up_output_size, block_scale_int32_hidden_size),
         )
+        shared_gate_up_weight_org = getattr(shared_gate_up_proj, "weight_org", None)
+        shared_gate_up_weight_scale_org = getattr(shared_gate_up_proj, "weight_scale_org", None)
+        if self._pytorch_ref_use_shared_gate_up_weight_org():
+            if shared_gate_up_weight_org is None or shared_gate_up_weight_scale_org is None:
+                raise RuntimeError(
+                    "TRTLLM_DEEPSEEKV3_MEGAMOE_REF_USE_SHARED_GATE_UP_WEIGHT_ORG requires "
+                    "shared_experts.gate_up_proj.weight_org and weight_scale_org to be retained"
+                )
+            check_data(
+                shared_gate_up_weight_org,
+                "pytorch_ref_mega_shared_gate_up_weight_org",
+                torch.float8_e4m3fn,
+                (gate_up_output_size, hidden_size),
+            )
+            check_data(
+                shared_gate_up_weight_scale_org,
+                "pytorch_ref_mega_shared_gate_up_weight_scale_org",
+                torch.float32,
+                (-1, block_scale_fp32_hidden_size),
+            )
         check_data(
             moe_backend.w3_w1_weight,
             "pytorch_ref_mega_routed_w3_w1_weight",
@@ -613,6 +666,8 @@ class Deepseekv3MegaMoE(nn.Module):
             routing_bias,
             shared_gate_up_proj.weight,
             shared_gate_up_proj.weight_scale,
+            shared_gate_up_weight_org,
+            shared_gate_up_weight_scale_org,
             moe_backend.w3_w1_weight,
             moe_backend.w3_w1_weight_scaling_factor,
             routing_params.top_k,

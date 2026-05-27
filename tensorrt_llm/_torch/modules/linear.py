@@ -1245,6 +1245,9 @@ class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):
         if (is_sm_100f() and not (module.use_cute_dsl_blockscaling_mm
                                  or module.disable_deep_gemm)) or \
            get_sm_version() == 120:
+            if getattr(module, "retain_pre_deep_gemm_weight", False):
+                module.weight_org = module.weight.detach().clone()
+                module.weight_scale_org = module.weight_scale.detach().clone()
             weight, weight_scale = resmooth_to_fp8_e8m0(module.weight,
                                                         module.weight_scale)
             transformed_scale = transform_sf_into_required_layout(
