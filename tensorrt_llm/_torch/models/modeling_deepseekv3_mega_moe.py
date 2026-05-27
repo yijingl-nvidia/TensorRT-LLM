@@ -476,6 +476,81 @@ class Deepseekv3MegaMoE(nn.Module):
         )
 
     @classmethod
+    def _run_wip_mega_kernel(
+        cls,
+        hidden_states: torch.Tensor,
+        router_weight: torch.Tensor,
+        routing_bias: torch.Tensor,
+        shared_gate_up_weight_org: torch.Tensor,
+        shared_gate_up_weight_scale_org: torch.Tensor,
+        routed_w3_w1_weight: torch.Tensor,
+        routed_w3_w1_weight_scale: torch.Tensor,
+        top_k: int,
+        n_group: int,
+        topk_group: int,
+        routed_scaling_factor: float,
+        shared_swiglu_limit: Optional[float],
+        routed_swiglu_limit: Optional[float],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        # fp32, [num_tokens, num_router_experts]
+        router_logits = torch.ops.trtllm.dsv3_router_gemm_op(
+            hidden_states, router_weight.t(), bias=None, out_dtype=torch.float32
+        )
+        num_tokens = hidden_states.shape[0]
+        num_router_experts = 256
+        check_data(
+            router_logits,
+            "wip_mega_kernels.router_logits",
+            torch.float32,
+            (num_tokens, num_router_experts),
+        )
+
+        assert top_k == 8, f"v68 WIP mega kernel only supports top_k=8, got {top_k}"
+        assert n_group > 0, f"expected positive n_group, got {n_group}"
+        assert topk_group > 0, f"expected positive topk_group, got {topk_group}"
+
+        expert_weights, expert_indices, slot_swiglu_output = (
+            torch.ops.trtllm.glm5_expert_select_up_gate_silu(
+                router_logits.contiguous(),
+                hidden_states.contiguous(),
+                routing_bias.contiguous(),
+                shared_gate_up_weight_org,
+                shared_gate_up_weight_scale_org,
+                routed_w3_w1_weight,
+                routed_w3_w1_weight_scale,
+                routed_scaling_factor,
+            )
+        )
+        check_data(
+            expert_indices,
+            "wip_mega_kernels.expert_indices",
+            torch.int32,
+            (num_tokens, top_k),
+        )
+        check_data(
+            expert_weights,
+            "wip_mega_kernels.expert_weights",
+            torch.float32,
+            (num_tokens, top_k),
+        )
+        check_data(
+            slot_swiglu_output,
+            "wip_mega_kernels.slot_swiglu_output",
+            torch.float16,
+            (num_tokens, top_k + 1, -1),
+        )
+
+        shared_swiglu_output = slot_swiglu_output[:, 0, :].to(hidden_states.dtype).contiguous()
+        routed_swiglu_output = slot_swiglu_output[:, 1:, :].to(torch.float32).contiguous()
+
+        return (
+            expert_indices,
+            expert_weights.to(torch.bfloat16),
+            shared_swiglu_output,
+            routed_swiglu_output,
+        )
+
+    @classmethod
     def _routed_down_project_pytorch(
         cls,
         routed_swiglu_output: torch.Tensor,
@@ -768,7 +843,7 @@ class Deepseekv3MegaMoE(nn.Module):
         gate_up_output_size: int,
     ) -> torch.Tensor:
         """
-        Reference PyTorch implementation of forward()
+        WIP CUDA mega-kernel implementation of forward().
         """
         old_moe = self._old_moe
         shared_experts = old_moe.shared_experts
@@ -813,57 +888,56 @@ class Deepseekv3MegaMoE(nn.Module):
 
         check_data(
             old_moe.gate.weight,
-            "pytorch_ref_mega_router_weight",
+            "wip_mega_router_weight",
             torch.bfloat16,
             (num_router_experts, hidden_size),
         )
         check_data(
             routing_bias,
-            "pytorch_ref_mega_router_logit_offset",
+            "wip_mega_router_logit_offset",
             torch.bfloat16,
             (num_router_experts,),
         )
         check_data(
             shared_gate_up_proj.weight,
-            "pytorch_ref_mega_shared_gate_up_weight",
+            "wip_mega_shared_gate_up_weight",
             torch.float8_e4m3fn,
             (gate_up_output_size, hidden_size),
         )
         check_data(
             shared_gate_up_proj.weight_scale,
-            "pytorch_ref_mega_shared_gate_up_weight_scale",
+            "wip_mega_shared_gate_up_weight_scale",
             torch.int32,
             (gate_up_output_size, block_scale_int32_hidden_size),
         )
         shared_gate_up_weight_org = getattr(shared_gate_up_proj, "weight_org", None)
         shared_gate_up_weight_scale_org = getattr(shared_gate_up_proj, "weight_scale_org", None)
-        if self._pytorch_ref_use_shared_gate_up_weight_org():
-            if shared_gate_up_weight_org is None or shared_gate_up_weight_scale_org is None:
-                raise RuntimeError(
-                    "TRTLLM_DEEPSEEKV3_MEGAMOE_REF_USE_SHARED_GATE_UP_WEIGHT_ORG requires "
-                    "shared_experts.gate_up_proj.weight_org and weight_scale_org to be retained"
-                )
-            check_data(
-                shared_gate_up_weight_org,
-                "pytorch_ref_mega_shared_gate_up_weight_org",
-                torch.float8_e4m3fn,
-                (gate_up_output_size, hidden_size),
-            )
-            check_data(
-                shared_gate_up_weight_scale_org,
-                "pytorch_ref_mega_shared_gate_up_weight_scale_org",
-                torch.float32,
-                (-1, block_scale_fp32_hidden_size),
+        if shared_gate_up_weight_org is None or shared_gate_up_weight_scale_org is None:
+            raise RuntimeError(
+                "TRTLLM_DEEPSEEKV3_MEGAMOE_MODE=wip_mega_kernel requires "
+                "shared_experts.gate_up_proj.weight_org and weight_scale_org to be retained"
             )
         check_data(
+            shared_gate_up_weight_org,
+            "wip_mega_shared_gate_up_weight_org",
+            torch.float8_e4m3fn,
+            (gate_up_output_size, hidden_size),
+        )
+        check_data(
+            shared_gate_up_weight_scale_org,
+            "wip_mega_shared_gate_up_weight_scale_org",
+            torch.float32,
+            (2 * block_scale_fp32_expert_intermediate_size, block_scale_fp32_hidden_size),
+        )
+        check_data(
             moe_backend.w3_w1_weight,
-            "pytorch_ref_mega_routed_w3_w1_weight",
+            "wip_mega_routed_w3_w1_weight",
             torch.float8_e4m3fn,
             (num_router_experts, 2 * expert_intermediate_size, hidden_size),
         )
         check_data(
             moe_backend.w3_w1_weight_scaling_factor,
-            "pytorch_ref_mega_routed_w3_w1_weight_scaling_factor",
+            "wip_mega_routed_w3_w1_weight_scaling_factor",
             torch.float32,
             (
                 num_router_experts,
@@ -873,13 +947,13 @@ class Deepseekv3MegaMoE(nn.Module):
         )
         check_data(
             moe_backend.w2_weight,
-            "pytorch_ref_mega_routed_w2_weight",
+            "wip_mega_routed_w2_weight",
             torch.float8_e4m3fn,
             (num_router_experts, hidden_size, expert_intermediate_size),
         )
         check_data(
             moe_backend.w2_weight_scaling_factor,
-            "pytorch_ref_mega_routed_w2_weight_scaling_factor",
+            "wip_mega_routed_w2_weight_scaling_factor",
             torch.float32,
             (
                 num_router_experts,
@@ -893,12 +967,10 @@ class Deepseekv3MegaMoE(nn.Module):
             expert_weights,
             shared_swiglu_output,
             routed_swiglu_output,
-        ) = self._run_pytorch_ref_mega_kernel(
+        ) = self._run_wip_mega_kernel(
             hidden_states,
             old_moe.gate.weight,
             routing_bias,
-            shared_gate_up_proj.weight,
-            shared_gate_up_proj.weight_scale,
             shared_gate_up_weight_org,
             shared_gate_up_weight_scale_org,
             moe_backend.w3_w1_weight,
@@ -912,25 +984,25 @@ class Deepseekv3MegaMoE(nn.Module):
         )
         check_data(
             expert_indices,
-            "pytorch_ref_mega_expert_indices",
+            "wip_mega_expert_indices",
             torch.int32,
             (num_tokens, routing_params.top_k),
         )
         check_data(
             expert_weights,
-            "pytorch_ref_mega_expert_weights",
+            "wip_mega_expert_weights",
             torch.bfloat16,
             (num_tokens, routing_params.top_k),
         )
         check_data(
             shared_swiglu_output,
-            "pytorch_ref_mega_shared_swiglu",
+            "wip_mega_shared_swiglu",
             torch.bfloat16,
             (num_tokens, expert_intermediate_size),
         )
         check_data(
             routed_swiglu_output,
-            "pytorch_ref_mega_routed_swiglu",
+            "wip_mega_routed_swiglu",
             torch.float32,
             (num_tokens, routing_params.top_k, expert_intermediate_size),
         )
@@ -945,7 +1017,7 @@ class Deepseekv3MegaMoE(nn.Module):
         )
         check_data(
             routed_output,
-            "pytorch_ref_mega_routed_output",
+            "wip_mega_routed_output",
             torch.bfloat16,
             tuple(hidden_states.shape),
         )
@@ -959,7 +1031,7 @@ class Deepseekv3MegaMoE(nn.Module):
         )
         check_data(
             shared_output,
-            "pytorch_ref_mega_shared_output",
+            "wip_mega_shared_output",
             torch.bfloat16,
             tuple(hidden_states.shape),
         )
