@@ -72,6 +72,7 @@ class Deepseekv3MegaMoE(nn.Module):
     _MEGA_MOE_MODE_BASELINE = "baseline"
     _MEGA_MOE_MODE_PYTORCH_REF = "pytorch_ref"
     _MEGA_MOE_MODE_WIP = "wip_mega_kernel"
+    _WIP_DOWN_PROJECT_MAX_NUM_TOKENS = 4
 
     @classmethod
     def _mega_moe_mode(cls) -> str:
@@ -593,6 +594,22 @@ class Deepseekv3MegaMoE(nn.Module):
                 routed_output[token_start:token_end] += expert_down_output
         return routed_output.to(output_dtype)
 
+    @classmethod
+    def _shared_down_project_pytorch(
+        cls,
+        shared_swiglu_output: torch.Tensor,
+        shared_w2_weight: torch.Tensor,
+        shared_w2_weight_scale: torch.Tensor,
+        output_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        shared_weight = cls._dequantize_fp8_128x128_block_weight(
+            shared_w2_weight, shared_w2_weight_scale
+        )
+        shared_output = cls._matmul_fp32_no_tf32(
+            shared_swiglu_output.to(torch.float32), shared_weight.t()
+        )
+        return shared_output.to(output_dtype)
+
     def _forward_pytorch_ref(
         self,
         hidden_states: torch.Tensor,
@@ -1033,16 +1050,50 @@ class Deepseekv3MegaMoE(nn.Module):
         if output_tensor is None:
             output_tensor = torch.empty_like(hidden_states)
 
-        final_hidden_states = torch.ops.trtllm.glm5_expert_down_project(
-            slot_swiglu_output.contiguous(),
-            expert_indices.contiguous(),
-            expert_weights.contiguous(),
-            moe_backend.w2_weight,
-            moe_backend.w2_weight_scaling_factor,
-            shared_down_weight_org,
-            shared_down_weight_scale_org,
-            output_tensor,
-        )
+        if num_tokens > self._WIP_DOWN_PROJECT_MAX_NUM_TOKENS:
+            # v110 down-project is decode-specialized for M <= 4. Larger prefill
+            # and KV-profile shapes use the PyTorch reference down-project path.
+            shared_output = self._shared_down_project_pytorch(
+                slot_swiglu_output[:, 0, :],
+                shared_down_weight_org,
+                shared_down_weight_scale_org,
+                torch.float32,
+            )
+            check_data(
+                shared_output,
+                "wip_mega_pytorch_down_shared_output",
+                torch.float32,
+                tuple(hidden_states.shape),
+            )
+            routed_output = self._routed_down_project_pytorch(
+                slot_swiglu_output[:, 1:, :],
+                expert_indices,
+                expert_weights,
+                moe_backend.w2_weight,
+                moe_backend.w2_weight_scaling_factor,
+                torch.float32,
+            )
+            check_data(
+                routed_output,
+                "wip_mega_pytorch_down_routed_output",
+                torch.float32,
+                tuple(hidden_states.shape),
+            )
+            final_hidden_states = (shared_output + routed_output).to(hidden_states.dtype)
+            if output_tensor is not None:
+                output_tensor.copy_(final_hidden_states)
+                final_hidden_states = output_tensor
+        else:
+            final_hidden_states = torch.ops.trtllm.glm5_expert_down_project(
+                slot_swiglu_output.contiguous(),
+                expert_indices.contiguous(),
+                expert_weights.contiguous(),
+                moe_backend.w2_weight,
+                moe_backend.w2_weight_scaling_factor,
+                shared_down_weight_org,
+                shared_down_weight_scale_org,
+                output_tensor,
+            )
         check_data(
             final_hidden_states,
             "wip_mega_final_hidden_states",
