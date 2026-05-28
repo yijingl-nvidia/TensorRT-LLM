@@ -62,6 +62,7 @@ class Deepseekv3MegaMoE(nn.Module):
             override_quant_config=override_quant_config,
         )
         self._old_moe.shared_experts.gate_up_proj.retain_pre_deep_gemm_weight = True
+        self._old_moe.shared_experts.down_proj.retain_pre_deep_gemm_weight = True
         self.layer_idx = layer_idx
 
     @property
@@ -491,7 +492,7 @@ class Deepseekv3MegaMoE(nn.Module):
         routed_scaling_factor: float,
         shared_swiglu_limit: Optional[float],
         routed_swiglu_limit: Optional[float],
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         # fp32, [num_tokens, num_router_experts]
         router_logits = torch.ops.trtllm.dsv3_router_gemm_op(
             hidden_states, router_weight.t(), bias=None, out_dtype=torch.float32
@@ -540,14 +541,10 @@ class Deepseekv3MegaMoE(nn.Module):
             (num_tokens, top_k + 1, -1),
         )
 
-        shared_swiglu_output = slot_swiglu_output[:, 0, :].to(hidden_states.dtype).contiguous()
-        routed_swiglu_output = slot_swiglu_output[:, 1:, :].to(torch.float32).contiguous()
-
         return (
             expert_indices,
-            expert_weights.to(torch.bfloat16),
-            shared_swiglu_output,
-            routed_swiglu_output,
+            expert_weights,
+            slot_swiglu_output,
         )
 
     @classmethod
@@ -848,6 +845,7 @@ class Deepseekv3MegaMoE(nn.Module):
         old_moe = self._old_moe
         shared_experts = old_moe.shared_experts
         shared_gate_up_proj = shared_experts.gate_up_proj
+        shared_down_proj = shared_experts.down_proj
         routed_experts = old_moe.experts
 
         assert routed_experts.__class__.__name__ == "ConfigurableMoE", (
@@ -961,12 +959,30 @@ class Deepseekv3MegaMoE(nn.Module):
                 block_scale_fp32_expert_intermediate_size,
             ),
         )
+        shared_down_weight_org = getattr(shared_down_proj, "weight_org", None)
+        shared_down_weight_scale_org = getattr(shared_down_proj, "weight_scale_org", None)
+        if shared_down_weight_org is None or shared_down_weight_scale_org is None:
+            raise RuntimeError(
+                "TRTLLM_DEEPSEEKV3_MEGAMOE_MODE=wip_mega_kernel requires "
+                "shared_experts.down_proj.weight_org and weight_scale_org to be retained"
+            )
+        check_data(
+            shared_down_weight_org,
+            "wip_mega_shared_down_weight_org",
+            torch.float8_e4m3fn,
+            (hidden_size, expert_intermediate_size),
+        )
+        check_data(
+            shared_down_weight_scale_org,
+            "wip_mega_shared_down_weight_scale_org",
+            torch.float32,
+            (block_scale_fp32_hidden_size, block_scale_fp32_expert_intermediate_size),
+        )
 
         (
             expert_indices,
             expert_weights,
-            shared_swiglu_output,
-            routed_swiglu_output,
+            slot_swiglu_output,
         ) = self._run_wip_mega_kernel(
             hidden_states,
             old_moe.gate.weight,
@@ -991,58 +1007,22 @@ class Deepseekv3MegaMoE(nn.Module):
         check_data(
             expert_weights,
             "wip_mega_expert_weights",
-            torch.bfloat16,
+            torch.float32,
             (num_tokens, routing_params.top_k),
         )
         check_data(
-            shared_swiglu_output,
-            "wip_mega_shared_swiglu",
-            torch.bfloat16,
-            (num_tokens, expert_intermediate_size),
+            slot_swiglu_output,
+            "wip_mega_slot_swiglu_output",
+            torch.float16,
+            (num_tokens, routing_params.top_k + 1, expert_intermediate_size),
         )
-        check_data(
-            routed_swiglu_output,
-            "wip_mega_routed_swiglu",
-            torch.float32,
-            (num_tokens, routing_params.top_k, expert_intermediate_size),
-        )
-
-        routed_output = self._routed_down_project_pytorch(
-            routed_swiglu_output,
-            expert_indices,
-            expert_weights,
-            moe_backend.w2_weight,
-            moe_backend.w2_weight_scaling_factor,
-            hidden_states.dtype,
-        )
-        check_data(
-            routed_output,
-            "wip_mega_routed_output",
-            torch.bfloat16,
-            tuple(hidden_states.shape),
-        )
-
-        if routed_experts.enable_dwdp:
-            routed_experts.dwdp_manager.record_compute_and_prefetch_next(routed_experts.layer_idx)
-        routed_experts.repeat_idx = (routed_experts.repeat_idx + 1) % routed_experts.repeat_count
-
-        shared_output = shared_experts.down_proj(
-            shared_swiglu_output, all_reduce_params=None, layer_idx=shared_experts.layer_idx
-        )
-        check_data(
-            shared_output,
-            "wip_mega_shared_output",
-            torch.bfloat16,
-            tuple(hidden_states.shape),
-        )
-
         assert old_moe.shared_output_scale is None, (
             f"shared_output_scale must be None, got {old_moe.shared_output_scale}"
         )
 
         output_tensor = None
         if not old_moe.use_dp and old_moe.mapping.tp_size > 1:
-            allocate_output_input = shared_output
+            allocate_output_input = hidden_states
             allocate_output_buffer_kind = old_moe.allreduce.output_buffer_kind
             allocate_output_tp_group = old_moe.mapping.tp_group
             w, actual_kind = torch.ops.trtllm.allocate_output(
@@ -1050,12 +1030,29 @@ class Deepseekv3MegaMoE(nn.Module):
             )
             if actual_kind == int(BufferKind.NCCL_WINDOW):
                 output_tensor = w
+        if output_tensor is None:
+            output_tensor = torch.empty_like(hidden_states)
 
-        assert shared_output.size() == routed_output.size(), "unmatched tensor shape"
-        if output_tensor is not None:
-            final_hidden_states = torch.add(shared_output, routed_output, out=output_tensor)
-        else:
-            final_hidden_states = shared_output.add_(routed_output)
+        final_hidden_states = torch.ops.trtllm.glm5_expert_down_project(
+            slot_swiglu_output.contiguous(),
+            expert_indices.contiguous(),
+            expert_weights.contiguous(),
+            moe_backend.w2_weight,
+            moe_backend.w2_weight_scaling_factor,
+            shared_down_weight_org,
+            shared_down_weight_scale_org,
+            output_tensor,
+        )
+        check_data(
+            final_hidden_states,
+            "wip_mega_final_hidden_states",
+            torch.bfloat16,
+            tuple(hidden_states.shape),
+        )
+
+        if routed_experts.enable_dwdp:
+            routed_experts.dwdp_manager.record_compute_and_prefetch_next(routed_experts.layer_idx)
+        routed_experts.repeat_idx = (routed_experts.repeat_idx + 1) % routed_experts.repeat_count
 
         return final_hidden_states
 

@@ -93,6 +93,8 @@ add_library(
   noAuxTcOp.cpp
   expertSelectUpGateSiLUOp.cpp
   ../kernels/glm5SmallBatch/expert_select_up_gate_silu/mega_kernel_v68_integrated.cu
+  expertDownAllReduceOp.cpp
+  ../kernels/glm5SmallBatch/expert_down_allreduce/mega_kernel_down_v110.cu
   fusedCatFp4Op.cpp
   fusedCatFp8Op.cpp
   IndexerKCacheGatherOp.cpp
