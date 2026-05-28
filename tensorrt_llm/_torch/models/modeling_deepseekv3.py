@@ -1079,7 +1079,16 @@ class DeepseekV3DecoderLayer(DecoderLayer):
             self.fusion_config.PRE_MOE_FUSION = self.enable_fusion and has_tp
             self.fusion_config.POST_MOE_FUSION = self.fusion_config.PRE_MOE_FUSION
 
-            self.mlp = Deepseekv3MegaMoE(
+            mlp_cls = Deepseekv3MegaMoE
+            if os.environ.get(
+                    "TRTLLM_DEEPSEEKV3_MOE_BASELINE",
+                    "").strip().lower() in ["true", "1", "y", "yes", "t", "on"]:
+                mlp_cls = Deepseekv3MoE
+            if layer_idx == 10:
+                print(
+                    f"Using {mlp_cls.__name__} for DeepseekV3DecoderLayer MLP")
+
+            self.mlp = mlp_cls(
                 num_experts=self.num_experts,
                 top_k=self.top_k,
                 hidden_size=self.hidden_size,
