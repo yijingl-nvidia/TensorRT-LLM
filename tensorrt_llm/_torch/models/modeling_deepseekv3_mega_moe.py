@@ -1120,6 +1120,20 @@ class Deepseekv3MegaMoE(nn.Module):
         old_moe = self._old_moe
         assert do_finalize is True, "Deepseekv3MegaMoE only supports do_finalize=True"
 
+        num_tokens: int = hidden_states.size(0)
+        if num_tokens > self._WIP_DOWN_PROJECT_MAX_NUM_TOKENS:
+            # The WIP down-project kernel is decode-specialized for M <= 4.
+            # Use the production MoE path for prefill and profiling shapes.
+            return old_moe(
+                hidden_states,
+                hidden_states_fp4,
+                all_rank_num_tokens=all_rank_num_tokens,
+                final_all_reduce_params=final_all_reduce_params,
+                do_finalize=do_finalize,
+            )
+
+        mega_moe_mode = self._mega_moe_mode()
+
         # Direct Blackwell DeepGEMM replacement for shared_experts.gate_up_proj.
         # ========= Shared experts gate_up_proj  =========
         shared_experts = old_moe.shared_experts
@@ -1139,7 +1153,6 @@ class Deepseekv3MegaMoE(nn.Module):
             f"shared_gate_up_proj.weight_scale must be a tensor, got {type(shared_gate_up_proj.weight_scale)}"
         )
 
-        num_tokens: int = hidden_states.size(0)
         hidden_size: int = hidden_states.size(1)
         block_scale_fp32_hidden_Size: int = int(triton.cdiv(hidden_size, 128))
         block_scale_int32_hidden_size: int = int(triton.cdiv(hidden_size, 128 * 4))
@@ -1153,7 +1166,6 @@ class Deepseekv3MegaMoE(nn.Module):
 
         # Debug reference for the first mega-kernel candidate:
         # router logits + shared/routed gate-up projections + SwiGLU.
-        mega_moe_mode = self._mega_moe_mode()
         if mega_moe_mode == self._MEGA_MOE_MODE_PYTORCH_REF:
             return self._forward_pytorch_ref(
                 hidden_states=hidden_states,
