@@ -273,25 +273,15 @@ __device__ __forceinline__ int v68_lane_offset(int m_tile, int k_sub, int lane)
 // K-block (6 fp32 per K-iter) - there is NO global act_scale_val anymore
 // because activation quant is now per-128-col-K-block (TRTLLM 1x128 scheme).
 //
-// [v68-slot0-residual] When `use_residual` is true (shared expert / slot 0),
-// the kernel additionally performs a SECOND MMA over the residual fp8
-// activation, recovering ~7 bits of precision lost by the primary fp8 quant.
-// Cost: 2x MMA work for slot 0 only (1/9 of total work => ~11% more compute).
-// The shared expert's hidden_out has weight=1.0 in v110's combine while
-// routed slots get topk_w ~= 0.3, so slot 0 dominates the noise budget;
-// halving slot 0's fp8 quant error closes ~75% of the v68 residual gap.
 __device__ __forceinline__ void compute_mma_kiter_v68(__nv_fp8_e4m3 const* __restrict__ smem_tile,
-    __nv_fp8_e4m3 const* __restrict__ smem_act_fp8, __nv_fp8_e4m3 const* __restrict__ smem_act_fp8_lo, int k_iter,
-    int my_m, int lane, float const (&per_block_scale)[kWeightScaleKBlocksPerKIter],
-    float const (&act_block_scale)[kWeightScaleKBlocksPerKIter],
-    float const (&act_block_scale_lo)[kWeightScaleKBlocksPerKIter], bool use_residual, float (&d_out)[4])
+    __nv_fp8_e4m3 const* __restrict__ smem_act_fp8, int k_iter, int my_m, int lane,
+    float const (&per_block_scale)[kWeightScaleKBlocksPerKIter],
+    float const (&act_block_scale)[kWeightScaleKBlocksPerKIter], float (&d_out)[4])
 {
 #pragma unroll
     for (int kb = 0; kb < kWeightScaleKBlocksPerKIter; ++kb)
     {
         float c_frag[4] = {0.f, 0.f, 0.f, 0.f};
-        float c_frag_lo[4] = {0.f, 0.f, 0.f, 0.f};
-
 #pragma unroll
         for (int ks_in_kb = 0; ks_in_kb < kKSubsPerThird; ++ks_in_kb)
         {
@@ -308,7 +298,6 @@ __device__ __forceinline__ void compute_mma_kiter_v68(__nv_fp8_e4m3 const* __res
             // B-fragment (activations). Lanes 0..3 hold the K-contiguous 16
             // bytes/half-K-sub; other lanes hold zeros. Unchanged from v34.
             uint32_t b_frag[2];
-            uint32_t b_frag_lo[2];
             if (lane < 4)
             {
                 int const k_base = k_iter * kKTile + k_sub * 32 + (lane & 3) * 4;
@@ -318,25 +307,11 @@ __device__ __forceinline__ void compute_mma_kiter_v68(__nv_fp8_e4m3 const* __res
                 lds64_b32x2(b_hi_pair[0], b_hi_pair[1], smem_act_fp8 + k_base + 16);
                 b_frag[0] = b_lo_pair[0];
                 b_frag[1] = b_hi_pair[0];
-                if (use_residual)
-                {
-                    lds64_b32x2(b_lo_pair[0], b_lo_pair[1], smem_act_fp8_lo + k_base);
-                    lds64_b32x2(b_hi_pair[0], b_hi_pair[1], smem_act_fp8_lo + k_base + 16);
-                    b_frag_lo[0] = b_lo_pair[0];
-                    b_frag_lo[1] = b_hi_pair[0];
-                }
-                else
-                {
-                    b_frag_lo[0] = 0;
-                    b_frag_lo[1] = 0;
-                }
             }
             else
             {
                 b_frag[0] = 0;
                 b_frag[1] = 0;
-                b_frag_lo[0] = 0;
-                b_frag_lo[1] = 0;
             }
 
             asm volatile(
@@ -347,34 +322,16 @@ __device__ __forceinline__ void compute_mma_kiter_v68(__nv_fp8_e4m3 const* __res
                 "{%0, %1, %2, %3};\n"
                 : "+f"(c_frag[0]), "+f"(c_frag[1]), "+f"(c_frag[2]), "+f"(c_frag[3])
                 : "r"(a_frag[0]), "r"(a_frag[1]), "r"(a_frag[2]), "r"(a_frag[3]), "r"(b_frag[0]), "r"(b_frag[1]));
-
-            if (use_residual)
-            {
-                asm volatile(
-                    "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
-                    "{%0, %1, %2, %3}, "
-                    "{%4, %5, %6, %7}, "
-                    "{%8, %9}, "
-                    "{%0, %1, %2, %3};\n"
-                    : "+f"(c_frag_lo[0]), "+f"(c_frag_lo[1]), "+f"(c_frag_lo[2]), "+f"(c_frag_lo[3])
-                    : "r"(a_frag[0]), "r"(a_frag[1]), "r"(a_frag[2]), "r"(a_frag[3]), "r"(b_frag_lo[0]),
-                    "r"(b_frag_lo[1]));
-            }
         }
 
         // Fold this 128-col K-block's accumulator into the per-K-iter sum.
         // Per-K-block activation scale + per-K-block weight scale - both
         // are dequant scales (mul to convert fp8 -> fp32 magnitude).
         float const fs_kb = per_block_scale[kb] * act_block_scale[kb];
-        float const fs_kb_lo = use_residual ? (per_block_scale[kb] * act_block_scale_lo[kb]) : 0.f;
 #pragma unroll
         for (int i = 0; i < 4; ++i)
         {
             d_out[i] += c_frag[i] * fs_kb;
-            if (use_residual)
-            {
-                d_out[i] += c_frag_lo[i] * fs_kb_lo;
-            }
         }
     }
 }
@@ -512,13 +469,9 @@ __global__ __launch_bounds__(384, V68_LB_BLOCKS_PER_SM) void mega_kernel_v68(flo
     // (not aliased over bf16) so multiple warps can read bf16 / write fp8
     // in parallel without aliasing races. Costs 6 KiB.
     __nv_fp8_e4m3* const smem_act_fp8 = reinterpret_cast<__nv_fp8_e4m3*>(smem_act_bf16 + kHidden);
-    // [v68-slot0-residual] Second fp8 activation buffer holding the residual
-    // (act - dequant(act_fp8)) - used by slot 0 (shared expert) only to
-    // recover ~7 bits of precision lost to the primary fp8 quant. Costs 6 KiB.
-    __nv_fp8_e4m3* const smem_act_fp8_lo = smem_act_fp8 + kHidden;
 
     auto align_up_128 = [](uintptr_t p) -> uintptr_t { return (p + 127u) & ~uintptr_t(127); };
-    uintptr_t rs_base = align_up_128(reinterpret_cast<uintptr_t>(smem_act_fp8_lo + kHidden));
+    uintptr_t rs_base = align_up_128(reinterpret_cast<uintptr_t>(smem_act_fp8 + kHidden));
 
     float* const smem_score_sigmoid = reinterpret_cast<float*>(rs_base);
     rs_base += sizeof(float) * kNumExperts;
@@ -540,20 +493,11 @@ __global__ __launch_bounds__(384, V68_LB_BLOCKS_PER_SM) void mega_kernel_v68(flo
     rs_base += sizeof(int32_t) * kTopK;
     rs_base = align_up_128(rs_base);
 
-    // (smem_warp_max removed - no longer needed now that activation amax is
-    // computed per-128-col within each quant warp and never reduced across warps.)
-
     // Per-128-col activation dequant scales (TRTLLM 1x128 quant scheme).
     // 48 fp32 = one scale per 128-col K-block over kHidden=6144.
     // Computed in-kernel during Phase 1 (overlapped with top-K) and consumed
     // in the K-loop fold (replacing the old single per-tensor scalar).
     float* const smem_act_block_scales = reinterpret_cast<float*>(rs_base);
-    rs_base += sizeof(float) * kWeightScaleKBlocks;
-    rs_base = align_up_128(rs_base);
-
-    // [v68-slot0-residual] Second per-K-block dequant scales for the residual
-    // fp8 quant (slot 0 only). 48 fp32 + alignment.
-    float* const smem_act_block_scales_lo = reinterpret_cast<float*>(rs_base);
     rs_base += sizeof(float) * kWeightScaleKBlocks;
     rs_base = align_up_128(rs_base);
 
@@ -717,36 +661,6 @@ __global__ __launch_bounds__(384, V68_LB_BLOCKS_PER_SM) void mega_kernel_v68(flo
                 | (static_cast<uint32_t>(static_cast<uint8_t>(fp8_2.__x)) << 16)
                 | (static_cast<uint32_t>(static_cast<uint8_t>(fp8_3.__x)) << 24);
             *reinterpret_cast<uint32_t*>(lane_dst) = packed;
-
-            // [v68-slot0-residual] Compute the residual quant for slot 0
-            // (shared expert) use. residual_i = f_i - dequant(fp8_i),
-            // then quant the residual with its own scale.
-            float const r0 = f0 - static_cast<float>(fp8_0) * dequant_scale;
-            float const r1 = f1 - static_cast<float>(fp8_1) * dequant_scale;
-            float const r2 = f2 - static_cast<float>(fp8_2) * dequant_scale;
-            float const r3 = f3 - static_cast<float>(fp8_3) * dequant_scale;
-
-            float const r_lane_max = fmaxf(fmaxf(fabsf(r0), fabsf(r1)), fmaxf(fabsf(r2), fabsf(r3)));
-            float r_amax = cg::reduce(warp, r_lane_max, cg::greater<float>{});
-            r_amax = fmaxf(r_amax, 1e-10f);
-            float const quant_scale_lo = kFp8Max / r_amax;
-            float const dequant_scale_lo = 1.f / quant_scale_lo;
-
-            if (lane == 0)
-            {
-                smem_act_block_scales_lo[kb_global] = dequant_scale_lo;
-            }
-
-            __nv_fp8_e4m3* lane_dst_lo = smem_act_fp8_lo + block_off + lane * kElemsPerLane128Block;
-            float const q0_lo = fmaxf(-kFp8Max, fminf(kFp8Max, r0 * quant_scale_lo));
-            float const q1_lo = fmaxf(-kFp8Max, fminf(kFp8Max, r1 * quant_scale_lo));
-            float const q2_lo = fmaxf(-kFp8Max, fminf(kFp8Max, r2 * quant_scale_lo));
-            float const q3_lo = fmaxf(-kFp8Max, fminf(kFp8Max, r3 * quant_scale_lo));
-            uint32_t const packed_lo = (static_cast<uint32_t>(static_cast<uint8_t>(__nv_fp8_e4m3(q0_lo).__x)) << 0)
-                | (static_cast<uint32_t>(static_cast<uint8_t>(__nv_fp8_e4m3(q1_lo).__x)) << 8)
-                | (static_cast<uint32_t>(static_cast<uint8_t>(__nv_fp8_e4m3(q2_lo).__x)) << 16)
-                | (static_cast<uint32_t>(static_cast<uint8_t>(__nv_fp8_e4m3(q3_lo).__x)) << 24);
-            *reinterpret_cast<uint32_t*>(lane_dst_lo) = packed_lo;
         }
     }
     __syncthreads();
@@ -801,16 +715,12 @@ __global__ __launch_bounds__(384, V68_LB_BLOCKS_PER_SM) void mega_kernel_v68(flo
         float gate_block_scales[kWeightScaleKBlocksPerKIter];
         float up_block_scales[kWeightScaleKBlocksPerKIter];
         float act_block_scales[kWeightScaleKBlocksPerKIter];
-        // [v68-slot0-residual] Second per-K-block activation dequant scales
-        // for slot 0 (shared expert) residual MMA path.
-        float act_block_scales_lo[kWeightScaleKBlocksPerKIter];
         if (is_gate_worker || is_up_worker)
         {
 #pragma unroll
             for (int kb = 0; kb < kWeightScaleKBlocksPerKIter; ++kb)
             {
                 act_block_scales[kb] = smem_act_block_scales[k * kWeightScaleKBlocksPerKIter + kb];
-                act_block_scales_lo[kb] = smem_act_block_scales_lo[k * kWeightScaleKBlocksPerKIter + kb];
             }
         }
         else
@@ -819,7 +729,6 @@ __global__ __launch_bounds__(384, V68_LB_BLOCKS_PER_SM) void mega_kernel_v68(flo
             for (int kb = 0; kb < kWeightScaleKBlocksPerKIter; ++kb)
             {
                 act_block_scales[kb] = 0.f;
-                act_block_scales_lo[kb] = 0.f;
             }
         }
         if (is_gate_worker)
@@ -865,19 +774,15 @@ __global__ __launch_bounds__(384, V68_LB_BLOCKS_PER_SM) void mega_kernel_v68(flo
             smem_up_tiles, shared_gate_up_weight, routed_w3_w1_weight, my_expert, sub_row, k, tidx);
         __syncthreads();
 
-        // Keep the WIP path numerically aligned with TRTLLM baseline and the
-        // PyTorch reference, both of which use one fp8_quantize_1x128 pass
-        // for routed and shared activations.
-        bool const use_residual = false;
         if (is_gate_worker)
         {
-            compute_mma_kiter_v68(smem_gate_tiles, smem_act_fp8, smem_act_fp8_lo, k, my_m_gate, lane, gate_block_scales,
-                act_block_scales, act_block_scales_lo, use_residual, d_gate);
+            compute_mma_kiter_v68(
+                smem_gate_tiles, smem_act_fp8, k, my_m_gate, lane, gate_block_scales, act_block_scales, d_gate);
         }
         if (is_up_worker)
         {
-            compute_mma_kiter_v68(smem_up_tiles, smem_act_fp8, smem_act_fp8_lo, k, my_m_up, lane, up_block_scales,
-                act_block_scales, act_block_scales_lo, use_residual, d_up);
+            compute_mma_kiter_v68(
+                smem_up_tiles, smem_act_fp8, k, my_m_up, lane, up_block_scales, act_block_scales, d_up);
         }
         __syncthreads();
     }
@@ -906,34 +811,11 @@ __global__ __launch_bounds__(384, V68_LB_BLOCKS_PER_SM) void mega_kernel_v68(flo
     // inside one CTA; the reference uses 128-row blocks.
     if (expert_slot != 0)
     {
-        if (tidx < kCtaOutRows)
+        float const gate_abs = tidx < kCtaOutRows ? fabsf(smem_gate_acc[tidx]) : 0.f;
+        float const warp_amax = cg::reduce(warp, gate_abs, cg::greater<float>{});
+        if (lane == 0 && warp_idx < 2)
         {
-            smem_score_sigmoid[tidx] = fabsf(smem_gate_acc[tidx]);
-        }
-        __syncthreads();
-        if (tidx < 32)
-        {
-            smem_score_sigmoid[tidx] = fmaxf(smem_score_sigmoid[tidx], smem_score_sigmoid[tidx + 32]);
-        }
-        __syncthreads();
-        if (tidx < 16)
-        {
-            smem_score_sigmoid[tidx] = fmaxf(smem_score_sigmoid[tidx], smem_score_sigmoid[tidx + 16]);
-        }
-        __syncthreads();
-        if (tidx < 8)
-        {
-            smem_score_sigmoid[tidx] = fmaxf(smem_score_sigmoid[tidx], smem_score_sigmoid[tidx + 8]);
-        }
-        __syncthreads();
-        if (tidx < 4)
-        {
-            smem_score_sigmoid[tidx] = fmaxf(smem_score_sigmoid[tidx], smem_score_sigmoid[tidx + 4]);
-        }
-        __syncthreads();
-        if (tidx < 2)
-        {
-            smem_score_sigmoid[tidx] = fmaxf(smem_score_sigmoid[tidx], smem_score_sigmoid[tidx + 2]);
+            smem_score_sigmoid[warp_idx] = warp_amax;
         }
         __syncthreads();
         if (tidx == 0)
@@ -949,7 +831,6 @@ __global__ __launch_bounds__(384, V68_LB_BLOCKS_PER_SM) void mega_kernel_v68(flo
             float const q = fmaxf(-kFp8Max, fminf(kFp8Max, smem_gate_acc[tidx] * quant_scale));
             smem_gate_acc[tidx] = static_cast<float>(__nv_fp8_e4m3(q)) * dequant_scale;
         }
-        __syncthreads();
     }
 
     if (tidx < kCtaOutRows)
@@ -978,8 +859,6 @@ static inline size_t v68_smem_bytes()
     bytes += static_cast<size_t>(kHidden) * sizeof(__nv_bfloat16);
     // Separate fp8 act buffer (no longer aliased over bf16). +6 KiB.
     bytes += static_cast<size_t>(kHidden) * sizeof(__nv_fp8_e4m3);
-    // [v68-slot0-residual] Second fp8 act buffer for residual quant. +6 KiB.
-    bytes += static_cast<size_t>(kHidden) * sizeof(__nv_fp8_e4m3);
     bytes = align_up_128(bytes);
     bytes += sizeof(float) * kNumExperts;
     bytes = align_up_128(bytes);
@@ -992,9 +871,6 @@ static inline size_t v68_smem_bytes()
     bytes += sizeof(int32_t) * kTopK;
     bytes = align_up_128(bytes);
     // smem_act_block_scales[48]: per-128-col activation dequant scales.
-    bytes += sizeof(float) * kWeightScaleKBlocks;
-    bytes = align_up_128(bytes);
-    // [v68-slot0-residual] smem_act_block_scales_lo[48].
     bytes += sizeof(float) * kWeightScaleKBlocks;
     bytes = align_up_128(bytes);
     bytes += sizeof(float) * kCtaOutRows;

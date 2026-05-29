@@ -326,6 +326,28 @@ __device__ __forceinline__ uint32_t fp8x2_to_f16x2(uint16_t fp8_pair)
     return out;
 }
 
+__device__ __forceinline__ void prefetchGlobalL2(void const* ptr)
+{
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+    asm volatile("prefetch.global.L2::evict_last [%0];\n" ::"l"(ptr));
+#else
+    (void) ptr;
+#endif
+}
+
+__device__ __forceinline__ uint4 loadGlobalUint4L2(uint4 const* ptr)
+{
+    uint4 value;
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+    asm volatile("ld.global.L2::256B.v4.u32 {%0, %1, %2, %3}, [%4];\n"
+                 : "=r"(value.x), "=r"(value.y), "=r"(value.z), "=r"(value.w)
+                 : "l"(ptr));
+#else
+    value = *ptr;
+#endif
+    return value;
+}
+
 // -----------------------------------------------------------------------------
 // HMMA.16816 f16xf16 -> fp32.
 // -----------------------------------------------------------------------------
@@ -567,6 +589,24 @@ __global__ __launch_bounds__(kThreadsPerCta, 1) void mega_down_v110_kernel(
     int const hidden_elems = M * kTopKPlusShared * K_local;
     const size_t hidden_bytes = sizeof(__half) * (size_t) hidden_elems;
 
+    // Cooperatively warm L2 for the small v68->v110 handoff before the per-CTA
+    // shared-memory staging below. The buffer is at most 36 KiB for M <= 4.
+    if (tid == 0)
+    {
+        constexpr int kPrefetchBytes = 128;
+        int const hidden_prefetch_lines = static_cast<int>((hidden_bytes + kPrefetchBytes - 1) / kPrefetchBytes);
+        char const* hidden_prefetch_base = reinterpret_cast<char const*>(hidden_in_raw);
+        for (int line = cta_id; line < hidden_prefetch_lines; line += kNumCtas)
+        {
+            prefetchGlobalL2(hidden_prefetch_base + static_cast<size_t>(line) * kPrefetchBytes);
+        }
+        if (cta_id == 0)
+        {
+            prefetchGlobalL2(indices);
+            prefetchGlobalL2(scores);
+        }
+    }
+
     int32_t* smem_expert_ids = reinterpret_cast<int32_t*>(smem_raw + hidden_bytes);
     float* smem_weights = reinterpret_cast<float*>(smem_expert_ids + M * kTopKPlusShared);
 
@@ -656,7 +696,7 @@ __global__ __launch_bounds__(kThreadsPerCta, 1) void mega_down_v110_kernel(
                 int const slot = slot_vec - m * kTopKPlusShared;
                 int const src_vec = (m * kTopKPlusShared + slot) * kKLocalVecs + src_chunk_vec + k_vec;
 
-                dst_chunk[chunk_vec] = hidden_src[src_vec];
+                dst_chunk[chunk_vec] = loadGlobalUint4L2(hidden_src + src_vec);
             }
         }
     }
