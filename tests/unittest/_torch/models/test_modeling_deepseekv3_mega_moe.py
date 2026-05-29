@@ -15,9 +15,11 @@
 
 import importlib
 import os
+import statistics
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 import pytest
 import torch
@@ -36,6 +38,8 @@ _DEFAULT_N_GROUP = 8
 _DEFAULT_TOPK_GROUP = 4
 _DEFAULT_ROUTED_SCALING_FACTOR = 2.5
 _DEFAULT_MAX_WIP_NUM_TOKENS = 4
+_DEFAULT_PROFILE_WARMUP_ITERS = 20
+_DEFAULT_PROFILE_ITERS = 100
 _ERROR_EPS = 1e-12
 
 # Tensor shape symbols used by the comments below:
@@ -66,7 +70,15 @@ def _debug_output_dir() -> Path:
 
 def _phase_enabled(phase: str) -> bool:
     selected_phase = os.environ.get(_PHASE_ENV, "both").strip().lower()
-    return selected_phase in ("both", "all", phase)
+    phase_aliases = {
+        "benchmark": "profile",
+        "bench": "profile",
+        "timing": "profile",
+    }
+    selected_phase = phase_aliases.get(selected_phase, selected_phase)
+    if selected_phase == "both":
+        return phase in ("reference", "test")
+    return selected_phase in ("all", phase)
 
 
 def _int_env(name: str, default: int) -> int:
@@ -118,6 +130,17 @@ def _max_wip_num_tokens() -> int:
     )
 
 
+def _profile_warmup_iters() -> int:
+    return _int_env(
+        "TRTLLM_DEEPSEEKV3_MEGAMOE_TEST_PROFILE_WARMUP_ITERS",
+        _DEFAULT_PROFILE_WARMUP_ITERS,
+    )
+
+
+def _profile_iters() -> int:
+    return _int_env("TRTLLM_DEEPSEEKV3_MEGAMOE_TEST_PROFILE_ITERS", _DEFAULT_PROFILE_ITERS)
+
+
 def _baseline_tune_max_num_tokens(num_tokens: int) -> int:
     return _int_env("TRTLLM_DEEPSEEKV3_MEGAMOE_TEST_BASELINE_TUNE_MAX_NUM_TOKENS", num_tokens)
 
@@ -153,6 +176,29 @@ def _save_tensor(group: MegaMoeDumpGroup, tensor_name: str, tensor: torch.Tensor
 def _save_summary(summary_name: str, rank: int, rel_error: float, abs_error: float) -> None:
     path = _debug_output_dir() / summary_name
     new_line = f"Test {rank}: rel {rel_error:.6e} abs {abs_error:.6e}"
+
+    lines_by_rank: dict[int, str] = {}
+    if path.exists():
+        for line in path.read_text().splitlines():
+            if not line.startswith("Test "):
+                continue
+            test_idx = int(line.split(":", 1)[0].split()[1])
+            lines_by_rank[test_idx] = line
+    lines_by_rank[rank] = new_line
+    path.write_text("\n".join(lines_by_rank[idx] for idx in sorted(lines_by_rank)) + "\n")
+
+
+def _save_profile_summary(
+    rank: int, baseline_stats: dict[str, float], wip_stats: dict[str, float]
+) -> None:
+    path = _debug_output_dir() / "mega_moe_profile_times.txt"
+    speedup = baseline_stats["mean_ms"] / wip_stats["mean_ms"]
+    new_line = (
+        f"Test {rank}: baseline_mean_ms {baseline_stats['mean_ms']:.6f} "
+        f"baseline_median_ms {baseline_stats['median_ms']:.6f} "
+        f"wip_mean_ms {wip_stats['mean_ms']:.6f} "
+        f"wip_median_ms {wip_stats['median_ms']:.6f} speedup {speedup:.3f}x"
+    )
 
     lines_by_rank: dict[int, str] = {}
     if path.exists():
@@ -481,6 +527,41 @@ def _run_wip(tensors: dict[str, torch.Tensor]) -> torch.Tensor:
     )
 
 
+def _profile_cuda_events(
+    fn: Callable[[], torch.Tensor], warmup_iters: int, profile_iters: int
+) -> tuple[torch.Tensor, dict[str, float]]:
+    if warmup_iters < 0:
+        raise ValueError(f"warmup_iters must be non-negative, got {warmup_iters}")
+    if profile_iters <= 0:
+        raise ValueError(f"profile_iters must be positive, got {profile_iters}")
+
+    for _ in range(warmup_iters):
+        fn()
+    torch.cuda.synchronize()
+
+    starts = [torch.cuda.Event(enable_timing=True) for _ in range(profile_iters)]
+    ends = [torch.cuda.Event(enable_timing=True) for _ in range(profile_iters)]
+    for idx in range(profile_iters):
+        starts[idx].record()
+        fn()
+        ends[idx].record()
+
+    torch.cuda.synchronize()
+    times_ms = torch.tensor(
+        [starts[idx].elapsed_time(ends[idx]) for idx in range(profile_iters)],
+        dtype=torch.float32,
+    )
+    times = [float(time_ms) for time_ms in times_ms.tolist()]
+    stats = {
+        "mean_ms": statistics.mean(times),
+        "median_ms": statistics.median(times),
+        "std_ms": statistics.stdev(times) if len(times) > 1 else 0.0,
+        "min_ms": min(times),
+        "max_ms": max(times),
+    }
+    return times_ms, stats
+
+
 def _max_errors(
     actual: torch.Tensor, expected: torch.Tensor
 ) -> tuple[float, float, torch.Tensor, torch.Tensor]:
@@ -564,4 +645,34 @@ def test_deepseekv3_mega_moe_wip_phase(rank: int) -> None:
     assert abs_error <= reference_abs_threshold, (
         f"rank {rank} WIP output differs from PyTorch reference: rel={rel_error} "
         f"abs={abs_error} reference_abs_threshold={reference_abs_threshold}"
+    )
+
+
+@pytest.mark.parametrize("rank", range(_NUM_RANKS))
+def test_deepseekv3_mega_moe_profile_phase(rank: int) -> None:
+    if not _phase_enabled("profile"):
+        pytest.skip(f"{_PHASE_ENV} disables profile phase")
+    _require_cuda_and_ops(require_baseline_ops=True, require_wip_ops=True)
+    group = _dump_group(rank)
+    tensors = _load_inputs(group, max_num_tokens=_max_wip_num_tokens())
+    warmup_iters = _profile_warmup_iters()
+    profile_iters = _profile_iters()
+
+    with torch.inference_mode():
+        # baseline_times_ms and wip_times_ms: torch.float32, [profile_iters].
+        baseline_times_ms, baseline_stats = _profile_cuda_events(
+            lambda: _run_trtllm_baseline(tensors), warmup_iters, profile_iters
+        )
+        wip_times_ms, wip_stats = _profile_cuda_events(
+            lambda: _run_wip(tensors), warmup_iters, profile_iters
+        )
+
+    _save_tensor(group, "baseline_profile_times_ms", baseline_times_ms)
+    _save_tensor(group, "wip_profile_times_ms", wip_times_ms)
+    _save_profile_summary(rank, baseline_stats, wip_stats)
+
+    speedup = baseline_stats["mean_ms"] / wip_stats["mean_ms"]
+    print(
+        f"rank {rank}: baseline {baseline_stats['mean_ms']:.6f} ms, "
+        f"wip {wip_stats['mean_ms']:.6f} ms, speedup {speedup:.3f}x"
     )
