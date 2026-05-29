@@ -1,12 +1,13 @@
 import os
-from typing import Dict, Optional
+from pathlib import Path
+from typing import Callable, Dict, Optional
 
 import torch
 import triton
 from torch import nn
 
 from tensorrt_llm import deep_gemm
-from tensorrt_llm._utils import is_sm_100f
+from tensorrt_llm._utils import is_sm_100f, mpi_rank
 from tensorrt_llm.bindings.internal.thop import BufferKind
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
@@ -15,6 +16,45 @@ from ..model_config import ModelConfig
 from ..modules.fused_moe import MoE
 from ..utils import AuxStreamType, Fp4QuantizedTensor
 from .modeling_deepseekv3_moe import Deepseekv3MoE
+
+_MEGA_MOE_DEBUG_DUMP_ENV = "TRTLLM_DEEPSEEKV3_MEGAMOE_DUMP_TENSORS"
+_MEGA_MOE_DEBUG_OUTPUT_DIR_ENV = "TRTLLM_DEEPSEEKV3_MEGAMOE_DEBUG_OUTPUT_DIR"
+_MEGA_MOE_DEBUG_DEFAULT_OUTPUT_DIR = "~/dev/debug_output"
+_TORCH_TENSOR_FILE_SUFFIX = "pt"
+
+
+def _mega_moe_debug_dump_enabled() -> bool:
+    value = os.environ.get(_MEGA_MOE_DEBUG_DUMP_ENV, "0").strip().lower()
+    return value in ("1", "true", "yes", "on")
+
+
+def _sanitize_dump_tensor_name(tensor_name: str) -> str:
+    return "".join(
+        char if char.isalnum() or char in ("-", "_", ".") else "_" for char in tensor_name
+    )
+
+
+def dump_mega_moe_tensor(
+    tensor: torch.Tensor,
+    layer_idx: int,
+    tensor_name: str,
+    output_dir: str | None = None,
+) -> None:
+    """Dump one MegaMoE tensor using the standard PyTorch ``.pt`` format."""
+    if not isinstance(tensor, torch.Tensor):
+        raise TypeError(f"expected tensor to be torch.Tensor, got {type(tensor)}")
+
+    base_dir = output_dir or os.environ.get(
+        _MEGA_MOE_DEBUG_OUTPUT_DIR_ENV, _MEGA_MOE_DEBUG_DEFAULT_OUTPUT_DIR
+    )
+    output_path = Path(base_dir).expanduser()
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    safe_tensor_name = _sanitize_dump_tensor_name(tensor_name)
+    file_path = output_path / (
+        f"r{mpi_rank()}_l{layer_idx}_{safe_tensor_name}.{_TORCH_TENSOR_FILE_SUFFIX}"
+    )
+    torch.save(tensor.detach().cpu(), file_path)
 
 
 def check_data(tensor: torch.Tensor, name: str, dtype: torch.dtype, shape: tuple[int, ...]) -> None:
@@ -64,6 +104,8 @@ class Deepseekv3MegaMoE(nn.Module):
         self._old_moe.shared_experts.gate_up_proj.retain_pre_deep_gemm_weight = True
         self._old_moe.shared_experts.down_proj.retain_pre_deep_gemm_weight = True
         self.layer_idx = layer_idx
+        self._debug_dump_weights_on_next_forward = False
+        self._debug_dump_activations_on_next_forward = False
 
     @property
     def experts(self) -> MoE:
@@ -107,6 +149,94 @@ class Deepseekv3MegaMoE(nn.Module):
                 f"expected one of: {allowed_modes}"
             )
         return mode_aliases[mode]
+
+    @classmethod
+    def debug_tensor_dump_enabled(cls) -> bool:
+        return _mega_moe_debug_dump_enabled()
+
+    def request_weight_tensor_dump(self) -> None:
+        self._debug_dump_weights_on_next_forward = True
+
+    def request_activation_tensor_dump(self) -> None:
+        self._debug_dump_activations_on_next_forward = True
+
+    def _consume_weight_tensor_dump_request(self) -> bool:
+        should_dump = self.debug_tensor_dump_enabled() and self._debug_dump_weights_on_next_forward
+        if should_dump:
+            self._debug_dump_weights_on_next_forward = False
+        return should_dump
+
+    def _consume_activation_tensor_dump_request(self) -> bool:
+        should_dump = (
+            self.debug_tensor_dump_enabled() and self._debug_dump_activations_on_next_forward
+        )
+        if should_dump:
+            self._debug_dump_activations_on_next_forward = False
+        return should_dump
+
+    def _dump_tensor(self, tensor_name: str, tensor: torch.Tensor) -> None:
+        dump_mega_moe_tensor(tensor, self.layer_idx, tensor_name)
+
+    def dump_mega_moe_weight_tensors(self) -> None:
+        """Dump the weight tensors consumed by MegaMoE and baseline MoE paths."""
+        old_moe = self._old_moe
+        shared_experts = old_moe.shared_experts
+        shared_gate_up_proj = shared_experts.gate_up_proj
+        shared_down_proj = shared_experts.down_proj
+        moe_backend = old_moe.experts.backend
+        routing_params = moe_backend._extract_routing_params()
+        routing_bias = routing_params.routing_bias
+
+        shared_gate_up_weight_org = getattr(shared_gate_up_proj, "weight_org", None)
+        shared_gate_up_weight_scale_org = getattr(shared_gate_up_proj, "weight_scale_org", None)
+        shared_down_weight_org = getattr(shared_down_proj, "weight_org", None)
+        shared_down_weight_scale_org = getattr(shared_down_proj, "weight_scale_org", None)
+
+        tensors: dict[str, torch.Tensor | None] = {
+            "router_weight": old_moe.gate.weight,
+            "routing_bias": routing_bias,
+            "shared_gate_up_weight": getattr(shared_gate_up_proj, "weight", None),
+            "shared_gate_up_weight_scale": getattr(shared_gate_up_proj, "weight_scale", None),
+            "shared_gate_up_weight_org": shared_gate_up_weight_org,
+            "shared_gate_up_weight_scale_org": shared_gate_up_weight_scale_org,
+            "routed_w3_w1_weight": moe_backend.w3_w1_weight,
+            "routed_w3_w1_weight_scaling_factor": moe_backend.w3_w1_weight_scaling_factor,
+            "routed_w2_weight": moe_backend.w2_weight,
+            "routed_w2_weight_scaling_factor": moe_backend.w2_weight_scaling_factor,
+            "shared_down_weight": getattr(shared_down_proj, "weight", None),
+            "shared_down_weight_scale": getattr(shared_down_proj, "weight_scale", None),
+            "shared_down_weight_org": shared_down_weight_org,
+            "shared_down_weight_scale_org": shared_down_weight_scale_org,
+        }
+        for tensor_name, tensor in tensors.items():
+            if tensor is not None:
+                self._dump_tensor(tensor_name, tensor)
+
+    def dump_mega_moe_activation_tensors(self, **tensors: torch.Tensor | None) -> None:
+        """Dump selected activation tensors from the current MegaMoE forward."""
+        for tensor_name, tensor in tensors.items():
+            if tensor is not None:
+                self._dump_tensor(tensor_name, tensor)
+
+    def _dump_requested_forward_start_tensors(
+        self,
+        hidden_states: torch.Tensor,
+        hidden_states_fp4: Fp4QuantizedTensor | None,
+    ) -> Callable[[str, torch.Tensor], None] | None:
+        if self._consume_weight_tensor_dump_request():
+            self.dump_mega_moe_weight_tensors()
+
+        if not self._consume_activation_tensor_dump_request():
+            return None
+
+        activation_tensors = {"hidden_states": hidden_states}
+        if hidden_states_fp4 is not None:
+            activation_tensors["hidden_states_fp4"] = hidden_states_fp4.fp4_tensor
+            activation_tensors["hidden_states_fp4_scaling_factor"] = (
+                hidden_states_fp4.scaling_factor
+            )
+        self.dump_mega_moe_activation_tensors(**activation_tensors)
+        return self._dump_tensor
 
     @staticmethod
     def _pytorch_ref_chunk_size() -> int:
@@ -493,6 +623,7 @@ class Deepseekv3MegaMoE(nn.Module):
         routed_scaling_factor: float,
         shared_swiglu_limit: Optional[float],
         routed_swiglu_limit: Optional[float],
+        activation_dump_callback: Callable[[str, torch.Tensor], None] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         # fp32, [num_tokens, num_router_experts]
         router_logits = torch.ops.trtllm.dsv3_router_gemm_op(
@@ -506,6 +637,8 @@ class Deepseekv3MegaMoE(nn.Module):
             torch.float32,
             (num_tokens, num_router_experts),
         )
+        if activation_dump_callback is not None:
+            activation_dump_callback("router_logits", router_logits)
 
         assert top_k == 8, f"v68 WIP mega kernel only supports top_k=8, got {top_k}"
         assert n_group > 0, f"expected positive n_group, got {n_group}"
@@ -541,6 +674,10 @@ class Deepseekv3MegaMoE(nn.Module):
             torch.float16,
             (num_tokens, top_k + 1, -1),
         )
+        if activation_dump_callback is not None:
+            activation_dump_callback("expert_indices", expert_indices)
+            activation_dump_callback("expert_weights", expert_weights)
+            activation_dump_callback("slot_swiglu_output", slot_swiglu_output)
 
         return (
             expert_indices,
@@ -855,6 +992,7 @@ class Deepseekv3MegaMoE(nn.Module):
         block_scale_int32_hidden_size: int,
         block_scale_fp32_expert_intermediate_size: int,
         gate_up_output_size: int,
+        activation_dump_callback: Callable[[str, torch.Tensor], None] | None = None,
     ) -> torch.Tensor:
         """
         WIP CUDA mega-kernel implementation of forward().
@@ -1014,6 +1152,7 @@ class Deepseekv3MegaMoE(nn.Module):
             routing_params.routed_scaling_factor,
             shared_experts.swiglu_limit,
             moe_backend.swiglu_limit_scalar,
+            activation_dump_callback,
         )
         check_data(
             expert_indices,
@@ -1120,6 +1259,10 @@ class Deepseekv3MegaMoE(nn.Module):
         old_moe = self._old_moe
         assert do_finalize is True, "Deepseekv3MegaMoE only supports do_finalize=True"
 
+        activation_dump_callback = self._dump_requested_forward_start_tensors(
+            hidden_states, hidden_states_fp4
+        )
+
         num_tokens: int = hidden_states.size(0)
         if num_tokens > self._WIP_DOWN_PROJECT_MAX_NUM_TOKENS:
             # The WIP down-project kernel is decode-specialized for M <= 4.
@@ -1195,6 +1338,7 @@ class Deepseekv3MegaMoE(nn.Module):
                     block_scale_fp32_expert_intermediate_size
                 ),
                 gate_up_output_size=gate_up_output_size,
+                activation_dump_callback=activation_dump_callback,
             )
 
         shared_gate_up_output = torch.empty(
