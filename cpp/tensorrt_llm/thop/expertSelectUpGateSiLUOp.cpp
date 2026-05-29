@@ -33,6 +33,10 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> mega_silu_v68_integrated
     torch::Tensor hidden_in, torch::Tensor bias, torch::Tensor shared_gate_up_weight,
     torch::Tensor shared_gate_up_scale, torch::Tensor routed_w3_w1_weight, torch::Tensor routed_w3_w1_scale,
     double routed_scaling_factor);
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> mega_silu_v68_packed_integrated(torch::Tensor scores,
+    torch::Tensor hidden_in, torch::Tensor bias, torch::Tensor shared_gate_up_weight,
+    torch::Tensor shared_gate_up_scale, torch::Tensor routed_w3_w1_weight, torch::Tensor routed_w3_w1_scale,
+    double routed_scaling_factor);
 } // namespace mega_kernel
 
 TRTLLM_NAMESPACE_BEGIN
@@ -49,6 +53,15 @@ std::tuple<th::Tensor, th::Tensor, th::Tensor> glm5_expert_select_up_gate_silu(t
         std::move(routed_w3_w1_scale), routed_scaling_factor);
 }
 
+std::tuple<th::Tensor, th::Tensor, th::Tensor> glm5_expert_select_up_gate_silu_packed(th::Tensor scores,
+    th::Tensor hidden_in, th::Tensor bias, th::Tensor shared_gate_up_weight, th::Tensor shared_gate_up_scale,
+    th::Tensor routed_w3_w1_weight, th::Tensor routed_w3_w1_scale, double routed_scaling_factor)
+{
+    return mega_kernel::mega_silu_v68_packed_integrated(std::move(scores), std::move(hidden_in), std::move(bias),
+        std::move(shared_gate_up_weight), std::move(shared_gate_up_scale), std::move(routed_w3_w1_weight),
+        std::move(routed_w3_w1_scale), routed_scaling_factor);
+}
+
 } // namespace torch_ext
 
 TRTLLM_NAMESPACE_END
@@ -60,9 +73,15 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "Tensor shared_gate_up_scale, Tensor routed_w3_w1_weight, Tensor routed_w3_w1_scale, "
         "float routed_scaling_factor) -> "
         "(Tensor topk_values, Tensor topk_indices, Tensor hidden_out)");
+    m.def(
+        "glm5_expert_select_up_gate_silu_packed(Tensor scores, Tensor hidden_in, Tensor bias, "
+        "Tensor shared_gate_up_weight, Tensor shared_gate_up_scale, Tensor routed_w3_w1_weight, "
+        "Tensor routed_w3_w1_scale, float routed_scaling_factor) -> "
+        "(Tensor topk_values, Tensor topk_indices, Tensor hidden_out)");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
     m.impl("glm5_expert_select_up_gate_silu", &tensorrt_llm::torch_ext::glm5_expert_select_up_gate_silu);
+    m.impl("glm5_expert_select_up_gate_silu_packed", &tensorrt_llm::torch_ext::glm5_expert_select_up_gate_silu_packed);
 }

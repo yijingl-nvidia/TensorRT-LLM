@@ -376,6 +376,41 @@ __device__ __forceinline__ float const* raw_scale_ptr(float const* __restrict__ 
 }
 
 template <int kInterPerTpParam, bool kGate>
+__device__ __forceinline__ __nv_fp8_e4m3 const* packed_weight_tile_ptr(
+    __nv_fp8_e4m3 const* __restrict__ shared_gate_up_weight, __nv_fp8_e4m3 const* __restrict__ routed_w3_w1_weight,
+    int expert, int sub_row, int k_iter)
+{
+    constexpr int kSubRowsPerExpert = sub_rows_per_expert(kInterPerTpParam);
+    constexpr int kGateUpIdx = kGate ? 0 : 1;
+    if (expert == kSharedExpert)
+    {
+        return shared_gate_up_weight + (((kGateUpIdx * kSubRowsPerExpert + sub_row) * kNumKIter + k_iter) * kTileBytes);
+    }
+
+    return routed_w3_w1_weight
+        + ((((expert * 2 + kGateUpIdx) * kSubRowsPerExpert + sub_row) * kNumKIter + k_iter) * kTileBytes);
+}
+
+template <int kInterPerTpParam, bool kGate>
+__device__ __forceinline__ void load_packed_weight_tile_v68(__nv_fp8_e4m3* __restrict__ smem_tile,
+    __nv_fp8_e4m3 const* __restrict__ shared_gate_up_weight, __nv_fp8_e4m3 const* __restrict__ routed_w3_w1_weight,
+    int expert, int sub_row, int k_iter, int tidx)
+{
+    constexpr int kVecsPerTile = kTileBytes / static_cast<int>(sizeof(uint4));
+    static_assert(kTileBytes % static_cast<int>(sizeof(uint4)) == 0);
+
+    uint4 const* const src = reinterpret_cast<uint4 const*>(packed_weight_tile_ptr<kInterPerTpParam, kGate>(
+        shared_gate_up_weight, routed_w3_w1_weight, expert, sub_row, k_iter));
+    uint4* const dst = reinterpret_cast<uint4*>(smem_tile);
+
+#pragma unroll 1
+    for (int vec = tidx; vec < kVecsPerTile; vec += kThreadsPerCta)
+    {
+        dst[vec] = src[vec];
+    }
+}
+
+template <int kInterPerTpParam, bool kGate>
 __device__ __forceinline__ void load_raw_weight_tile_v68(__nv_fp8_e4m3* __restrict__ smem_tile,
     __nv_fp8_e4m3 const* __restrict__ shared_gate_up_weight, __nv_fp8_e4m3 const* __restrict__ routed_w3_w1_weight,
     int expert, int sub_row, int k_iter, int tidx)
@@ -434,7 +469,7 @@ __device__ __forceinline__ void load_raw_weight_tile_v68(__nv_fp8_e4m3* __restri
 #define V68_LB_BLOCKS_PER_SM 1
 #endif
 
-template <int kInterPerTpParam>
+template <int kInterPerTpParam, bool kUsePackedWeights>
 __global__ __launch_bounds__(384, V68_LB_BLOCKS_PER_SM) void mega_kernel_v68(float const* __restrict__ scores,
     __nv_bfloat16 const* __restrict__ hidden_in, __nv_bfloat16 const* __restrict__ bias,
     __nv_fp8_e4m3 const* __restrict__ shared_gate_up_weight, float const* __restrict__ shared_gate_up_scale,
@@ -768,10 +803,20 @@ __global__ __launch_bounds__(384, V68_LB_BLOCKS_PER_SM) void mega_kernel_v68(flo
             }
         }
 
-        load_raw_weight_tile_v68<kInterPerTpParam, true>(
-            smem_gate_tiles, shared_gate_up_weight, routed_w3_w1_weight, my_expert, sub_row, k, tidx);
-        load_raw_weight_tile_v68<kInterPerTpParam, false>(
-            smem_up_tiles, shared_gate_up_weight, routed_w3_w1_weight, my_expert, sub_row, k, tidx);
+        if constexpr (kUsePackedWeights)
+        {
+            load_packed_weight_tile_v68<kInterPerTpParam, true>(
+                smem_gate_tiles, shared_gate_up_weight, routed_w3_w1_weight, my_expert, sub_row, k, tidx);
+            load_packed_weight_tile_v68<kInterPerTpParam, false>(
+                smem_up_tiles, shared_gate_up_weight, routed_w3_w1_weight, my_expert, sub_row, k, tidx);
+        }
+        else
+        {
+            load_raw_weight_tile_v68<kInterPerTpParam, true>(
+                smem_gate_tiles, shared_gate_up_weight, routed_w3_w1_weight, my_expert, sub_row, k, tidx);
+            load_raw_weight_tile_v68<kInterPerTpParam, false>(
+                smem_up_tiles, shared_gate_up_weight, routed_w3_w1_weight, my_expert, sub_row, k, tidx);
+        }
         __syncthreads();
 
         if (is_gate_worker)
@@ -881,26 +926,40 @@ static inline size_t v68_smem_bytes()
     return bytes;
 }
 
-template <int kInterPerTpParam>
+template <int kInterPerTpParam, bool kUsePackedWeights>
 static std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> mega_silu_v68_impl(torch::Tensor scores,
     torch::Tensor hidden_in, torch::Tensor bias, torch::Tensor shared_gate_up_weight,
     torch::Tensor shared_gate_up_scale, torch::Tensor routed_w3_w1_weight, torch::Tensor routed_w3_w1_scale,
     double routed_scaling_factor)
 {
     constexpr int kInterPerTp = kInterPerTpParam;
+    constexpr int kSubRowsPerExpert = sub_rows_per_expert(kInterPerTp);
     constexpr int kCtasPerToken = ctas_per_token(kInterPerTp);
     constexpr int kWeightScaleMBlocks = weight_scale_m_blocks(kInterPerTp);
 
     auto const M = scores.size(0);
 
-    TORCH_CHECK(shared_gate_up_weight.size(0) == 2 * kInterPerTp && shared_gate_up_weight.size(1) == kHidden,
-        "shared_gate_up_weight shape mismatch");
+    if constexpr (kUsePackedWeights)
+    {
+        TORCH_CHECK(shared_gate_up_weight.size(0) == 2 && shared_gate_up_weight.size(1) == kSubRowsPerExpert
+                && shared_gate_up_weight.size(2) == kNumKIter && shared_gate_up_weight.size(3) == kTileBytes,
+            "packed shared_gate_up_weight shape mismatch");
+        TORCH_CHECK(routed_w3_w1_weight.size(0) == kNumExperts && routed_w3_w1_weight.size(1) == 2
+                && routed_w3_w1_weight.size(2) == kSubRowsPerExpert && routed_w3_w1_weight.size(3) == kNumKIter
+                && routed_w3_w1_weight.size(4) == kTileBytes,
+            "packed routed_w3_w1_weight shape mismatch");
+    }
+    else
+    {
+        TORCH_CHECK(shared_gate_up_weight.size(0) == 2 * kInterPerTp && shared_gate_up_weight.size(1) == kHidden,
+            "shared_gate_up_weight shape mismatch");
+        TORCH_CHECK(routed_w3_w1_weight.size(0) == kNumExperts && routed_w3_w1_weight.size(1) == 2 * kInterPerTp
+                && routed_w3_w1_weight.size(2) == kHidden,
+            "routed_w3_w1_weight shape mismatch");
+    }
     TORCH_CHECK(
         shared_gate_up_scale.size(0) == 2 * kWeightScaleMBlocks && shared_gate_up_scale.size(1) == kWeightScaleKBlocks,
         "shared_gate_up_scale shape mismatch");
-    TORCH_CHECK(routed_w3_w1_weight.size(0) == kNumExperts && routed_w3_w1_weight.size(1) == 2 * kInterPerTp
-            && routed_w3_w1_weight.size(2) == kHidden,
-        "routed_w3_w1_weight shape mismatch");
     TORCH_CHECK(routed_w3_w1_scale.size(0) == kNumExperts && routed_w3_w1_scale.size(1) == 2 * kWeightScaleMBlocks
             && routed_w3_w1_scale.size(2) == kWeightScaleKBlocks,
         "routed_w3_w1_scale shape mismatch");
@@ -914,8 +973,8 @@ static std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> mega_silu_v68_imp
     {
         printf(
             "[v68_integrated] kKTile=%d, kStages=%d, LB(384,%d), "
-            "kInterPerTp=%d (raw shared gate/up, routed up/gate)\n",
-            kKTile, kStages, V68_LB_BLOCKS_PER_SM, kInterPerTp);
+            "kInterPerTp=%d (%s weights)\n",
+            kKTile, kStages, V68_LB_BLOCKS_PER_SM, kInterPerTp, kUsePackedWeights ? "packed" : "raw");
         s_logged = true;
     }
 
@@ -934,13 +993,13 @@ static std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> mega_silu_v68_imp
     static bool s_smem_opt_done = false;
     if (!s_smem_opt_done)
     {
-        cudaError_t err = cudaFuncSetAttribute(mega_kernel_v68<kInterPerTpParam>,
+        cudaError_t err = cudaFuncSetAttribute(mega_kernel_v68<kInterPerTpParam, kUsePackedWeights>,
             cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem_bytes));
         TORCH_CHECK(err == cudaSuccess, "cudaFuncSetAttribute(v68, maxDynSmem) failed: ", cudaGetErrorString(err));
         s_smem_opt_done = true;
     }
 
-    mega_kernel_v68<kInterPerTpParam><<<grid, block, smem_bytes, stream>>>(scores.data_ptr<float>(),
+    mega_kernel_v68<kInterPerTpParam, kUsePackedWeights><<<grid, block, smem_bytes, stream>>>(scores.data_ptr<float>(),
         reinterpret_cast<__nv_bfloat16 const*>(hidden_in.data_ptr<at::BFloat16>()),
         reinterpret_cast<__nv_bfloat16 const*>(bias.data_ptr<at::BFloat16>()),
         reinterpret_cast<__nv_fp8_e4m3 const*>(shared_gate_up_weight.data_ptr<at::Float8_e4m3fn>()),
@@ -1008,13 +1067,13 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> mega_silu_v68_integrated
 
     if (inter_per_tp == kInterPerTp_TP8)
     {
-        return mega_silu_v68_impl<kInterPerTp_TP8>(std::move(scores), std::move(hidden_in), std::move(bias),
+        return mega_silu_v68_impl<kInterPerTp_TP8, false>(std::move(scores), std::move(hidden_in), std::move(bias),
             std::move(shared_gate_up_weight), std::move(shared_gate_up_scale), std::move(routed_w3_w1_weight),
             std::move(routed_w3_w1_scale), routed_scaling_factor);
     }
     else if (inter_per_tp == kInterPerTp_TP4)
     {
-        return mega_silu_v68_impl<kInterPerTp_TP4>(std::move(scores), std::move(hidden_in), std::move(bias),
+        return mega_silu_v68_impl<kInterPerTp_TP4, false>(std::move(scores), std::move(hidden_in), std::move(bias),
             std::move(shared_gate_up_weight), std::move(shared_gate_up_scale), std::move(routed_w3_w1_weight),
             std::move(routed_w3_w1_scale), routed_scaling_factor);
     }
@@ -1022,6 +1081,78 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> mega_silu_v68_integrated
     {
         TORCH_CHECK(false,
             "v68 only supports TP=4 (kInterPerTp=512) or TP=8 "
+            "(kInterPerTp=256); inferred kInterPerTp=",
+            inter_per_tp);
+        return {};
+    }
+}
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> mega_silu_v68_packed_integrated(torch::Tensor scores,
+    torch::Tensor hidden_in, torch::Tensor bias, torch::Tensor shared_gate_up_weight,
+    torch::Tensor shared_gate_up_scale, torch::Tensor routed_w3_w1_weight, torch::Tensor routed_w3_w1_scale,
+    double routed_scaling_factor)
+{
+
+    TORCH_CHECK(scores.is_cuda() && hidden_in.is_cuda() && bias.is_cuda() && shared_gate_up_weight.is_cuda()
+            && shared_gate_up_scale.is_cuda() && routed_w3_w1_weight.is_cuda() && routed_w3_w1_scale.is_cuda(),
+        "inputs must be CUDA");
+    TORCH_CHECK(scores.dtype() == torch::kFloat32 && hidden_in.dtype() == torch::kBFloat16
+            && bias.dtype() == torch::kBFloat16 && shared_gate_up_weight.dtype() == torch::kFloat8_e4m3fn
+            && shared_gate_up_scale.dtype() == torch::kFloat32 && routed_w3_w1_weight.dtype() == torch::kFloat8_e4m3fn
+            && routed_w3_w1_scale.dtype() == torch::kFloat32,
+        "dtype mismatch");
+
+    auto const M = scores.size(0);
+    TORCH_CHECK(scores.size(1) == kNumExperts);
+    TORCH_CHECK(hidden_in.size(0) == M && hidden_in.size(1) == kHidden);
+    TORCH_CHECK(bias.size(0) == kNumExperts);
+
+    TORCH_CHECK(scores.is_contiguous() && hidden_in.is_contiguous() && bias.is_contiguous()
+            && shared_gate_up_weight.is_contiguous() && shared_gate_up_scale.is_contiguous()
+            && routed_w3_w1_weight.is_contiguous() && routed_w3_w1_scale.is_contiguous(),
+        "inputs must be contiguous");
+
+    TORCH_CHECK(shared_gate_up_weight.dim() == 4,
+        "packed shared_gate_up_weight must be 4D [gate_up, sub_row, k_iter, tile_bytes]");
+    TORCH_CHECK(
+        shared_gate_up_scale.dim() == 2, "shared_gate_up_scale must be 2D [2 * inter_per_tp / 128, hidden / 128]");
+    TORCH_CHECK(routed_w3_w1_weight.dim() == 5,
+        "packed routed_w3_w1_weight must be 5D [num_experts, gate_up, sub_row, k_iter, tile_bytes]");
+    TORCH_CHECK(routed_w3_w1_scale.dim() == 3,
+        "routed_w3_w1_scale must be 3D [num_experts, 2 * inter_per_tp / 128, hidden / 128]");
+    TORCH_CHECK(shared_gate_up_weight.size(0) == 2 && shared_gate_up_weight.size(2) == kNumKIter
+            && shared_gate_up_weight.size(3) == kTileBytes,
+        "packed shared_gate_up_weight shape mismatch");
+    TORCH_CHECK(routed_w3_w1_weight.size(0) == kNumExperts && routed_w3_w1_weight.size(1) == 2
+            && routed_w3_w1_weight.size(3) == kNumKIter && routed_w3_w1_weight.size(4) == kTileBytes,
+        "packed routed_w3_w1_weight shape mismatch");
+    TORCH_CHECK(routed_w3_w1_scale.size(0) == kNumExperts && routed_w3_w1_scale.size(2) == kWeightScaleKBlocks,
+        "routed_w3_w1_scale shape mismatch");
+
+    int64_t const inter_per_tp = routed_w3_w1_weight.size(2) * kCtaOutRows;
+    TORCH_CHECK(shared_gate_up_weight.size(1) == routed_w3_w1_weight.size(2),
+        "packed shared and routed weight sub_row dimensions must match");
+    TORCH_CHECK(
+        shared_gate_up_scale.size(0) == 2 * (inter_per_tp / 128) && shared_gate_up_scale.size(1) == kWeightScaleKBlocks,
+        "shared_gate_up_scale shape mismatch");
+    TORCH_CHECK(routed_w3_w1_scale.size(1) == 2 * (inter_per_tp / 128), "routed_w3_w1_scale shape mismatch");
+
+    if (inter_per_tp == kInterPerTp_TP8)
+    {
+        return mega_silu_v68_impl<kInterPerTp_TP8, true>(std::move(scores), std::move(hidden_in), std::move(bias),
+            std::move(shared_gate_up_weight), std::move(shared_gate_up_scale), std::move(routed_w3_w1_weight),
+            std::move(routed_w3_w1_scale), routed_scaling_factor);
+    }
+    else if (inter_per_tp == kInterPerTp_TP4)
+    {
+        return mega_silu_v68_impl<kInterPerTp_TP4, true>(std::move(scores), std::move(hidden_in), std::move(bias),
+            std::move(shared_gate_up_weight), std::move(shared_gate_up_scale), std::move(routed_w3_w1_weight),
+            std::move(routed_w3_w1_scale), routed_scaling_factor);
+    }
+    else
+    {
+        TORCH_CHECK(false,
+            "packed v68 only supports TP=4 (kInterPerTp=512) or TP=8 "
             "(kInterPerTp=256); inferred kInterPerTp=",
             inter_per_tp);
         return {};

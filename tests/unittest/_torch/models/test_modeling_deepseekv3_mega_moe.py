@@ -31,6 +31,7 @@ _RUNTIME_DEBUG_OUTPUT_DIR_ENV = "TRTLLM_DEEPSEEKV3_MEGAMOE_DEBUG_OUTPUT_DIR"
 _DEFAULT_DEBUG_OUTPUT_DIR = "~/dev/debug_output"
 _PHASE_ENV = "TRTLLM_DEEPSEEKV3_MEGAMOE_TEST_PHASE"
 _REF_USE_ORG_ENV = "TRTLLM_DEEPSEEKV3_MEGAMOE_REF_USE_SHARED_GATE_UP_WEIGHT_ORG"
+_PREPACK_V68_ENV = "TRTLLM_DEEPSEEKV3_MEGAMOE_TEST_PREPACK_V68"
 
 _NUM_RANKS = 8
 _DEFAULT_TOP_K = 8
@@ -42,6 +43,20 @@ _DEFAULT_PROFILE_WARMUP_ITERS = 20
 _DEFAULT_PROFILE_ITERS = 100
 _ERROR_EPS = 1e-12
 _WIP_ABS_ERROR_THRESHOLD_SLACK = 1.35
+_DEFAULT_PREPACK_V68 = True
+
+_V68_HIDDEN_SIZE = 6144
+_V68_CTA_OUT_ROWS = 64
+_V68_M_TILES_PER_CTA = 4
+_V68_ROW_HALVES_PER_M_TILE = 2
+_V68_ROWS_PER_HALF = 8
+_V68_NUM_K_ITER = 8
+_V68_K_THIRDS_PER_ITER = 6
+_V68_K_SUBS_PER_THIRD = 4
+_V68_COL_HALVES_PER_K_SUB = 2
+_V68_COL_QUADS_PER_HALF = 4
+_V68_BYTES_PER_COL_QUAD = 4
+_V68_TILE_BYTES = 49152
 
 # Ideal target is zero WIP slack: abs_error <= reference_abs_threshold.
 # Current dumped GLM-5 baseline-vs-PyTorch max abs thresholds by rank are:
@@ -93,6 +108,13 @@ def _int_env(name: str, default: int) -> int:
 
 def _float_env(name: str, default: float) -> float:
     return float(os.environ.get(name, str(default)))
+
+
+def _bool_env(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in ("1", "true", "yes", "on")
 
 
 def _optional_float_env(name: str) -> float | None:
@@ -147,6 +169,10 @@ def _profile_iters() -> int:
     return _int_env("TRTLLM_DEEPSEEKV3_MEGAMOE_TEST_PROFILE_ITERS", _DEFAULT_PROFILE_ITERS)
 
 
+def _prepack_v68_enabled() -> bool:
+    return _bool_env(_PREPACK_V68_ENV, _DEFAULT_PREPACK_V68)
+
+
 def _baseline_tune_max_num_tokens(num_tokens: int) -> int:
     return _int_env("TRTLLM_DEEPSEEKV3_MEGAMOE_TEST_BASELINE_TUNE_MAX_NUM_TOKENS", num_tokens)
 
@@ -195,15 +221,24 @@ def _save_summary(summary_name: str, rank: int, rel_error: float, abs_error: flo
 
 
 def _save_profile_summary(
-    rank: int, baseline_stats: dict[str, float], wip_stats: dict[str, float]
+    rank: int,
+    baseline_stats: dict[str, float],
+    raw_wip_stats: dict[str, float],
+    packed_wip_stats: dict[str, float],
 ) -> None:
     path = _debug_output_dir() / "mega_moe_profile_times.txt"
-    speedup = baseline_stats["mean_ms"] / wip_stats["mean_ms"]
+    raw_speedup = baseline_stats["mean_ms"] / raw_wip_stats["mean_ms"]
+    packed_speedup = baseline_stats["mean_ms"] / packed_wip_stats["mean_ms"]
+    packed_vs_raw_speedup = raw_wip_stats["mean_ms"] / packed_wip_stats["mean_ms"]
     new_line = (
         f"Test {rank}: baseline_mean_ms {baseline_stats['mean_ms']:.6f} "
         f"baseline_median_ms {baseline_stats['median_ms']:.6f} "
-        f"wip_mean_ms {wip_stats['mean_ms']:.6f} "
-        f"wip_median_ms {wip_stats['median_ms']:.6f} speedup {speedup:.3f}x"
+        f"raw_wip_mean_ms {raw_wip_stats['mean_ms']:.6f} "
+        f"raw_wip_median_ms {raw_wip_stats['median_ms']:.6f} "
+        f"packed_wip_mean_ms {packed_wip_stats['mean_ms']:.6f} "
+        f"packed_wip_median_ms {packed_wip_stats['median_ms']:.6f} "
+        f"raw_speedup {raw_speedup:.3f}x packed_speedup {packed_speedup:.3f}x "
+        f"packed_vs_raw_speedup {packed_vs_raw_speedup:.3f}x"
     )
 
     lines_by_rank: dict[int, str] = {}
@@ -271,7 +306,13 @@ def _require_cuda_and_ops(
             ]
         )
     if require_wip_ops:
-        required_ops.extend(["glm5_expert_select_up_gate_silu", "glm5_expert_down_project"])
+        required_ops.extend(
+            [
+                "glm5_expert_select_up_gate_silu",
+                "glm5_expert_down_project",
+                "glm5_expert_select_up_gate_silu_packed",
+            ]
+        )
     missing_ops = [name for name in required_ops if not hasattr(torch.ops.trtllm, name)]
     if missing_ops:
         pytest.skip(f"missing torch.ops.trtllm ops: {missing_ops}")
@@ -332,6 +373,104 @@ def _load_inputs(
             group, weight_layer_idx, "shared_down_weight_scale_org"
         ),
     }
+
+
+def _prepack_v68_weight_side(weight: torch.Tensor) -> torch.Tensor:
+    # weight: torch.float8_e4m3fn, [..., I, H].
+    if weight.dtype != torch.float8_e4m3fn:
+        raise TypeError(f"v68 prepack expects float8_e4m3fn weights, got {weight.dtype}")
+    if weight.shape[-1] != _V68_HIDDEN_SIZE:
+        raise ValueError(
+            f"v68 prepack expects hidden size {_V68_HIDDEN_SIZE}, got {weight.shape[-1]}"
+        )
+    inter_per_tp = weight.shape[-2]
+    if inter_per_tp % _V68_CTA_OUT_ROWS != 0:
+        raise ValueError(
+            f"v68 prepack expects I to be divisible by {_V68_CTA_OUT_ROWS}, got {inter_per_tp}"
+        )
+
+    prefix_shape = tuple(weight.shape[:-2])
+    num_prefix_dims = len(prefix_shape)
+    sub_rows = inter_per_tp // _V68_CTA_OUT_ROWS
+
+    reshaped = weight.contiguous().reshape(
+        *prefix_shape,
+        sub_rows,
+        _V68_M_TILES_PER_CTA,
+        _V68_ROW_HALVES_PER_M_TILE,
+        _V68_ROWS_PER_HALF,
+        _V68_NUM_K_ITER,
+        _V68_K_THIRDS_PER_ITER,
+        _V68_K_SUBS_PER_THIRD,
+        _V68_COL_HALVES_PER_K_SUB,
+        _V68_COL_QUADS_PER_HALF,
+        _V68_BYTES_PER_COL_QUAD,
+    )
+    # Reorder the raw row-major [64, 768] tile into the exact 48 KiB K-major
+    # lane slab consumed by compute_mma_kiter_v68().
+    permute_order = (
+        *range(num_prefix_dims),
+        num_prefix_dims,
+        num_prefix_dims + 4,
+        num_prefix_dims + 5,
+        num_prefix_dims + 1,
+        num_prefix_dims + 6,
+        num_prefix_dims + 3,
+        num_prefix_dims + 8,
+        num_prefix_dims + 7,
+        num_prefix_dims + 2,
+        num_prefix_dims + 9,
+    )
+    return (
+        reshaped.permute(permute_order)
+        .contiguous()
+        .reshape(*prefix_shape, sub_rows, _V68_NUM_K_ITER, _V68_TILE_BYTES)
+    )
+
+
+def _prepack_v68_shared_gate_up_weight(weight: torch.Tensor) -> torch.Tensor:
+    # weight: torch.float8_e4m3fn, [2 * I, H], stored as [gate, up].
+    gate_weight, up_weight = weight.chunk(2, dim=0)
+    gate_packed = _prepack_v68_weight_side(gate_weight)
+    up_packed = _prepack_v68_weight_side(up_weight)
+    packed = torch.empty(
+        (2, *gate_packed.shape),
+        device=weight.device,
+        dtype=weight.dtype,
+    )
+    # packed: torch.float8_e4m3fn, [2, I / 64, 8, 49152], stored as [gate, up].
+    packed[0].copy_(gate_packed)
+    packed[1].copy_(up_packed)
+    return packed
+
+
+def _prepack_v68_routed_w3_w1_weight(weight: torch.Tensor) -> torch.Tensor:
+    # weight: torch.float8_e4m3fn, [E, 2 * I, H], stored as [up, gate].
+    up_weight, gate_weight = weight.chunk(2, dim=1)
+    gate_packed = _prepack_v68_weight_side(gate_weight)
+    up_packed = _prepack_v68_weight_side(up_weight)
+    packed = torch.empty(
+        (weight.shape[0], 2, *gate_packed.shape[1:]),
+        device=weight.device,
+        dtype=weight.dtype,
+    )
+    # packed: torch.float8_e4m3fn, [E, 2, I / 64, 8, 49152], stored as [gate, up].
+    packed[:, 0].copy_(gate_packed)
+    packed[:, 1].copy_(up_packed)
+    return packed
+
+
+def _ensure_v68_prepacked_tensors(tensors: dict[str, torch.Tensor]) -> None:
+    if "shared_gate_up_weight_packed_v68" in tensors:
+        return
+
+    tensors["shared_gate_up_weight_packed_v68"] = _prepack_v68_shared_gate_up_weight(
+        tensors["shared_gate_up_weight_org"]
+    )
+    tensors["routed_w3_w1_weight_packed_v68"] = _prepack_v68_routed_w3_w1_weight(
+        tensors["routed_w3_w1_weight"]
+    )
+    torch.cuda.synchronize()
 
 
 def _shared_down_project(
@@ -500,22 +639,54 @@ def _run_pytorch_decomposed(
     return shared_output + routed_output
 
 
-def _run_wip(tensors: dict[str, torch.Tensor]) -> torch.Tensor:
-    expert_indices, expert_weights, slot_swiglu_output = Deepseekv3MegaMoE._run_wip_mega_kernel(
+def _run_wip_select_packed_v68(
+    tensors: dict[str, torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # router_logits: torch.float32, [T, E].
+    router_logits = torch.ops.trtllm.dsv3_router_gemm_op(
         tensors["hidden_states"],
-        tensors["router_weight"],
-        tensors["routing_bias"],
-        tensors["shared_gate_up_weight_org"],
-        tensors["shared_gate_up_weight_scale_org"],
-        tensors["routed_w3_w1_weight"],
-        tensors["routed_w3_w1_weight_scale"],
-        _top_k(),
-        _n_group(),
-        _topk_group(),
-        _routed_scaling_factor(),
-        _shared_swiglu_limit(),
-        _routed_swiglu_limit(),
+        tensors["router_weight"].t(),
+        bias=None,
+        out_dtype=torch.float32,
     )
+    expert_weights, expert_indices, slot_swiglu_output = (
+        torch.ops.trtllm.glm5_expert_select_up_gate_silu_packed(
+            router_logits.contiguous(),
+            tensors["hidden_states"].contiguous(),
+            tensors["routing_bias"].contiguous(),
+            tensors["shared_gate_up_weight_packed_v68"],
+            tensors["shared_gate_up_weight_scale_org"],
+            tensors["routed_w3_w1_weight_packed_v68"],
+            tensors["routed_w3_w1_weight_scale"],
+            _routed_scaling_factor(),
+        )
+    )
+    # expert_indices: torch.int32, [T, K].
+    # expert_weights: torch.float32, [T, K].
+    # slot_swiglu_output: torch.float16, [T, K + 1, I].
+    return expert_indices, expert_weights, slot_swiglu_output
+
+
+def _run_wip(tensors: dict[str, torch.Tensor], *, use_packed_v68: bool = False) -> torch.Tensor:
+    if use_packed_v68:
+        expert_indices, expert_weights, slot_swiglu_output = _run_wip_select_packed_v68(tensors)
+    else:
+        expert_indices, expert_weights, slot_swiglu_output = Deepseekv3MegaMoE._run_wip_mega_kernel(
+            tensors["hidden_states"],
+            tensors["router_weight"],
+            tensors["routing_bias"],
+            tensors["shared_gate_up_weight_org"],
+            tensors["shared_gate_up_weight_scale_org"],
+            tensors["routed_w3_w1_weight"],
+            tensors["routed_w3_w1_weight_scale"],
+            _top_k(),
+            _n_group(),
+            _topk_group(),
+            _routed_scaling_factor(),
+            _shared_swiglu_limit(),
+            _routed_swiglu_limit(),
+        )
+
     # expert_indices: torch.int32, [T, K].
     # expert_weights: torch.float32, [T, K].
     # slot_swiglu_output: torch.float16, [T, K + 1, I].
@@ -634,12 +805,17 @@ def test_deepseekv3_mega_moe_wip_phase(rank: int) -> None:
     wip_abs_threshold = reference_abs_threshold * _WIP_ABS_ERROR_THRESHOLD_SLACK
 
     tensors = _load_inputs(group, max_num_tokens=_max_wip_num_tokens())
+    use_packed_v68 = _prepack_v68_enabled()
     with torch.inference_mode():
+        if use_packed_v68:
+            _ensure_v68_prepacked_tensors(tensors)
         # wip_output: torch.bfloat16, [T, H].
-        wip_output = _run_wip(tensors)
+        wip_output = _run_wip(tensors, use_packed_v68=use_packed_v68)
         torch.cuda.synchronize()
 
     _save_tensor(group, "wip_output", wip_output)
+    if use_packed_v68:
+        _save_tensor(group, "wip_packed_v68_output", wip_output)
 
     rel_error, abs_error, rel_error_by_dim, abs_error_by_dim = _max_errors(
         wip_output, pytorch_ref_output
@@ -667,20 +843,31 @@ def test_deepseekv3_mega_moe_profile_phase(rank: int) -> None:
     profile_iters = _profile_iters()
 
     with torch.inference_mode():
-        # baseline_times_ms and wip_times_ms: torch.float32, [profile_iters].
+        _ensure_v68_prepacked_tensors(tensors)
+        # *_times_ms: torch.float32, [profile_iters].
         baseline_times_ms, baseline_stats = _profile_cuda_events(
             lambda: _run_trtllm_baseline(tensors), warmup_iters, profile_iters
         )
-        wip_times_ms, wip_stats = _profile_cuda_events(
-            lambda: _run_wip(tensors), warmup_iters, profile_iters
+        raw_wip_times_ms, raw_wip_stats = _profile_cuda_events(
+            lambda: _run_wip(tensors, use_packed_v68=False), warmup_iters, profile_iters
+        )
+        packed_wip_times_ms, packed_wip_stats = _profile_cuda_events(
+            lambda: _run_wip(tensors, use_packed_v68=True), warmup_iters, profile_iters
         )
 
     _save_tensor(group, "baseline_profile_times_ms", baseline_times_ms)
-    _save_tensor(group, "wip_profile_times_ms", wip_times_ms)
-    _save_profile_summary(rank, baseline_stats, wip_stats)
+    _save_tensor(group, "wip_raw_profile_times_ms", raw_wip_times_ms)
+    _save_tensor(group, "wip_packed_v68_profile_times_ms", packed_wip_times_ms)
+    _save_tensor(group, "wip_profile_times_ms", packed_wip_times_ms)
+    _save_profile_summary(rank, baseline_stats, raw_wip_stats, packed_wip_stats)
 
-    speedup = baseline_stats["mean_ms"] / wip_stats["mean_ms"]
+    raw_speedup = baseline_stats["mean_ms"] / raw_wip_stats["mean_ms"]
+    packed_speedup = baseline_stats["mean_ms"] / packed_wip_stats["mean_ms"]
+    packed_vs_raw_speedup = raw_wip_stats["mean_ms"] / packed_wip_stats["mean_ms"]
     print(
         f"rank {rank}: baseline {baseline_stats['mean_ms']:.6f} ms, "
-        f"wip {wip_stats['mean_ms']:.6f} ms, speedup {speedup:.3f}x"
+        f"raw_wip {raw_wip_stats['mean_ms']:.6f} ms, "
+        f"packed_wip {packed_wip_stats['mean_ms']:.6f} ms, "
+        f"raw_speedup {raw_speedup:.3f}x, packed_speedup {packed_speedup:.3f}x, "
+        f"packed_vs_raw_speedup {packed_vs_raw_speedup:.3f}x"
     )
