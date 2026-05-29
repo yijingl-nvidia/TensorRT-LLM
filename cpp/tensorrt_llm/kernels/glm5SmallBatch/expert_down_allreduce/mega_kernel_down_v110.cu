@@ -252,11 +252,15 @@
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <cstdint>
 #include <cuda.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
+#include <list>
+#include <mutex>
 #include <torch/extension.h>
+#include <unordered_map>
 
 namespace
 {
@@ -1215,6 +1219,69 @@ static CUtensorMap make_w_down_tmap(void* base_ptr, int num_experts, int K_local
     return map;
 }
 
+constexpr size_t kWDownTmaDescCacheCap = 256;
+constexpr int kMaxCudaDevicesForSmemAttr = 16;
+
+struct WDownTmaDescKey
+{
+    void const* base;
+    int numExperts;
+    int kLocal;
+    int deviceId;
+
+    bool operator==(WDownTmaDescKey const& o) const noexcept
+    {
+        return base == o.base && numExperts == o.numExperts && kLocal == o.kLocal && deviceId == o.deviceId;
+    }
+};
+
+struct WDownTmaDescKeyHash
+{
+    size_t operator()(WDownTmaDescKey const& k) const noexcept
+    {
+        size_t h = reinterpret_cast<uintptr_t>(k.base);
+        h = h * 1099511628211ull + static_cast<size_t>(k.numExperts);
+        h = h * 1099511628211ull + static_cast<size_t>(k.kLocal);
+        h = h * 1099511628211ull + static_cast<size_t>(k.deviceId);
+        return h;
+    }
+};
+
+struct WDownTmaDescCache
+{
+    using ListIt = std::list<std::pair<WDownTmaDescKey, CUtensorMap>>::iterator;
+    std::list<std::pair<WDownTmaDescKey, CUtensorMap>> order;
+    std::unordered_map<WDownTmaDescKey, ListIt, WDownTmaDescKeyHash> index;
+};
+
+static CUtensorMap get_cached_w_down_tmap(
+    void* base_ptr, int num_experts, int K_local, int device_id, CUresult* out_err)
+{
+    static thread_local WDownTmaDescCache cache;
+    WDownTmaDescKey const key{base_ptr, num_experts, K_local, device_id};
+    auto it = cache.index.find(key);
+    if (it != cache.index.end())
+    {
+        cache.order.splice(cache.order.begin(), cache.order, it->second);
+        *out_err = CUDA_SUCCESS;
+        return it->second->second;
+    }
+
+    CUtensorMap const map = make_w_down_tmap(base_ptr, num_experts, K_local, out_err);
+    if (*out_err != CUDA_SUCCESS)
+    {
+        return map;
+    }
+    if (cache.order.size() >= kWDownTmaDescCacheCap)
+    {
+        cache.index.erase(cache.order.back().first);
+        cache.order.pop_back();
+    }
+    cache.order.emplace_front(key, map);
+    cache.index.emplace(key, cache.order.begin());
+    return map;
+}
+
 // -----------------------------------------------------------------------------
 } // anonymous namespace
 
@@ -1288,45 +1355,49 @@ torch::Tensor mega_down_project_v110(torch::Tensor hidden_in, torch::Tensor indi
     TORCH_CHECK(shared_w_down_scale.is_contiguous(), "shared_w_down_scale must be contiguous");
     TORCH_CHECK(output.is_contiguous(), "output must be contiguous");
 
-    // Build the TMA descriptors for routed and shared down weights.
+    at::cuda::OptionalCUDAGuard const device_guard(hidden_in.device());
+    auto stream = at::cuda::getCurrentCUDAStream();
+    int device_id = 0;
+    AT_CUDA_CHECK(cudaGetDevice(&device_id));
+
+    // Build or reuse the TMA descriptors for routed and shared down weights.
     CUresult routed_tma_err = CUDA_SUCCESS;
     CUtensorMap routed_w_down_map
-        = make_w_down_tmap(routed_w_down.data_ptr(), kSharedExpertIdx, K_local, &routed_tma_err);
+        = get_cached_w_down_tmap(routed_w_down.data_ptr(), kSharedExpertIdx, K_local, device_id, &routed_tma_err);
     TORCH_CHECK(routed_tma_err == CUDA_SUCCESS,
         "cuTensorMapEncodeTiled (routed_w_down) failed: CUresult=", (int) routed_tma_err);
     CUresult shared_tma_err = CUDA_SUCCESS;
-    CUtensorMap shared_w_down_map = make_w_down_tmap(shared_w_down.data_ptr(), 1, K_local, &shared_tma_err);
+    CUtensorMap shared_w_down_map
+        = get_cached_w_down_tmap(shared_w_down.data_ptr(), 1, K_local, device_id, &shared_tma_err);
     TORCH_CHECK(shared_tma_err == CUDA_SUCCESS,
         "cuTensorMapEncodeTiled (shared_w_down) failed: CUresult=", (int) shared_tma_err);
-
-    const at::cuda::OptionalCUDAGuard device_guard(hidden_in.device());
-    auto stream = at::cuda::getCurrentCUDAStream();
-
-    size_t hidden_bytes = sizeof(__half) * (size_t) M * kTopKPlusShared * K_local;
-    size_t tables_bytes = sizeof(int32_t) * (size_t) M * kTopKPlusShared + sizeof(float) * (size_t) M * kTopKPlusShared;
-    size_t partial_bytes = sizeof(float) * (size_t) kTopKPlusShared * kRowTilesPerCta * kMmaM * kMaxM;
-
-    size_t bucket_count_base = hidden_bytes + tables_bytes + partial_bytes;
-    bucket_count_base = (bucket_count_base + 15) & ~size_t(15);
-    size_t bucket_count_bytes = sizeof(int32_t) * (size_t) kNumExpertsTotal;
-
-    size_t bucket_pairs_base = bucket_count_base + bucket_count_bytes;
-    bucket_pairs_base = (bucket_pairs_base + 15) & ~size_t(15);
-    size_t bucket_pairs_bytes = (size_t) kNumExpertsTotal * kMaxM;
-
-    size_t unique_eid_base = bucket_pairs_base + bucket_pairs_bytes;
-    unique_eid_base = (unique_eid_base + 15) & ~size_t(15);
-    size_t unique_eid_bytes = sizeof(int16_t) * (size_t) kMaxBuckets;
-
-    size_t num_unique_base = unique_eid_base + unique_eid_bytes;
-    num_unique_base = (num_unique_base + 15) & ~size_t(15);
-    size_t num_unique_bytes = sizeof(int32_t) * 4;
 
     // [dv93] kFp8Stages is constexpr 4 (deploy config). Stage selection
     // and the <1>/<2> variants are eliminated. Smem footprint is fixed.
     constexpr int chosen_stages = kSpecFp8Stages;
-    auto compute_smem = [&](int stages) -> size_t
+    auto compute_smem = [&](int stages, int m_for_smem) -> size_t
     {
+        size_t hidden_bytes = sizeof(__half) * (size_t) m_for_smem * kTopKPlusShared * K_local;
+        size_t tables_bytes = sizeof(int32_t) * (size_t) m_for_smem * kTopKPlusShared
+            + sizeof(float) * (size_t) m_for_smem * kTopKPlusShared;
+        size_t partial_bytes = sizeof(float) * (size_t) kTopKPlusShared * kRowTilesPerCta * kMmaM * kMaxM;
+
+        size_t bucket_count_base = hidden_bytes + tables_bytes + partial_bytes;
+        bucket_count_base = (bucket_count_base + 15) & ~size_t(15);
+        size_t bucket_count_bytes = sizeof(int32_t) * (size_t) kNumExpertsTotal;
+
+        size_t bucket_pairs_base = bucket_count_base + bucket_count_bytes;
+        bucket_pairs_base = (bucket_pairs_base + 15) & ~size_t(15);
+        size_t bucket_pairs_bytes = (size_t) kNumExpertsTotal * kMaxM;
+
+        size_t unique_eid_base = bucket_pairs_base + bucket_pairs_bytes;
+        unique_eid_base = (unique_eid_base + 15) & ~size_t(15);
+        size_t unique_eid_bytes = sizeof(int16_t) * (size_t) kMaxBuckets;
+
+        size_t num_unique_base = unique_eid_base + unique_eid_bytes;
+        num_unique_base = (num_unique_base + 15) & ~size_t(15);
+        size_t num_unique_bytes = sizeof(int32_t) * 4;
+
         size_t mb = num_unique_base + num_unique_bytes;
         mb = (mb + 15) & ~size_t(15);
         size_t mb_bytes = sizeof(uint64_t) * (size_t) (kNumWarps * stages);
@@ -1335,10 +1406,12 @@ torch::Tensor mega_down_project_v110(torch::Tensor hidden_in, torch::Tensor indi
         size_t fp8b_bytes = (size_t) kNumWarps * stages * kFp8BytesPerStage;
         return fp8b + fp8b_bytes;
     };
-    size_t smem_bytes = compute_smem(chosen_stages);
+    size_t smem_bytes = compute_smem(chosen_stages, M);
+    size_t max_smem_bytes = compute_smem(chosen_stages, kMaxM);
 
     const size_t kSmemCapBytes = 232448; // B200/GB300 maxSharedMemoryPerBlockOptin
-    TORCH_CHECK(smem_bytes <= kSmemCapBytes, "dv110 smem footprint ", smem_bytes, " exceeds cap ", kSmemCapBytes);
+    TORCH_CHECK(
+        max_smem_bytes <= kSmemCapBytes, "dv110 smem footprint ", max_smem_bytes, " exceeds cap ", kSmemCapBytes);
 
     using KernelFn = void (*)(const CUtensorMap, const CUtensorMap,
         __half const*, // [v68-fp16-hidden] hidden_in_raw (was bf16)
@@ -1358,12 +1431,31 @@ torch::Tensor mega_down_project_v110(torch::Tensor hidden_in, torch::Tensor indi
         TORCH_CHECK(false, "v110 only supports K_local=512 or K_local=256; got K_local=", K_local);
     }
 
-    if (smem_bytes > 48 * 1024)
+    auto set_smem_attribute_once = [&](std::once_flag& flag)
     {
-        cudaError_t set_err
-            = cudaFuncSetAttribute(kfn, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem_bytes));
-        TORCH_CHECK(set_err == cudaSuccess, "cudaFuncSetAttribute(MaxDynamicSharedMemorySize=", smem_bytes,
-            ") failed: ", cudaGetErrorString(set_err));
+        std::call_once(flag,
+            [&]()
+            {
+                if (max_smem_bytes > 48 * 1024)
+                {
+                    cudaError_t set_err = cudaFuncSetAttribute(
+                        kfn, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(max_smem_bytes));
+                    TORCH_CHECK(set_err == cudaSuccess,
+                        "cudaFuncSetAttribute(MaxDynamicSharedMemorySize=", max_smem_bytes,
+                        ") failed: ", cudaGetErrorString(set_err));
+                }
+            });
+    };
+    TORCH_CHECK(device_id >= 0 && device_id < kMaxCudaDevicesForSmemAttr, "unsupported CUDA device id ", device_id);
+    static std::once_flag s_smem_attr_512_per_device[kMaxCudaDevicesForSmemAttr];
+    static std::once_flag s_smem_attr_256_per_device[kMaxCudaDevicesForSmemAttr];
+    if (K_local == 512)
+    {
+        set_smem_attribute_once(s_smem_attr_512_per_device[device_id]);
+    }
+    else
+    {
+        set_smem_attribute_once(s_smem_attr_256_per_device[device_id]);
     }
 
     dim3 grid(kNumCtas, 1, 1);
