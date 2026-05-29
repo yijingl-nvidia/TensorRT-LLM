@@ -760,14 +760,11 @@ __global__ __launch_bounds__(384, V68_LB_BLOCKS_PER_SM) void mega_kernel_v68(flo
 
         int32_t const expert_idx = (lane < kTopK) ? top_experts[lane] : (kNumExperts - 1);
         float const score_norm = (lane < kTopK) ? smem_score_sigmoid[expert_idx] : 0.f;
-        // [v68-fp64-renorm] Match C++ noaux_tc kernel: it does
-        //   static_cast<float>(scoreNorm * factor / (redNorm + 1e-20))
-        // where `factor` is double and `1e-20` is a double literal, so the
-        // RHS is fp64 and only rounds to fp32 at the final cast. fp32 renorm
-        // here has ULP drift that compounds across 75 MoE layers and breaks
-        // MTP acceptance (~6% AL gain on nsc-svg sibling-branch bench).
-        double const red_norm_d = cg::reduce(warp, (double) score_norm, cg::plus<double>{});
-        double const final_score_d = (double) score_norm * (double) routed_scaling_factor / (red_norm_d + 1e-20);
+        // Match noAuxTcKernels.cu: the warp reduction itself is fp32, then
+        // the double scaling factor and double literal promote the final
+        // division expression before the OutputT cast.
+        float const red_norm = cg::reduce(warp, score_norm, cg::plus<float>{});
+        double const final_score_d = (double) score_norm * (double) routed_scaling_factor / ((double) red_norm + 1e-20);
         float const final_score = static_cast<float>(final_score_d);
 
         if (lane < kTopK)
@@ -868,13 +865,10 @@ __global__ __launch_bounds__(384, V68_LB_BLOCKS_PER_SM) void mega_kernel_v68(flo
             smem_up_tiles, shared_gate_up_weight, routed_w3_w1_weight, my_expert, sub_row, k, tidx);
         __syncthreads();
 
-        // [iter17-residual-all-slots] Per-slot diagnostic (diag_per_slot.py)
-        // shows slot 0 (residual on) ~0.005 max_abs vs slots 1..8 (residual
-        // off) at 0.05-0.17 on the synthetic oracle. Routed slots dominate
-        // per-call drift, so apply the residual fp8 quant to every slot.
-        // ~8x drop in per-element actquant error (single-shot max_abs
-        // 0.153 -> 0.020 at TP=8 M=4) at +6.6% measured cost.
-        bool const use_residual = true;
+        // Keep the WIP path numerically aligned with TRTLLM baseline and the
+        // PyTorch reference, both of which use one fp8_quantize_1x128 pass
+        // for routed and shared activations.
+        bool const use_residual = false;
         if (is_gate_worker)
         {
             compute_mma_kiter_v68(smem_gate_tiles, smem_act_fp8, smem_act_fp8_lo, k, my_m_gate, lane, gate_block_scales,
@@ -906,6 +900,57 @@ __global__ __launch_bounds__(384, V68_LB_BLOCKS_PER_SM) void mega_kernel_v68(flo
         smem_up_acc[my_m_up * 16 + row_bot] = d_up[2];
     }
     __syncthreads();
+
+    // Routed baseline applies fp8 quantize/dequantize to the gate/up output
+    // before SwiGLU. This local 64-row scale is the closest match available
+    // inside one CTA; the reference uses 128-row blocks.
+    if (expert_slot != 0)
+    {
+        if (tidx < kCtaOutRows)
+        {
+            smem_score_sigmoid[tidx] = fabsf(smem_gate_acc[tidx]);
+        }
+        __syncthreads();
+        if (tidx < 32)
+        {
+            smem_score_sigmoid[tidx] = fmaxf(smem_score_sigmoid[tidx], smem_score_sigmoid[tidx + 32]);
+        }
+        __syncthreads();
+        if (tidx < 16)
+        {
+            smem_score_sigmoid[tidx] = fmaxf(smem_score_sigmoid[tidx], smem_score_sigmoid[tidx + 16]);
+        }
+        __syncthreads();
+        if (tidx < 8)
+        {
+            smem_score_sigmoid[tidx] = fmaxf(smem_score_sigmoid[tidx], smem_score_sigmoid[tidx + 8]);
+        }
+        __syncthreads();
+        if (tidx < 4)
+        {
+            smem_score_sigmoid[tidx] = fmaxf(smem_score_sigmoid[tidx], smem_score_sigmoid[tidx + 4]);
+        }
+        __syncthreads();
+        if (tidx < 2)
+        {
+            smem_score_sigmoid[tidx] = fmaxf(smem_score_sigmoid[tidx], smem_score_sigmoid[tidx + 2]);
+        }
+        __syncthreads();
+        if (tidx == 0)
+        {
+            smem_score_sigmoid[0] = fmaxf(smem_score_sigmoid[0], smem_score_sigmoid[1]);
+        }
+        __syncthreads();
+        if (tidx < kCtaOutRows)
+        {
+            float const amax = smem_score_sigmoid[0];
+            float const dequant_scale = amax > 0.f ? (amax / kFp8Max) : 0.f;
+            float const quant_scale = amax > 0.f ? (kFp8Max / amax) : 1.f;
+            float const q = fmaxf(-kFp8Max, fminf(kFp8Max, smem_gate_acc[tidx] * quant_scale));
+            smem_gate_acc[tidx] = static_cast<float>(__nv_fp8_e4m3(q)) * dequant_scale;
+        }
+        __syncthreads();
+    }
 
     if (tidx < kCtaOutRows)
     {

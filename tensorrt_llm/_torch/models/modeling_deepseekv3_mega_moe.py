@@ -641,8 +641,8 @@ class Deepseekv3MegaMoE(nn.Module):
             activation_dump_callback("router_logits", router_logits)
 
         assert top_k == 8, f"v68 WIP mega kernel only supports top_k=8, got {top_k}"
-        assert n_group > 0, f"expected positive n_group, got {n_group}"
-        assert topk_group > 0, f"expected positive topk_group, got {topk_group}"
+        assert n_group == 1, f"v68 WIP mega kernel only supports n_group=1, got {n_group}"
+        assert topk_group == 1, f"v68 WIP mega kernel only supports topk_group=1, got {topk_group}"
 
         expert_weights, expert_indices, slot_swiglu_output = (
             torch.ops.trtllm.glm5_expert_select_up_gate_silu(
