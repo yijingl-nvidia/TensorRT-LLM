@@ -29,6 +29,10 @@
 // -128 LDS.128, +256 LDS.U16 = -455 integer/wide-LDS ops, +256 narrow-LDS
 // = net 199 fewer ops, ~4× narrower smem traffic.
 //
+// Current WIP delta: hidden_in is staged with generic LDG instead of TMA, while
+// preserving dv22's [K_chunks, M, 9, 128] SMEM layout. This keeps the v68->v110
+// handoff in the generic proxy and avoids expensive cross-proxy/system fences.
+//
 // Per D107/D108: mechanism levers null lately; this is a SASS-pattern lever
 // targeting the largest opcode-count delta vs TileRT BS=4. Honest a-priori:
 // 0.5-2% if compiler issues are smem-pipe-throttled, may regress if narrow
@@ -405,29 +409,6 @@ __device__ __forceinline__ void fence_proxy_async_shared()
     asm volatile("fence.proxy.async.shared::cta;\n" :::);
 }
 
-// [v110-fix-proxy-fence] Cross-proxy fence: synchronizes the GENERIC proxy
-// (regular STG / LDG) with the ASYNC proxy (TMA / cp.async.bulk).
-//
-// Why this is needed: the upstream v68 kernel writes its `hidden_out` via
-// regular STG.U16 (generic proxy). v110 reads the same buffer via TMA
-// (cp.async.bulk.tensor — async proxy). The kernel-end implicit fence at
-// the v68 → v110 stream boundary makes v68's writes visible to v110's
-// GENERIC-proxy loads (LDG), but does NOT guarantee visibility to ASYNC-
-// proxy TMA loads on the SAME global address. Without this fence, v110's
-// first TMA load after v68 may return stale L2 / cache state, producing
-// silently corrupted hidden_in in smem and ~10% per-element output error.
-//
-// Repro: GLM-5 layer 3, M=1/4, TP=4 — v68 output → v110 has max_abs
-// ≈ 0.14 vs ref; `torch.cuda.synchronize()` between v68 and v110 (Trial C
-// in probe_ordering.py) hides the bug because it forces full DRAM commit.
-// Adding `fence.proxy.async.global` at v110 entry (before the hidden TMA
-// load) is the proper cross-proxy synchronization primitive and fixes the
-// regression without the host-side sync overhead.
-__device__ __forceinline__ void fence_proxy_async_global()
-{
-    asm volatile("fence.proxy.async.global;\n" :::);
-}
-
 // -----------------------------------------------------------------------------
 // [dv53] Direct fp8 -> A-fragment loader (STS-elimination).
 //
@@ -534,14 +515,9 @@ __device__ __forceinline__ void cvt_fp8_to_afrag_direct(
 template <int kKLocal>
 __global__ __launch_bounds__(kThreadsPerCta, 1) void mega_down_v110_kernel(
     __grid_constant__ const CUtensorMap routed_w_down_map, __grid_constant__ const CUtensorMap shared_w_down_map,
-    __grid_constant__ const CUtensorMap hidden_map,
-    // [v110-fix-hidden-ldg] Pass hidden_in's raw pointer too, so we can
-    // read it via plain LDG (generic memory proxy) instead of TMA
-    // (`cp.async.bulk.tensor`, async memory proxy). This eliminates the
-    // cross-proxy ordering issue with the upstream v68 kernel's STG
-    // (generic proxy) writes. The TMA descriptor (hidden_map) is kept
-    // for now but no longer used in the hidden_in staging loop —
-    // future cleanup can drop hidden_map entirely.
+    // Read hidden_in via plain LDG (generic memory proxy) instead of TMA.
+    // v68 writes hidden_out through normal global stores, so same-stream
+    // kernel ordering is sufficient for this handoff without proxy fences.
     // [v68-fp16-hidden] Upstream v68 now writes hidden_in as fp16 (was bf16).
     // The downstream MMA already runs in fp16 so we accept fp16 directly,
     // skipping the bf16->fp16 narrowing pass that this kernel used to do.
@@ -562,10 +538,9 @@ __global__ __launch_bounds__(kThreadsPerCta, 1) void mega_down_v110_kernel(
     constexpr int K_local = kKLocal;           // 512 (TP=4) or 256 (TP=8)
     // [dv110-tp8] Per-template derived counts. Same formulas as before;
     // values change for TP=8.
-    //   TP=4 (kKLocal=512): kKBlocks=4, kHiddenKChunks=4
-    //   TP=8 (kKLocal=256): kKBlocks=2, kHiddenKChunks=2
-    constexpr int kKBlocks = kKLocal / kBlockK;             // 4 or 2
-    constexpr int kHiddenKChunks = kKLocal / kHiddenKChunk; // 4 or 2
+    //   TP=4 (kKLocal=512): kKBlocks=4
+    //   TP=8 (kKLocal=256): kKBlocks=2
+    constexpr int kKBlocks = kKLocal / kBlockK; // 4 or 2
 
     int const cta_id = blockIdx.x;
     int const tid = threadIdx.x;
@@ -579,8 +554,7 @@ __global__ __launch_bounds__(kThreadsPerCta, 1) void mega_down_v110_kernel(
     int const rows_here = row_hi - row_lo;
 
     // [dv93/dv110-tp8] All derived loop counts fold to compile-time literals.
-    constexpr int k_blocks = kKBlocks;              // 4 (TP=4) or 2 (TP=8)
-    constexpr int hidden_k_chunks = kHiddenKChunks; // 4 (TP=4) or 2 (TP=8)
+    constexpr int k_blocks = kKBlocks; // 4 (TP=4) or 2 (TP=8)
 
     extern __shared__ unsigned char smem_raw[];
     // [v68-fp16-hidden] Upstream v68 writes fp16 directly; the smem destination
@@ -616,14 +590,12 @@ __global__ __launch_bounds__(kThreadsPerCta, 1) void mega_down_v110_kernel(
     num_unique_base = (num_unique_base + 15) & ~size_t(15);
     int32_t* smem_num_unique = reinterpret_cast<int32_t*>(smem_raw + num_unique_base);
 
-    // ---- TMA mbarrier ring (one per (warp, stage) for W_down +
-    //      one shared for hidden TMA). 8B aligned. ----
+    // ---- TMA mbarrier ring (one per (warp, stage) for W_down). 8B aligned. ----
     size_t mbar_base = num_unique_base + sizeof(int32_t) * 4;
     mbar_base = (mbar_base + 15) & ~size_t(15);
     uint64_t* smem_mbar = reinterpret_cast<uint64_t*>(smem_raw + mbar_base);
     int const kWdMbarCount = kNumWarps * kFp8Stages;
-    int const kHiddenMbarIdx = kWdMbarCount; // [dv22] hidden mbarrier slot
-    int const kMbarCount = kWdMbarCount + 1;
+    int const kMbarCount = kWdMbarCount;
 
     // ---- fp8 TMA W-tile staging.
     //
@@ -645,40 +617,7 @@ __global__ __launch_bounds__(kThreadsPerCta, 1) void mega_down_v110_kernel(
     // ldmatrix.x2 B-frag uses warp_fp8_addr instead (valid smem address).
     // We still consume fp8 stage memory in the same place.
 
-    // ---- [v110-fix-proxy-fence + v110-fix-l2-drain] ----
-    // Cross-proxy fence at kernel entry, plus a CTA-wide L2 drain for the
-    // hidden_in surface.
-    //
-    // The upstream v68 kernel writes hidden_in via regular STG (generic
-    // proxy); v110 reads it via TMA (async proxy). The implicit stream
-    // fence between v68 and v110 syncs the generic proxy only.
-    //
-    // The original fix (just fence.proxy.async.global) was empirically
-    // INSUFFICIENT when v68 is followed back-to-back by v110 on the same
-    // stream — the consumer-side cross-proxy fence is per-thread and can
-    // only elevate generic-proxy state that is already visible to the
-    // issuing thread; it cannot force cross-CTA visibility in the async
-    // proxy on its own. The v68 producer-side STG writes may sit in L2
-    // long enough that v110's TMA load (tid 0) reads stale state for
-    // some cache lines, while other lines have already drained.
-    // Symptom: B-A in the GLM-5 single-layer diff test = 0.058-0.143
-    // (vs ~0.003 expected) — the error is structured, consistent with
-    // ~1 of 9 routed slots reading wrong bytes per TMA-tile cache-line.
-    //
-    // Fix: pair the per-thread proxy fence with a CTA-wide L2 release
-    // fence at SYSTEM scope (`__threadfence_system` ≡ `membar.sys`).
-    // membar.sys flushes ALL pending writes (both proxies) from this
-    // CTA's L1/L2 view to system-visible state and waits for prior
-    // writes to be acknowledged. This guarantees the v68→v110 cache
-    // lines are coherent before the TMA load begins.
-    //
-    // Cost: one membar.sys at kernel entry (~100-200 cycles, one-shot
-    // per CTA). v110 wall-time is ~33 us = ~108k cycles; the cost is
-    // <0.2% — well within the user's ≤5% perf budget.
-    fence_proxy_async_global();
-    __threadfence_system();
-
-    // ---- [dv22] Init mbarriers FIRST (W_down ring + hidden mbarrier). ----
+    // ---- [dv22] Init mbarriers FIRST (W_down ring). ----
     if (tid < kMbarCount)
     {
         mbarrier_init(&smem_mbar[tid], 1);
@@ -689,21 +628,32 @@ __global__ __launch_bounds__(kThreadsPerCta, 1) void mega_down_v110_kernel(
     }
     __syncthreads();
 
-    // ---- [dv22] Stage hidden_in into SMEM via TMA bulk. ----
-    //
-    // [v68-fp16-hidden] hidden_in is now fp16 (was bf16). The TMA descriptor
-    // is built with element-type FLOAT16; smem destination is __half. The
-    // post-stage bf16->fp16 narrowing pass is no longer needed.
-    if (tid == 0)
+    // ---- Stage hidden_in into SMEM through the generic memory proxy. ----
     {
-        const uint32_t total_bytes = static_cast<uint32_t>(hidden_bytes);
-        mbarrier_arrive_expect_tx(&smem_mbar[kHiddenMbarIdx], total_bytes);
-        const size_t per_chunk_elems = (size_t) M * kTopKPlusShared * kHiddenKChunk;
-        for (int c = 0; c < hidden_k_chunks; ++c)
+        constexpr int kHalfElemsPerVec = sizeof(uint4) / sizeof(__half);
+        constexpr int kHiddenVecsPerKChunk = kHiddenKChunk / kHalfElemsPerVec;
+        constexpr int kKLocalVecs = K_local / kHalfElemsPerVec;
+        static_assert(kHiddenKChunk % kHalfElemsPerVec == 0);
+        static_assert(K_local % kHalfElemsPerVec == 0);
+        int const chunk_elems = M * kTopKPlusShared * kHiddenKChunk;
+        int const chunk_vecs = chunk_elems / kHalfElemsPerVec;
+        uint4 const* hidden_src = reinterpret_cast<uint4 const*>(hidden_in_raw);
+        uint4* hidden_dst = reinterpret_cast<uint4*>(smem_hidden);
+#pragma unroll
+        for (int chunk = 0; chunk < k_blocks; ++chunk)
         {
-            __half* dst_chunk = smem_hidden + (size_t) c * per_chunk_elems;
-            cp_async_bulk_tensor_3d(dst_chunk, &hidden_map,
-                /*x=*/c * kHiddenKChunk, /*y=*/0, /*z=*/0, &smem_mbar[kHiddenMbarIdx]);
+            uint4* dst_chunk = hidden_dst + (size_t) chunk * chunk_vecs;
+            int const src_chunk_vec = chunk * kHiddenVecsPerKChunk;
+            for (int chunk_vec = tid; chunk_vec < chunk_vecs; chunk_vec += kThreadsPerCta)
+            {
+                int const slot_vec = chunk_vec / kHiddenVecsPerKChunk;
+                int const k_vec = chunk_vec - slot_vec * kHiddenVecsPerKChunk;
+                int const m = slot_vec / kTopKPlusShared;
+                int const slot = slot_vec - m * kTopKPlusShared;
+                int const src_vec = (m * kTopKPlusShared + slot) * kKLocalVecs + src_chunk_vec + k_vec;
+
+                dst_chunk[chunk_vec] = hidden_src[src_vec];
+            }
         }
     }
 
@@ -747,7 +697,7 @@ __global__ __launch_bounds__(kThreadsPerCta, 1) void mega_down_v110_kernel(
         *smem_num_unique = 0;
     }
 
-    // [dv22] mbarriers already initialised before the TMA staging.
+    // Mbarriers are already initialised before weight TMA staging.
     __syncthreads();
 
     // ---- Bucket routed pairs by expert_id (dv7). ----
@@ -780,14 +730,8 @@ __global__ __launch_bounds__(kThreadsPerCta, 1) void mega_down_v110_kernel(
     }
     __syncthreads();
 
-    // ---- [dv22] Wait for hidden TMA to land before any reader runs. ----
-    mbarrier_wait_parity(&smem_mbar[kHiddenMbarIdx], 0u);
-    fence_proxy_async_shared();
-    __syncthreads();
-
-    // [v68-fp16-hidden] The legacy bf16->fp16 in-place narrowing pass is now
-    // a no-op: v68 already writes fp16 and the TMA staged fp16 into smem.
-    // No conversion is needed; the consumer reads __half directly.
+    // The previous __syncthreads waits for the LDG-based hidden staging,
+    // table initialization, and bucket construction before any reader runs.
 
     int const num_unique = *smem_num_unique;
 
@@ -802,16 +746,16 @@ __global__ __launch_bounds__(kThreadsPerCta, 1) void mega_down_v110_kernel(
     // [dv21+dv22] smem_hidden base addr for ldmatrix.x2 B-frag.
     //
     // dv22 smem layout = [K_chunks, M, 9, 128] row-major (innermost = 128
-    // bf16 elements). So per-(kb, m, slot) row offset in bytes is:
+    // fp16 elements). So per-(kb, m, slot) row offset in bytes is:
     //   kb * (M * 9 * 128 * 2)
     // + m  * (9 * 128 * 2)
     // + s  * (128 * 2)
-    // The bf16 row stride for a single (kb, m, slot) is 128 elements *
+    // The fp16 row stride for a single (kb, m, slot) is 128 elements *
     // 2 bytes = 256 bytes — much larger than a single ldmatrix row
-    // (16 bytes = 8 bf16). ldmatrix.x2 only uses per-lane addresses
-    // (not strides), so the wide bf16-row works fine as the row source.
+    // (16 bytes = 8 fp16). ldmatrix.x2 only uses per-lane addresses
+    // (not strides), so the wide fp16 row works fine as the row source.
     const uint32_t smem_hidden_addr = cvt_smem_addr(smem_hidden);
-    // [dv110-runtimeM] kb_stride depends on runtime M (the TMA writes M-packed
+    // [dv110-runtimeM] kb_stride depends on runtime M (hidden staging writes M-packed
     // rows per K-chunk). m_stride and slot_stride remain compile-time.
     const uint32_t kb_stride_bytes = (uint32_t) (M * kTopKPlusShared * kHiddenKChunk * 2);  // M*9*128*2
     constexpr uint32_t m_stride_bytes_h = (uint32_t) (kTopKPlusShared * kHiddenKChunk * 2); // 9*128*2 = 2304
@@ -1272,42 +1216,6 @@ static CUtensorMap make_w_down_tmap(void* base_ptr, int num_experts, int K_local
 }
 
 // -----------------------------------------------------------------------------
-// [dv22] Hidden bf16 TMA descriptor.
-//
-// hidden_in [M, 9, K_local] bf16 contiguous row-major.
-// TMA coord order: (x = K, y = slot, z = m).
-// global_dim   = {K_local, 9, M} elements
-// global_stride = bytes between successive y / z elements
-// box_dim      = {kHiddenKChunk, 9, M} elements (one TMA call = one K chunk)
-// L2_128B (narrow; hidden is small and only loaded once per launch).
-// -----------------------------------------------------------------------------
-static CUtensorMap make_hidden_tmap_v110(void* base_ptr, int M, int K_local, CUresult* out_err)
-{
-    CUtensorMap map = {};
-    cuuint64_t global_dim[3] = {
-        static_cast<cuuint64_t>(K_local),
-        static_cast<cuuint64_t>(kTopKPlusShared),
-        static_cast<cuuint64_t>(M),
-    };
-    cuuint64_t global_stride[2] = {
-        static_cast<cuuint64_t>(K_local) * 2u,
-        static_cast<cuuint64_t>(K_local) * static_cast<cuuint64_t>(kTopKPlusShared) * 2u,
-    };
-    cuuint32_t box_dim[3] = {
-        static_cast<cuuint32_t>(kHiddenKChunk),
-        static_cast<cuuint32_t>(kTopKPlusShared),
-        static_cast<cuuint32_t>(M),
-    };
-    cuuint32_t elem_stride[3] = {1u, 1u, 1u};
-
-    // [v68-fp16-hidden] TMA element type is FLOAT16 (was BFLOAT16). Stride
-    // bytes are unchanged (both 16-bit). Consumer reads __half.
-    *out_err = cuTensorMapEncodeTiled(&map, CU_TENSOR_MAP_DATA_TYPE_FLOAT16,
-        /*rank=*/3, base_ptr, global_dim, global_stride, box_dim, elem_stride, CU_TENSOR_MAP_INTERLEAVE_NONE,
-        CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-    return map;
-}
-
 } // anonymous namespace
 
 // -----------------------------------------------------------------------------
@@ -1391,11 +1299,6 @@ torch::Tensor mega_down_project_v110(torch::Tensor hidden_in, torch::Tensor indi
     TORCH_CHECK(shared_tma_err == CUDA_SUCCESS,
         "cuTensorMapEncodeTiled (shared_w_down) failed: CUresult=", (int) shared_tma_err);
 
-    // [dv22] Build the TMA descriptor for hidden_in.
-    CUresult hidden_err = CUDA_SUCCESS;
-    CUtensorMap hidden_map = make_hidden_tmap_v110(hidden_in.data_ptr(), M, K_local, &hidden_err);
-    TORCH_CHECK(hidden_err == CUDA_SUCCESS, "cuTensorMapEncodeTiled (hidden_in) failed: CUresult=", (int) hidden_err);
-
     const at::cuda::OptionalCUDAGuard device_guard(hidden_in.device());
     auto stream = at::cuda::getCurrentCUDAStream();
 
@@ -1426,7 +1329,7 @@ torch::Tensor mega_down_project_v110(torch::Tensor hidden_in, torch::Tensor indi
     {
         size_t mb = num_unique_base + num_unique_bytes;
         mb = (mb + 15) & ~size_t(15);
-        size_t mb_bytes = sizeof(uint64_t) * (size_t) (kNumWarps * stages + 1);
+        size_t mb_bytes = sizeof(uint64_t) * (size_t) (kNumWarps * stages);
         size_t fp8b = mb + mb_bytes;
         fp8b = (fp8b + 1023) & ~size_t(1023);
         size_t fp8b_bytes = (size_t) kNumWarps * stages * kFp8BytesPerStage;
@@ -1437,7 +1340,7 @@ torch::Tensor mega_down_project_v110(torch::Tensor hidden_in, torch::Tensor indi
     const size_t kSmemCapBytes = 232448; // B200/GB300 maxSharedMemoryPerBlockOptin
     TORCH_CHECK(smem_bytes <= kSmemCapBytes, "dv110 smem footprint ", smem_bytes, " exceeds cap ", kSmemCapBytes);
 
-    using KernelFn = void (*)(const CUtensorMap, const CUtensorMap, const CUtensorMap,
+    using KernelFn = void (*)(const CUtensorMap, const CUtensorMap,
         __half const*, // [v68-fp16-hidden] hidden_in_raw (was bf16)
         int32_t const*, float const*, float const*, float const*, __nv_bfloat16*, int);
 
@@ -1469,8 +1372,7 @@ torch::Tensor mega_down_project_v110(torch::Tensor hidden_in, torch::Tensor indi
     void* args[] = {
         (void*) &routed_w_down_map,
         (void*) &shared_w_down_map,
-        (void*) &hidden_map,
-        nullptr, // hidden_in_raw   [NEW — for v110-fix-hidden-ldg]
+        nullptr,
         nullptr,
         nullptr,
         nullptr,
@@ -1478,9 +1380,7 @@ torch::Tensor mega_down_project_v110(torch::Tensor hidden_in, torch::Tensor indi
         nullptr,
         nullptr,
     };
-    // [v110-fix-hidden-ldg] hidden_in raw pointer for the LDG-based
-    // hidden_in staging in the kernel — see the long comment in the
-    // kernel for why we no longer use TMA for this path.
+    // Hidden_in is staged in the kernel with generic LDG instead of TMA.
     // [v68-fp16-hidden] hidden_in dtype is now __half (was __nv_bfloat16).
     __half const* hidden_in_ptr = reinterpret_cast<__half const*>(hidden_in.data_ptr<at::Half>());
     int32_t const* indices_ptr = indices.data_ptr<int32_t>();
@@ -1489,13 +1389,13 @@ torch::Tensor mega_down_project_v110(torch::Tensor hidden_in, torch::Tensor indi
     float const* shared_wscale_ptr = shared_w_down_scale.data_ptr<float>();
     __nv_bfloat16* output_ptr = reinterpret_cast<__nv_bfloat16*>(output.data_ptr<at::BFloat16>());
     int m_arg = M;
-    args[3] = &hidden_in_ptr;
-    args[4] = &indices_ptr;
-    args[5] = &scores_ptr;
-    args[6] = &routed_wscale_ptr;
-    args[7] = &shared_wscale_ptr;
-    args[8] = &output_ptr;
-    args[9] = &m_arg;
+    args[2] = &hidden_in_ptr;
+    args[3] = &indices_ptr;
+    args[4] = &scores_ptr;
+    args[5] = &routed_wscale_ptr;
+    args[6] = &shared_wscale_ptr;
+    args[7] = &output_ptr;
+    args[8] = &m_arg;
 
     cudaError_t launch_err = cudaLaunchKernel((void const*) kfn, grid, block, args, smem_bytes, stream);
     TORCH_CHECK(launch_err == cudaSuccess, "dv110 cudaLaunchKernel failed: ", cudaGetErrorString(launch_err));

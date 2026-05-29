@@ -235,33 +235,6 @@ static __device__ inline float sigmoid_accurate(float x)
     return 0.5f * tanhf(0.5f * x) + 0.5f;
 }
 
-// ---- [v68-fix-proxy-fence] Producer-side cross-proxy fence helper. ----
-// v68 writes hidden_out via regular STG (generic memory proxy) and the
-// downstream v110 kernel reads the same address via TMA / cp.async.bulk
-// (async memory proxy). The implicit stream-order fence between v68 and
-// v110 guarantees generic-proxy visibility of v68's writes to v110's
-// generic-proxy reads, but it does NOT promote those writes into the
-// async memory proxy. v110 already issues `fence.proxy.async.global` at
-// kernel entry, but that consumer-side fence is per-thread and can only
-// uplift writes the issuing thread can already observe in the generic
-// proxy. With the v68 per-128-col activation-quant rewrite, the generic
-// writes from v68's Phase-5 STG no longer drain reliably through L2 to
-// be visible in async-proxy view by the time v110's tid 0 issues its
-// hidden TMA - empirically observed as B-A=0.143 (vs ~0.003 expected).
-//
-// The fix: each producer thread also emits `fence.proxy.async.global`
-// AFTER its STG. This per-thread fence uplifts the thread's STG into
-// the async proxy before the kernel-end implicit fence, so the
-// subsequent kernel sees consistent state in BOTH proxies.
-//
-// Cost: one extra FENCE.VIEW.ASYNC.G per active producer thread (64
-// threads per CTA, 4-8 cycles each). Negligible (<0.05% of v68 wall
-// time at M=1).
-__device__ __forceinline__ void fence_proxy_async_global()
-{
-    asm volatile("fence.proxy.async.global;\n" :::);
-}
-
 // -------------------------------------------------------------------------
 // `ld.shared.v2.b32` = LDS.64 (8 bytes / lane).
 __device__ __forceinline__ void lds64_b32x2(uint32_t& r0, uint32_t& r1, __nv_fp8_e4m3 const* smem_ptr)
@@ -945,39 +918,9 @@ __global__ __launch_bounds__(384, V68_LB_BLOCKS_PER_SM) void mega_kernel_v68(flo
             + static_cast<int64_t>(expert_slot) * kInterPerTp + global_row;
         // [iter5-fp16-hidden] Keep iter-2's fp16 store. Iter-5 reverts the
         // iter-4 bf16-revert to isolate the fp64 renorm fix as a single
-        // variable. v110 TMA descriptor matches FLOAT16.
+        // variable. v110 consumes this handoff as FLOAT16.
         hidden_out[out_off] = __float2half(h);
     }
-    // [v68-fix-proxy-fence] Producer-side ordering for the v68 -> v110
-    // kernel chain. After all hidden_out STGs by Phase 5 threads have
-    // issued, we drain them to system-visible state and uplift them
-    // into the async memory proxy before kernel exit. Two-step pattern:
-    //
-    //   __threadfence_system()       -> drains generic-proxy STGs to L2
-    //                                   and waits for system-scope ack
-    //                                   (release semantics, CTA-wide).
-    //   fence.proxy.async.global     -> elevates the just-drained writes
-    //                                   into the ASYNC proxy view, so
-    //                                   that v110's `cp.async.bulk.tensor`
-    //                                   load of the SAME global address
-    //                                   on the SAME stream observes them.
-    //
-    // Critical: the implicit stream-order kernel-end fence between v68
-    // and v110 synchronizes the GENERIC proxy. With the v68 actquant
-    // rewrite, the L2 timing of Phase-5 STGs no longer fully drains by
-    // the time v110's tid 0 issues its hidden TMA on the same VA - we
-    // observe B-A in the chained diff test = 0.058-0.143 instead of
-    // the ~0.003 noise floor. Pairing the two fences here at v68 exit
-    // (release + proxy-uplift) makes v68's STGs system-visible AND
-    // async-proxy-visible across all threads / CTAs / proxies before
-    // kernel-end implicit synchronization, eliminating the residue.
-    //
-    // Cost: one membar.sys + one FENCE.VIEW.ASYNC.G per active Phase-5
-    // thread (64 of 384), at kernel exit (one-shot). Single-digit-cycle
-    // membar latency, well within the user's <=5% TPOT budget (the
-    // kernel runs ~25-30 us; the fences add ~50 ns at most).
-    fence_proxy_async_global();
-    __threadfence_system();
 }
 
 // Dynamic smem sizing.
