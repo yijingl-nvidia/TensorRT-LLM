@@ -396,17 +396,18 @@ __device__ __forceinline__ void load_packed_weight_tile_v68(__nv_fp8_e4m3* __res
     __nv_fp8_e4m3 const* __restrict__ shared_gate_up_weight, __nv_fp8_e4m3 const* __restrict__ routed_w3_w1_weight,
     int expert, int sub_row, int k_iter, int tidx)
 {
-    constexpr int kVecsPerTile = kTileBytes / static_cast<int>(sizeof(uint4));
-    static_assert(kTileBytes % static_cast<int>(sizeof(uint4)) == 0);
+    constexpr int kCopyBytes = 16;
+    static_assert(kTileBytes % kCopyBytes == 0);
 
-    uint4 const* const src = reinterpret_cast<uint4 const*>(packed_weight_tile_ptr<kInterPerTpParam, kGate>(
+    char const* const src = reinterpret_cast<char const*>(packed_weight_tile_ptr<kInterPerTpParam, kGate>(
         shared_gate_up_weight, routed_w3_w1_weight, expert, sub_row, k_iter));
-    uint4* const dst = reinterpret_cast<uint4*>(smem_tile);
+    char* const dst = reinterpret_cast<char*>(smem_tile);
 
 #pragma unroll 1
-    for (int vec = tidx; vec < kVecsPerTile; vec += kThreadsPerCta)
+    for (int byte_off = tidx * kCopyBytes; byte_off < kTileBytes; byte_off += kThreadsPerCta * kCopyBytes)
     {
-        dst[vec] = src[vec];
+        unsigned const dst_smem = __cvta_generic_to_shared(dst + byte_off);
+        asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(dst_smem), "l"(src + byte_off));
     }
 }
 
@@ -454,6 +455,69 @@ __device__ __forceinline__ void load_raw_weight_tile_v68(__nv_fp8_e4m3* __restri
         *reinterpret_cast<uint32_t*>(dst + 4) = b;
         *reinterpret_cast<uint32_t*>(dst + 8) = c;
         *reinterpret_cast<uint32_t*>(dst + 12) = d;
+    }
+}
+
+template <int kQuantWarps>
+__device__ __forceinline__ void quant_act_blocks_v68(cg::thread_block_tile<kWarpSize> warp,
+    __nv_bfloat16 const* __restrict__ smem_act_bf16, __nv_fp8_e4m3* __restrict__ smem_act_fp8,
+    float* __restrict__ smem_act_block_scales, int q_warp, int lane)
+{
+    constexpr int kQuantRounds = (kWeightScaleKBlocks + kQuantWarps - 1) / kQuantWarps;
+    constexpr int kElemsPerLane128Block = 128 / kWarpSize;
+
+#pragma unroll
+    for (int r = 0; r < kQuantRounds; ++r)
+    {
+        int const kb_global = q_warp + r * kQuantWarps;
+        if (kb_global >= kWeightScaleKBlocks)
+        {
+            break;
+        }
+
+        int const block_off = kb_global * 128; // bf16 element offset
+
+        // Each lane reads 4 contiguous bf16 elements (8 B vector load).
+        __nv_bfloat16 const* lane_src = smem_act_bf16 + block_off + lane * kElemsPerLane128Block;
+        __nv_bfloat162 v01;
+        __nv_bfloat162 v23;
+        v01 = *reinterpret_cast<__nv_bfloat162 const*>(lane_src);
+        v23 = *reinterpret_cast<__nv_bfloat162 const*>(lane_src + 2);
+        float const f0 = __bfloat162float(__low2bfloat16(v01));
+        float const f1 = __bfloat162float(__high2bfloat16(v01));
+        float const f2 = __bfloat162float(__low2bfloat16(v23));
+        float const f3 = __bfloat162float(__high2bfloat16(v23));
+
+        float lane_max = fmaxf(fmaxf(fabsf(f0), fabsf(f1)), fmaxf(fabsf(f2), fabsf(f3)));
+        float amax = cg::reduce(warp, lane_max, cg::greater<float>{});
+        amax = fmaxf(amax, 1e-10f);
+        float const quant_scale = kFp8Max / amax; // bf16 * quant_scale -> fp8
+        // [v68-precision] Compute dequant as 1/quant_scale rather than
+        // amax/kFp8Max so the (quant_scale * dequant_scale) chain simplifies
+        // to EXACTLY 1.0 in fp32.
+        float const dequant_scale = 1.f / quant_scale; // fp8 * dequant -> bf16
+
+        if (lane == 0)
+        {
+            smem_act_block_scales[kb_global] = dequant_scale;
+        }
+
+        // Quantize and write 4 fp8 elements per lane.
+        __nv_fp8_e4m3* lane_dst = smem_act_fp8 + block_off + lane * kElemsPerLane128Block;
+        float const q0 = fmaxf(-kFp8Max, fminf(kFp8Max, f0 * quant_scale));
+        float const q1 = fmaxf(-kFp8Max, fminf(kFp8Max, f1 * quant_scale));
+        float const q2 = fmaxf(-kFp8Max, fminf(kFp8Max, f2 * quant_scale));
+        float const q3 = fmaxf(-kFp8Max, fminf(kFp8Max, f3 * quant_scale));
+        __nv_fp8_e4m3 const fp8_0 = __nv_fp8_e4m3(q0);
+        __nv_fp8_e4m3 const fp8_1 = __nv_fp8_e4m3(q1);
+        __nv_fp8_e4m3 const fp8_2 = __nv_fp8_e4m3(q2);
+        __nv_fp8_e4m3 const fp8_3 = __nv_fp8_e4m3(q3);
+        // Pack 4 fp8 = 4 bytes = uint32 store.
+        uint32_t const packed = (static_cast<uint32_t>(static_cast<uint8_t>(fp8_0.__x)) << 0)
+            | (static_cast<uint32_t>(static_cast<uint8_t>(fp8_1.__x)) << 8)
+            | (static_cast<uint32_t>(static_cast<uint8_t>(fp8_2.__x)) << 16)
+            | (static_cast<uint32_t>(static_cast<uint8_t>(fp8_3.__x)) << 24);
+        *reinterpret_cast<uint32_t*>(lane_dst) = packed;
     }
 }
 
@@ -586,34 +650,11 @@ __global__ __launch_bounds__(384, V68_LB_BLOCKS_PER_SM) void mega_kernel_v68(flo
     __syncthreads();
 
     // ===== Phase 1+2 FUSED: top-K (warps 0..kNumExpertWarps-1)
-    //                       || per-128-col activation FP8 quant (warps kNumExpertWarps..kNumWarps-1)
-    //
-    // Activation quant uses the warps that are otherwise idle while warps
-    // 0..kNumExpertWarps-1 run the noaux_tc top-K reduction. 48 K-blocks of
-    // 128 bf16 elements each are partitioned round-robin across the 10
-    // (= kNumWarps - kNumExpertWarps) quant warps. Each warp performs
-    // amax -> quant_scale -> fp8 cast (writing to a separate, non-aliased
-    // fp8 smem buffer), then stores the dequant scale into
-    // smem_act_block_scales[kb_global] for the K-loop to consume per block.
-    //
-    // Layout:
-    //   smem_act_bf16[0..6143]  - source (12 KiB bf16)
-    //   smem_act_fp8 [0..6143]  - destination (6 KiB fp8, SEPARATE buffer)
-    //
-    // We deliberately use a separate fp8 buffer (rather than reusing the
-    // bf16 buffer's lower half) so multiple quant warps can read bf16 and
-    // write fp8 concurrently without cross-warp byte-level aliasing races.
-    // The 6 KiB extra smem is acceptable (we have ~21 KiB of slack at LB=1).
+    //                       || per-128-col activation FP8 quant (remaining warps)
     // -------------------------------------------------------------------
     float top_scores[kTopK];
     int32_t top_experts[kTopK];
-
-    // Quant constants: 48 K-blocks split round-robin across (kNumWarps -
-    // kNumExpertWarps) = 10 warps. Each quant warp does kQuantRounds = 5
-    // strided blocks (covers 50 >= 48 with bounds check).
-    constexpr int kQuantWarps = kNumWarps - kNumExpertWarps;                            // 10
-    constexpr int kQuantRounds = (kWeightScaleKBlocks + kQuantWarps - 1) / kQuantWarps; // 5
-    constexpr int kElemsPerLane128Block = 128 / kWarpSize;                              // 4
+    constexpr int kQuantWarps = kNumWarps - kNumExpertWarps; // 10
 
     if (warp_idx < kNumExpertWarps)
     {
@@ -638,65 +679,8 @@ __global__ __launch_bounds__(384, V68_LB_BLOCKS_PER_SM) void mega_kernel_v68(flo
     }
     else
     {
-        // ----- Per-128-col activation FP8 quant (warps kNumExpertWarps..) -----
-        // Each "quant warp" processes kQuantRounds blocks stride-kQuantWarps.
-        int const q_warp = warp_idx - kNumExpertWarps; // 0..9
-
-#pragma unroll
-        for (int r = 0; r < kQuantRounds; ++r)
-        {
-            int const kb_global = q_warp + r * kQuantWarps;
-            if (kb_global >= kWeightScaleKBlocks)
-                break;
-
-            int const block_off = kb_global * 128; // bf16 element offset
-
-            // Each lane reads 4 contiguous bf16 elements (8 B vector load).
-            __nv_bfloat16 const* lane_src = smem_act_bf16 + block_off + lane * kElemsPerLane128Block;
-            __nv_bfloat162 v01;
-            __nv_bfloat162 v23;
-            v01 = *reinterpret_cast<__nv_bfloat162 const*>(lane_src);
-            v23 = *reinterpret_cast<__nv_bfloat162 const*>(lane_src + 2);
-            float const f0 = __bfloat162float(__low2bfloat16(v01));
-            float const f1 = __bfloat162float(__high2bfloat16(v01));
-            float const f2 = __bfloat162float(__low2bfloat16(v23));
-            float const f3 = __bfloat162float(__high2bfloat16(v23));
-
-            float lane_max = fmaxf(fmaxf(fabsf(f0), fabsf(f1)), fmaxf(fabsf(f2), fabsf(f3)));
-            float amax = cg::reduce(warp, lane_max, cg::greater<float>{});
-            amax = fmaxf(amax, 1e-10f);
-            float const quant_scale = kFp8Max / amax; // bf16 * quant_scale -> fp8
-            // [v68-precision] Compute dequant as 1/quant_scale rather than
-            // amax/kFp8Max so the (quant_scale * dequant_scale) chain
-            // simplifies to EXACTLY 1.0 in fp32 (IEEE 754 x*(1/x)==1 for
-            // most finite x; the two-division form `amax/448 * 448/amax`
-            // accumulates a 1-ULP residual that propagates into the MMA
-            // fold). Matches parent fp8CS1x128's formulation
-            // (fp8_blockscale_gemm_kernel.cuh:247).
-            float const dequant_scale = 1.f / quant_scale; // fp8 * dequant -> bf16
-
-            if (lane == 0)
-            {
-                smem_act_block_scales[kb_global] = dequant_scale;
-            }
-
-            // Quantize and write 4 fp8 elements per lane.
-            __nv_fp8_e4m3* lane_dst = smem_act_fp8 + block_off + lane * kElemsPerLane128Block;
-            float const q0 = fmaxf(-kFp8Max, fminf(kFp8Max, f0 * quant_scale));
-            float const q1 = fmaxf(-kFp8Max, fminf(kFp8Max, f1 * quant_scale));
-            float const q2 = fmaxf(-kFp8Max, fminf(kFp8Max, f2 * quant_scale));
-            float const q3 = fmaxf(-kFp8Max, fminf(kFp8Max, f3 * quant_scale));
-            __nv_fp8_e4m3 const fp8_0 = __nv_fp8_e4m3(q0);
-            __nv_fp8_e4m3 const fp8_1 = __nv_fp8_e4m3(q1);
-            __nv_fp8_e4m3 const fp8_2 = __nv_fp8_e4m3(q2);
-            __nv_fp8_e4m3 const fp8_3 = __nv_fp8_e4m3(q3);
-            // Pack 4 fp8 = 4 bytes = uint32 store.
-            uint32_t const packed = (static_cast<uint32_t>(static_cast<uint8_t>(fp8_0.__x)) << 0)
-                | (static_cast<uint32_t>(static_cast<uint8_t>(fp8_1.__x)) << 8)
-                | (static_cast<uint32_t>(static_cast<uint8_t>(fp8_2.__x)) << 16)
-                | (static_cast<uint32_t>(static_cast<uint8_t>(fp8_3.__x)) << 24);
-            *reinterpret_cast<uint32_t*>(lane_dst) = packed;
-        }
+        quant_act_blocks_v68<kQuantWarps>(
+            warp, smem_act_bf16, smem_act_fp8, smem_act_block_scales, warp_idx - kNumExpertWarps, lane);
     }
     __syncthreads();
 
@@ -809,6 +793,8 @@ __global__ __launch_bounds__(384, V68_LB_BLOCKS_PER_SM) void mega_kernel_v68(flo
                 smem_gate_tiles, shared_gate_up_weight, routed_w3_w1_weight, my_expert, sub_row, k, tidx);
             load_packed_weight_tile_v68<kInterPerTpParam, false>(
                 smem_up_tiles, shared_gate_up_weight, routed_w3_w1_weight, my_expert, sub_row, k, tidx);
+            asm volatile("cp.async.commit_group;\n" :::);
+            asm volatile("cp.async.wait_all;\n" :::);
         }
         else
         {
