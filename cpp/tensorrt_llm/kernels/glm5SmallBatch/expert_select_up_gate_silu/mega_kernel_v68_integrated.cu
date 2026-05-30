@@ -111,13 +111,17 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
+#include <cstdint>
 #include <cstdlib>
+#include <cuda.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
+#include <list>
 #include <string>
 #include <torch/extension.h>
 #include <tuple>
+#include <unordered_map>
 #include <utility>
 
 #include "topk_reduce.cuh"
@@ -215,6 +219,8 @@ constexpr int kPackedStagesSingle = 1;
 // The packed path can afford a second weight stage because this kernel runs one CTA per SM.
 constexpr int kPackedStagesDouble = 2;
 constexpr int kPackedStagesDefault = kPackedStagesDouble;
+constexpr int kPackedLoadCpAsync = 0;
+constexpr int kPackedLoadTma = 1;
 
 constexpr float kInvalidScore = -INFINITY;
 constexpr float kFp8Max = 448.f;
@@ -233,6 +239,9 @@ constexpr int kKSubsPerThird = 4;                                    // 4 k_subs
 constexpr int kKThirdsPerIter = 6;                                   // 768 / 128 = 6 k_sixths per K-iter
 constexpr int kMtileSubslabBytes = kKSubsPerThird * kKsubBytes;      // 2048 B per m_tile within a k_sixth
 constexpr int kSubslabBytes = kCtaOutRows / 16 * kMtileSubslabBytes; // 4 * 2048 = 8192 B per k_sixth
+constexpr int kPackedTmaInnerBytes = 256;
+constexpr int kPackedTmaRows = kTileBytes / kPackedTmaInnerBytes;
+static_assert(kTileBytes % kPackedTmaInnerBytes == 0);
 
 static __device__ inline float sigmoid_accurate(float x)
 {
@@ -253,6 +262,55 @@ __device__ __forceinline__ void lds128_b32x4(
 {
     uint32_t addr = __cvta_generic_to_shared(const_cast<__nv_fp8_e4m3*>(smem_ptr));
     asm volatile("ld.shared.v4.b32 {%0, %1, %2, %3}, [%4];\n" : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3) : "r"(addr));
+}
+
+// mbarrier + cp.async.bulk.tensor.3d wrappers for the packed-weight TMA path.
+__device__ __forceinline__ uint32_t cvt_smem_addr(void const* smem_ptr)
+{
+    return static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+}
+
+__device__ __forceinline__ void mbarrier_init(uint64_t* mbar, int arrive_count)
+{
+    uint32_t const addr = cvt_smem_addr(mbar);
+    asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;\n" ::"r"(addr), "r"(arrive_count));
+}
+
+__device__ __forceinline__ void mbarrier_arrive_expect_tx(uint64_t* mbar, uint32_t bytes)
+{
+    uint32_t const addr = cvt_smem_addr(mbar);
+    asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;\n" ::"r"(addr), "r"(bytes));
+}
+
+__device__ __forceinline__ void mbarrier_wait_parity(uint64_t* mbar, uint32_t phase)
+{
+    uint32_t const addr = cvt_smem_addr(mbar);
+    asm volatile(
+        "{\n"
+        " .reg .pred P;\n"
+        " WAIT_%=:\n"
+        "  mbarrier.try_wait.parity.shared::cta.b64 P, [%0], %1;\n"
+        "  @P bra DONE_%=;\n"
+        "  bra WAIT_%=;\n"
+        " DONE_%=:\n"
+        "}\n" ::"r"(addr),
+        "r"(phase));
+}
+
+__device__ __forceinline__ void cp_async_bulk_tensor_3d(
+    void* smem_dst, CUtensorMap const* tmap, int32_t coord_x, int32_t coord_y, int32_t coord_z, uint64_t* mbar)
+{
+    uint32_t const smem_addr = cvt_smem_addr(smem_dst);
+    uint32_t const mbar_addr = cvt_smem_addr(mbar);
+    asm volatile(
+        "cp.async.bulk.tensor.3d.shared::cluster.global.tile."
+        "mbarrier::complete_tx::bytes [%0], [%1, {%2, %3, %4}], [%5];\n" ::"r"(smem_addr),
+        "l"(tmap), "r"(coord_x), "r"(coord_y), "r"(coord_z), "r"(mbar_addr));
+}
+
+__device__ __forceinline__ void fence_proxy_async_shared()
+{
+    asm volatile("fence.proxy.async.shared::cta;\n" :::);
 }
 
 // -------------------------------------------------------------------------
@@ -380,19 +438,30 @@ __device__ __forceinline__ float const* raw_scale_ptr(float const* __restrict__ 
 }
 
 template <int kInterPerTpParam, bool kGate>
-__device__ __forceinline__ __nv_fp8_e4m3 const* packed_weight_tile_ptr(
-    __nv_fp8_e4m3 const* __restrict__ shared_gate_up_weight, __nv_fp8_e4m3 const* __restrict__ routed_w3_w1_weight,
-    int expert, int sub_row, int k_iter)
+__device__ __forceinline__ int packed_weight_tile_idx(int expert, int sub_row, int k_iter)
 {
     constexpr int kSubRowsPerExpert = sub_rows_per_expert(kInterPerTpParam);
     constexpr int kGateUpIdx = kGate ? 0 : 1;
     if (expert == kSharedExpert)
     {
-        return shared_gate_up_weight + (((kGateUpIdx * kSubRowsPerExpert + sub_row) * kNumKIter + k_iter) * kTileBytes);
+        return (kGateUpIdx * kSubRowsPerExpert + sub_row) * kNumKIter + k_iter;
     }
 
-    return routed_w3_w1_weight
-        + ((((expert * 2 + kGateUpIdx) * kSubRowsPerExpert + sub_row) * kNumKIter + k_iter) * kTileBytes);
+    return ((expert * 2 + kGateUpIdx) * kSubRowsPerExpert + sub_row) * kNumKIter + k_iter;
+}
+
+template <int kInterPerTpParam, bool kGate>
+__device__ __forceinline__ __nv_fp8_e4m3 const* packed_weight_tile_ptr(
+    __nv_fp8_e4m3 const* __restrict__ shared_gate_up_weight, __nv_fp8_e4m3 const* __restrict__ routed_w3_w1_weight,
+    int expert, int sub_row, int k_iter)
+{
+    int const tile_idx = packed_weight_tile_idx<kInterPerTpParam, kGate>(expert, sub_row, k_iter);
+    if (expert == kSharedExpert)
+    {
+        return shared_gate_up_weight + static_cast<int64_t>(tile_idx) * kTileBytes;
+    }
+
+    return routed_w3_w1_weight + static_cast<int64_t>(tile_idx) * kTileBytes;
 }
 
 template <int kInterPerTpParam, bool kGate>
@@ -412,6 +481,23 @@ __device__ __forceinline__ void load_packed_weight_tile_v68(__nv_fp8_e4m3* __res
     {
         unsigned const dst_smem = __cvta_generic_to_shared(dst + byte_off);
         asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(dst_smem), "l"(src + byte_off));
+    }
+}
+
+template <int kInterPerTpParam, bool kGate>
+__device__ __forceinline__ void issue_packed_weight_tma_v68(__nv_fp8_e4m3* __restrict__ smem_tile,
+    CUtensorMap const* shared_gate_up_tma, CUtensorMap const* routed_w3_w1_tma, int expert, int sub_row, int k_iter,
+    uint64_t* mbar)
+{
+    int const tile_idx = packed_weight_tile_idx<kInterPerTpParam, kGate>(expert, sub_row, k_iter);
+    mbarrier_arrive_expect_tx(mbar, kTileBytes);
+    if (expert == kSharedExpert)
+    {
+        cp_async_bulk_tensor_3d(smem_tile, shared_gate_up_tma, 0, 0, tile_idx, mbar);
+    }
+    else
+    {
+        cp_async_bulk_tensor_3d(smem_tile, routed_w3_w1_tma, 0, 0, tile_idx, mbar);
     }
 }
 
@@ -537,12 +623,14 @@ __device__ __forceinline__ void quant_act_blocks_v68(cg::thread_block_tile<kWarp
 #define V68_LB_BLOCKS_PER_SM 1
 #endif
 
-template <int kInterPerTpParam, bool kUsePackedWeights, int kPackedWeightStagesParam = kPackedStagesDefault>
-__global__ __launch_bounds__(384, V68_LB_BLOCKS_PER_SM) void mega_kernel_v68(float const* __restrict__ scores,
-    __nv_bfloat16 const* __restrict__ hidden_in, __nv_bfloat16 const* __restrict__ bias,
-    __nv_fp8_e4m3 const* __restrict__ shared_gate_up_weight, float const* __restrict__ shared_gate_up_scale,
-    __nv_fp8_e4m3 const* __restrict__ routed_w3_w1_weight, float const* __restrict__ routed_w3_w1_scale,
-    float* __restrict__ topk_weights, int32_t* __restrict__ topk_indices,
+template <int kInterPerTpParam, bool kUsePackedWeights, int kPackedWeightStagesParam = kPackedStagesDefault,
+    int kPackedWeightLoadModeParam = kPackedLoadCpAsync>
+__global__ __launch_bounds__(384, V68_LB_BLOCKS_PER_SM) void mega_kernel_v68(
+    __grid_constant__ const CUtensorMap shared_gate_up_tma, __grid_constant__ const CUtensorMap routed_w3_w1_tma,
+    float const* __restrict__ scores, __nv_bfloat16 const* __restrict__ hidden_in,
+    __nv_bfloat16 const* __restrict__ bias, __nv_fp8_e4m3 const* __restrict__ shared_gate_up_weight,
+    float const* __restrict__ shared_gate_up_scale, __nv_fp8_e4m3 const* __restrict__ routed_w3_w1_weight,
+    float const* __restrict__ routed_w3_w1_scale, float* __restrict__ topk_weights, int32_t* __restrict__ topk_indices,
     // [iter5-fp16-hidden] hidden_out is fp16 (10-bit mantissa) - kept from
     // iter-2 (the bf16 revert of iter-4 caused a bench hang; iter-5 isolates
     // the fp64 renorm fix). v110's TMA descriptor matches FLOAT16.
@@ -552,8 +640,10 @@ __global__ __launch_bounds__(384, V68_LB_BLOCKS_PER_SM) void mega_kernel_v68(flo
     constexpr int kInterPerTp = kInterPerTpParam;
     constexpr int kSubRowsPerExpert = sub_rows_per_expert(kInterPerTp);
     static_assert(kPackedWeightStagesParam == kPackedStagesSingle || kPackedWeightStagesParam == kPackedStagesDouble);
+    static_assert(kPackedWeightLoadModeParam == kPackedLoadCpAsync || kPackedWeightLoadModeParam == kPackedLoadTma);
     constexpr int kWeightStages = kUsePackedWeights ? kPackedWeightStagesParam : kStages;
     constexpr bool kDoubleBufferedWeights = kUsePackedWeights && (kWeightStages == kPackedStagesDouble);
+    constexpr bool kUsePackedTmaWeights = kUsePackedWeights && (kPackedWeightLoadModeParam == kPackedLoadTma);
 
     int const token = blockIdx.x;
     int const cta_y = blockIdx.y;
@@ -614,6 +704,13 @@ __global__ __launch_bounds__(384, V68_LB_BLOCKS_PER_SM) void mega_kernel_v68(flo
     float* const smem_up_acc = reinterpret_cast<float*>(rs_base);
     rs_base += sizeof(float) * kCtaOutRows;
     rs_base = align_up_128(rs_base);
+
+    rs_base = (rs_base + 15u) & ~uintptr_t(15);
+    uint64_t* const smem_tma_mbar = reinterpret_cast<uint64_t*>(rs_base);
+    if constexpr (kUsePackedTmaWeights)
+    {
+        rs_base += sizeof(uint64_t) * 2 * kWeightStages;
+    }
 
     auto block = cg::this_thread_block();
     auto warp = cg::tiled_partition<kWarpSize>(block);
@@ -729,16 +826,57 @@ __global__ __launch_bounds__(384, V68_LB_BLOCKS_PER_SM) void mega_kernel_v68(flo
 
     float d_gate[4] = {0.f, 0.f, 0.f, 0.f};
     float d_up[4] = {0.f, 0.f, 0.f, 0.f};
+    uint32_t tma_gate_phase[kPackedStagesDouble] = {0u, 0u};
+    uint32_t tma_up_phase[kPackedStagesDouble] = {0u, 0u};
+
+    if constexpr (kUsePackedTmaWeights)
+    {
+        if (tidx < 2 * kWeightStages)
+        {
+            mbarrier_init(&smem_tma_mbar[tidx], 1);
+        }
+        if (tidx == 0)
+        {
+            fence_proxy_async_shared();
+        }
+        __syncthreads();
+    }
 
     if constexpr (kDoubleBufferedWeights)
     {
         // Prime stage 0 before entering the loop; later iterations preload the next K tile into the other stage.
-        load_packed_weight_tile_v68<kInterPerTpParam, true>(
-            smem_gate_tiles, shared_gate_up_weight, routed_w3_w1_weight, my_expert, sub_row, 0, tidx);
-        load_packed_weight_tile_v68<kInterPerTpParam, false>(
-            smem_up_tiles, shared_gate_up_weight, routed_w3_w1_weight, my_expert, sub_row, 0, tidx);
-        asm volatile("cp.async.commit_group;\n" :::);
-        asm volatile("cp.async.wait_all;\n" :::);
+        if constexpr (kUsePackedTmaWeights)
+        {
+            if (tidx == 0)
+            {
+                issue_packed_weight_tma_v68<kInterPerTpParam, true>(
+                    smem_gate_tiles, &shared_gate_up_tma, &routed_w3_w1_tma, my_expert, sub_row, 0, smem_tma_mbar);
+            }
+            if (tidx == 1)
+            {
+                issue_packed_weight_tma_v68<kInterPerTpParam, false>(smem_up_tiles, &shared_gate_up_tma,
+                    &routed_w3_w1_tma, my_expert, sub_row, 0, smem_tma_mbar + kWeightStages);
+            }
+            if (tidx == 0)
+            {
+                mbarrier_wait_parity(smem_tma_mbar, tma_gate_phase[0]);
+                tma_gate_phase[0] ^= 1u;
+            }
+            if (tidx == 1)
+            {
+                mbarrier_wait_parity(smem_tma_mbar + kWeightStages, tma_up_phase[0]);
+                tma_up_phase[0] ^= 1u;
+            }
+        }
+        else
+        {
+            load_packed_weight_tile_v68<kInterPerTpParam, true>(
+                smem_gate_tiles, shared_gate_up_weight, routed_w3_w1_weight, my_expert, sub_row, 0, tidx);
+            load_packed_weight_tile_v68<kInterPerTpParam, false>(
+                smem_up_tiles, shared_gate_up_weight, routed_w3_w1_weight, my_expert, sub_row, 0, tidx);
+            asm volatile("cp.async.commit_group;\n" :::);
+            asm volatile("cp.async.wait_all;\n" :::);
+        }
         __syncthreads();
     }
 
@@ -754,12 +892,30 @@ __global__ __launch_bounds__(384, V68_LB_BLOCKS_PER_SM) void mega_kernel_v68(flo
             if (k + 1 < kNumKIter)
             {
                 int const preload_stage = (k + 1) & 1;
-                // Keep this prefetch ahead of MMA so cp.async latency overlaps with the current K tile.
-                load_packed_weight_tile_v68<kInterPerTpParam, true>(smem_gate_tiles + preload_stage * kTileBytes,
-                    shared_gate_up_weight, routed_w3_w1_weight, my_expert, sub_row, k + 1, tidx);
-                load_packed_weight_tile_v68<kInterPerTpParam, false>(smem_up_tiles + preload_stage * kTileBytes,
-                    shared_gate_up_weight, routed_w3_w1_weight, my_expert, sub_row, k + 1, tidx);
-                asm volatile("cp.async.commit_group;\n" :::);
+                // Keep this prefetch ahead of MMA so copy latency overlaps with the current K tile.
+                if constexpr (kUsePackedTmaWeights)
+                {
+                    if (tidx == 0)
+                    {
+                        issue_packed_weight_tma_v68<kInterPerTpParam, true>(
+                            smem_gate_tiles + preload_stage * kTileBytes, &shared_gate_up_tma, &routed_w3_w1_tma,
+                            my_expert, sub_row, k + 1, smem_tma_mbar + preload_stage);
+                    }
+                    if (tidx == 1)
+                    {
+                        issue_packed_weight_tma_v68<kInterPerTpParam, false>(smem_up_tiles + preload_stage * kTileBytes,
+                            &shared_gate_up_tma, &routed_w3_w1_tma, my_expert, sub_row, k + 1,
+                            smem_tma_mbar + kWeightStages + preload_stage);
+                    }
+                }
+                else
+                {
+                    load_packed_weight_tile_v68<kInterPerTpParam, true>(smem_gate_tiles + preload_stage * kTileBytes,
+                        shared_gate_up_weight, routed_w3_w1_weight, my_expert, sub_row, k + 1, tidx);
+                    load_packed_weight_tile_v68<kInterPerTpParam, false>(smem_up_tiles + preload_stage * kTileBytes,
+                        shared_gate_up_weight, routed_w3_w1_weight, my_expert, sub_row, k + 1, tidx);
+                    asm volatile("cp.async.commit_group;\n" :::);
+                }
             }
         }
 
@@ -825,12 +981,38 @@ __global__ __launch_bounds__(384, V68_LB_BLOCKS_PER_SM) void mega_kernel_v68(flo
 
         if constexpr (kUsePackedWeights && !kDoubleBufferedWeights)
         {
-            load_packed_weight_tile_v68<kInterPerTpParam, true>(
-                smem_gate_tiles, shared_gate_up_weight, routed_w3_w1_weight, my_expert, sub_row, k, tidx);
-            load_packed_weight_tile_v68<kInterPerTpParam, false>(
-                smem_up_tiles, shared_gate_up_weight, routed_w3_w1_weight, my_expert, sub_row, k, tidx);
-            asm volatile("cp.async.commit_group;\n" :::);
-            asm volatile("cp.async.wait_all;\n" :::);
+            if constexpr (kUsePackedTmaWeights)
+            {
+                if (tidx == 0)
+                {
+                    issue_packed_weight_tma_v68<kInterPerTpParam, true>(
+                        smem_gate_tiles, &shared_gate_up_tma, &routed_w3_w1_tma, my_expert, sub_row, k, smem_tma_mbar);
+                }
+                if (tidx == 1)
+                {
+                    issue_packed_weight_tma_v68<kInterPerTpParam, false>(smem_up_tiles, &shared_gate_up_tma,
+                        &routed_w3_w1_tma, my_expert, sub_row, k, smem_tma_mbar + kWeightStages);
+                }
+                if (tidx == 0)
+                {
+                    mbarrier_wait_parity(smem_tma_mbar, tma_gate_phase[0]);
+                    tma_gate_phase[0] ^= 1u;
+                }
+                if (tidx == 1)
+                {
+                    mbarrier_wait_parity(smem_tma_mbar + kWeightStages, tma_up_phase[0]);
+                    tma_up_phase[0] ^= 1u;
+                }
+            }
+            else
+            {
+                load_packed_weight_tile_v68<kInterPerTpParam, true>(
+                    smem_gate_tiles, shared_gate_up_weight, routed_w3_w1_weight, my_expert, sub_row, k, tidx);
+                load_packed_weight_tile_v68<kInterPerTpParam, false>(
+                    smem_up_tiles, shared_gate_up_weight, routed_w3_w1_weight, my_expert, sub_row, k, tidx);
+                asm volatile("cp.async.commit_group;\n" :::);
+                asm volatile("cp.async.wait_all;\n" :::);
+            }
             __syncthreads();
         }
         else if constexpr (!kUsePackedWeights)
@@ -856,7 +1038,25 @@ __global__ __launch_bounds__(384, V68_LB_BLOCKS_PER_SM) void mega_kernel_v68(flo
         {
             if (k + 1 < kNumKIter)
             {
-                asm volatile("cp.async.wait_all;\n" :::);
+                int const preload_stage = (k + 1) & 1;
+                if constexpr (kUsePackedTmaWeights)
+                {
+                    if (tidx == 0)
+                    {
+                        mbarrier_wait_parity(smem_tma_mbar + preload_stage, tma_gate_phase[preload_stage]);
+                        tma_gate_phase[preload_stage] ^= 1u;
+                    }
+                    if (tidx == 1)
+                    {
+                        mbarrier_wait_parity(
+                            smem_tma_mbar + kWeightStages + preload_stage, tma_up_phase[preload_stage]);
+                        tma_up_phase[preload_stage] ^= 1u;
+                    }
+                }
+                else
+                {
+                    asm volatile("cp.async.wait_all;\n" :::);
+                }
             }
         }
         __syncthreads();
@@ -925,11 +1125,14 @@ __global__ __launch_bounds__(384, V68_LB_BLOCKS_PER_SM) void mega_kernel_v68(flo
 }
 
 // Dynamic smem sizing.
-template <bool kUsePackedWeights, int kPackedWeightStagesParam = kPackedStagesDefault>
+template <bool kUsePackedWeights, int kPackedWeightStagesParam = kPackedStagesDefault,
+    int kPackedWeightLoadModeParam = kPackedLoadCpAsync>
 static inline size_t v68_smem_bytes()
 {
     auto align_up_128 = [](size_t p) -> size_t { return (p + 127u) & ~size_t(127); };
+    static_assert(kPackedWeightLoadModeParam == kPackedLoadCpAsync || kPackedWeightLoadModeParam == kPackedLoadTma);
     constexpr int kWeightStages = kUsePackedWeights ? kPackedWeightStagesParam : kStages;
+    constexpr bool kUsePackedTmaWeights = kUsePackedWeights && (kPackedWeightLoadModeParam == kPackedLoadTma);
     size_t bytes = 0;
     bytes += static_cast<size_t>(kWeightStages) * kTileBytes;
     bytes += static_cast<size_t>(kWeightStages) * kTileBytes;
@@ -955,6 +1158,11 @@ static inline size_t v68_smem_bytes()
     bytes += sizeof(float) * kCtaOutRows;
     bytes = align_up_128(bytes);
     bytes = (bytes + 15u) & ~size_t(15);
+    if constexpr (kUsePackedTmaWeights)
+    {
+        bytes += sizeof(uint64_t) * 2 * kWeightStages;
+        bytes = (bytes + 15u) & ~size_t(15);
+    }
     return bytes;
 }
 
@@ -972,7 +1180,113 @@ static int v68_packed_weight_stages()
     return stages;
 }
 
-template <int kInterPerTpParam, bool kUsePackedWeights, int kPackedWeightStagesParam = kPackedStagesDefault>
+static int v68_packed_weight_load_mode()
+{
+    char const* const env = std::getenv("TRTLLM_DEEPSEEKV3_MEGAMOE_V68_PACKED_LOAD");
+    if (env == nullptr || env[0] == '\0')
+    {
+        return kPackedLoadTma;
+    }
+
+    std::string const mode(env);
+    if (mode == "cp_async" || mode == "cpasync" || mode == "cp" || mode == "0")
+    {
+        return kPackedLoadCpAsync;
+    }
+    if (mode == "tma" || mode == "1")
+    {
+        return kPackedLoadTma;
+    }
+    TORCH_CHECK(false, "TRTLLM_DEEPSEEKV3_MEGAMOE_V68_PACKED_LOAD must be cp_async or tma, got: ", env);
+    return kPackedLoadCpAsync;
+}
+
+static CUtensorMap make_packed_v68_tmap(void* base_ptr, int num_tiles, CUresult* out_err)
+{
+    CUtensorMap map = {};
+    cuuint64_t global_dim[3] = {
+        static_cast<cuuint64_t>(kPackedTmaInnerBytes),
+        static_cast<cuuint64_t>(kPackedTmaRows),
+        static_cast<cuuint64_t>(num_tiles),
+    };
+    cuuint64_t global_stride[2] = {
+        static_cast<cuuint64_t>(kPackedTmaInnerBytes),
+        static_cast<cuuint64_t>(kTileBytes),
+    };
+    cuuint32_t box_dim[3] = {
+        static_cast<cuuint32_t>(kPackedTmaInnerBytes),
+        static_cast<cuuint32_t>(kPackedTmaRows),
+        1u,
+    };
+    cuuint32_t elem_stride[3] = {1u, 1u, 1u};
+
+    *out_err = cuTensorMapEncodeTiled(&map, CU_TENSOR_MAP_DATA_TYPE_UINT8,
+        /*rank=*/3, base_ptr, global_dim, global_stride, box_dim, elem_stride, CU_TENSOR_MAP_INTERLEAVE_NONE,
+        CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_L2_256B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+    return map;
+}
+
+constexpr size_t kPackedV68TmaDescCacheCap = 256;
+
+struct PackedV68TmaDescKey
+{
+    void const* base;
+    int numTiles;
+    int deviceId;
+
+    bool operator==(PackedV68TmaDescKey const& o) const noexcept
+    {
+        return base == o.base && numTiles == o.numTiles && deviceId == o.deviceId;
+    }
+};
+
+struct PackedV68TmaDescKeyHash
+{
+    size_t operator()(PackedV68TmaDescKey const& k) const noexcept
+    {
+        size_t h = reinterpret_cast<uintptr_t>(k.base);
+        h = h * 1099511628211ull + static_cast<size_t>(k.numTiles);
+        h = h * 1099511628211ull + static_cast<size_t>(k.deviceId);
+        return h;
+    }
+};
+
+struct PackedV68TmaDescCache
+{
+    using ListIt = std::list<std::pair<PackedV68TmaDescKey, CUtensorMap>>::iterator;
+    std::list<std::pair<PackedV68TmaDescKey, CUtensorMap>> order;
+    std::unordered_map<PackedV68TmaDescKey, ListIt, PackedV68TmaDescKeyHash> index;
+};
+
+static CUtensorMap get_cached_packed_v68_tmap(void* base_ptr, int num_tiles, int device_id, CUresult* out_err)
+{
+    static thread_local PackedV68TmaDescCache cache;
+    PackedV68TmaDescKey const key{base_ptr, num_tiles, device_id};
+    auto it = cache.index.find(key);
+    if (it != cache.index.end())
+    {
+        cache.order.splice(cache.order.begin(), cache.order, it->second);
+        *out_err = CUDA_SUCCESS;
+        return it->second->second;
+    }
+
+    CUtensorMap const map = make_packed_v68_tmap(base_ptr, num_tiles, out_err);
+    if (*out_err != CUDA_SUCCESS)
+    {
+        return map;
+    }
+    if (cache.order.size() >= kPackedV68TmaDescCacheCap)
+    {
+        cache.index.erase(cache.order.back().first);
+        cache.order.pop_back();
+    }
+    cache.order.emplace_front(key, map);
+    cache.index.emplace(key, cache.order.begin());
+    return map;
+}
+
+template <int kInterPerTpParam, bool kUsePackedWeights, int kPackedWeightStagesParam = kPackedStagesDefault,
+    int kPackedWeightLoadModeParam = kPackedLoadCpAsync>
 static std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> mega_silu_v68_impl(torch::Tensor scores,
     torch::Tensor hidden_in, torch::Tensor bias, torch::Tensor shared_gate_up_weight,
     torch::Tensor shared_gate_up_scale, torch::Tensor routed_w3_w1_weight, torch::Tensor routed_w3_w1_scale,
@@ -983,7 +1297,9 @@ static std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> mega_silu_v68_imp
     constexpr int kCtasPerToken = ctas_per_token(kInterPerTp);
     constexpr int kWeightScaleMBlocks = weight_scale_m_blocks(kInterPerTp);
     static_assert(kPackedWeightStagesParam == kPackedStagesSingle || kPackedWeightStagesParam == kPackedStagesDouble);
+    static_assert(kPackedWeightLoadModeParam == kPackedLoadCpAsync || kPackedWeightLoadModeParam == kPackedLoadTma);
     constexpr int kWeightStages = kUsePackedWeights ? kPackedWeightStagesParam : kStages;
+    constexpr bool kUsePackedTmaWeights = kUsePackedWeights && (kPackedWeightLoadModeParam == kPackedLoadTma);
 
     auto const M = scores.size(0);
 
@@ -1015,6 +1331,26 @@ static std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> mega_silu_v68_imp
     auto stream = at::cuda::getCurrentCUDAStream();
     const at::cuda::OptionalCUDAGuard device_guard(scores.device());
 
+    CUtensorMap shared_gate_up_tma = {};
+    CUtensorMap routed_w3_w1_tma = {};
+    if constexpr (kUsePackedTmaWeights)
+    {
+        int device_id = 0;
+        AT_CUDA_CHECK(cudaGetDevice(&device_id));
+
+        CUresult shared_tma_err = CUDA_SUCCESS;
+        shared_gate_up_tma = get_cached_packed_v68_tmap(
+            shared_gate_up_weight.data_ptr(), 2 * kSubRowsPerExpert * kNumKIter, device_id, &shared_tma_err);
+        TORCH_CHECK(shared_tma_err == CUDA_SUCCESS,
+            "cuTensorMapEncodeTiled (v68 shared_gate_up packed) failed: CUresult=", (int) shared_tma_err);
+
+        CUresult routed_tma_err = CUDA_SUCCESS;
+        routed_w3_w1_tma = get_cached_packed_v68_tmap(routed_w3_w1_weight.data_ptr(),
+            kNumExperts * 2 * kSubRowsPerExpert * kNumKIter, device_id, &routed_tma_err);
+        TORCH_CHECK(routed_tma_err == CUDA_SUCCESS,
+            "cuTensorMapEncodeTiled (v68 routed_w3_w1 packed) failed: CUresult=", (int) routed_tma_err);
+    }
+
     static bool s_logged = false;
 
     if (!s_logged)
@@ -1022,7 +1358,8 @@ static std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> mega_silu_v68_imp
         printf(
             "[v68_integrated] kKTile=%d, kStages=%d, LB(384,%d), "
             "kInterPerTp=%d (%s weights)\n",
-            kKTile, kWeightStages, V68_LB_BLOCKS_PER_SM, kInterPerTp, kUsePackedWeights ? "packed" : "raw");
+            kKTile, kWeightStages, V68_LB_BLOCKS_PER_SM, kInterPerTp,
+            kUsePackedWeights ? (kUsePackedTmaWeights ? "packed/tma" : "packed/cp_async") : "raw");
         s_logged = true;
     }
 
@@ -1036,26 +1373,27 @@ static std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> mega_silu_v68_imp
     dim3 grid(static_cast<unsigned>(M), kCtasPerToken, 1);
     dim3 block(kThreadsPerCta, 1, 1);
 
-    size_t const smem_bytes = v68_smem_bytes<kUsePackedWeights, kPackedWeightStagesParam>();
+    size_t const smem_bytes = v68_smem_bytes<kUsePackedWeights, kPackedWeightStagesParam, kPackedWeightLoadModeParam>();
 
     static bool s_smem_opt_done = false;
     if (!s_smem_opt_done)
     {
-        cudaError_t err
-            = cudaFuncSetAttribute(mega_kernel_v68<kInterPerTpParam, kUsePackedWeights, kPackedWeightStagesParam>,
-                cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem_bytes));
+        cudaError_t err = cudaFuncSetAttribute(
+            mega_kernel_v68<kInterPerTpParam, kUsePackedWeights, kPackedWeightStagesParam, kPackedWeightLoadModeParam>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem_bytes));
         TORCH_CHECK(err == cudaSuccess, "cudaFuncSetAttribute(v68, maxDynSmem) failed: ", cudaGetErrorString(err));
         s_smem_opt_done = true;
     }
 
-    mega_kernel_v68<kInterPerTpParam, kUsePackedWeights, kPackedWeightStagesParam><<<grid, block, smem_bytes, stream>>>(
-        scores.data_ptr<float>(), reinterpret_cast<__nv_bfloat16 const*>(hidden_in.data_ptr<at::BFloat16>()),
-        reinterpret_cast<__nv_bfloat16 const*>(bias.data_ptr<at::BFloat16>()),
-        reinterpret_cast<__nv_fp8_e4m3 const*>(shared_gate_up_weight.data_ptr<at::Float8_e4m3fn>()),
-        shared_gate_up_scale.data_ptr<float>(),
-        reinterpret_cast<__nv_fp8_e4m3 const*>(routed_w3_w1_weight.data_ptr<at::Float8_e4m3fn>()),
-        routed_w3_w1_scale.data_ptr<float>(), topk_weights.data_ptr<float>(), topk_indices.data_ptr<int32_t>(),
-        reinterpret_cast<__half*>(hidden_out.data_ptr<at::Half>()), M, static_cast<float>(routed_scaling_factor));
+    mega_kernel_v68<kInterPerTpParam, kUsePackedWeights, kPackedWeightStagesParam, kPackedWeightLoadModeParam>
+        <<<grid, block, smem_bytes, stream>>>(shared_gate_up_tma, routed_w3_w1_tma, scores.data_ptr<float>(),
+            reinterpret_cast<__nv_bfloat16 const*>(hidden_in.data_ptr<at::BFloat16>()),
+            reinterpret_cast<__nv_bfloat16 const*>(bias.data_ptr<at::BFloat16>()),
+            reinterpret_cast<__nv_fp8_e4m3 const*>(shared_gate_up_weight.data_ptr<at::Float8_e4m3fn>()),
+            shared_gate_up_scale.data_ptr<float>(),
+            reinterpret_cast<__nv_fp8_e4m3 const*>(routed_w3_w1_weight.data_ptr<at::Float8_e4m3fn>()),
+            routed_w3_w1_scale.data_ptr<float>(), topk_weights.data_ptr<float>(), topk_indices.data_ptr<int32_t>(),
+            reinterpret_cast<__half*>(hidden_out.data_ptr<at::Half>()), M, static_cast<float>(routed_scaling_factor));
 
     return std::make_tuple(topk_weights, topk_indices, hidden_out);
 }
@@ -1186,31 +1524,60 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> mega_silu_v68_packed_int
         "shared_gate_up_scale shape mismatch");
     TORCH_CHECK(routed_w3_w1_scale.size(1) == 2 * (inter_per_tp / 128), "routed_w3_w1_scale shape mismatch");
     int const packed_stages = v68_packed_weight_stages();
+    int const packed_load_mode = v68_packed_weight_load_mode();
 
     if (inter_per_tp == kInterPerTp_TP8)
     {
         if (packed_stages == kPackedStagesSingle)
         {
-            return mega_silu_v68_impl<kInterPerTp_TP8, true, kPackedStagesSingle>(std::move(scores),
+            if (packed_load_mode == kPackedLoadTma)
+            {
+                return mega_silu_v68_impl<kInterPerTp_TP8, true, kPackedStagesSingle, kPackedLoadTma>(std::move(scores),
+                    std::move(hidden_in), std::move(bias), std::move(shared_gate_up_weight),
+                    std::move(shared_gate_up_scale), std::move(routed_w3_w1_weight), std::move(routed_w3_w1_scale),
+                    routed_scaling_factor);
+            }
+            return mega_silu_v68_impl<kInterPerTp_TP8, true, kPackedStagesSingle, kPackedLoadCpAsync>(std::move(scores),
                 std::move(hidden_in), std::move(bias), std::move(shared_gate_up_weight),
                 std::move(shared_gate_up_scale), std::move(routed_w3_w1_weight), std::move(routed_w3_w1_scale),
                 routed_scaling_factor);
         }
-        return mega_silu_v68_impl<kInterPerTp_TP8, true, kPackedStagesDouble>(std::move(scores), std::move(hidden_in),
-            std::move(bias), std::move(shared_gate_up_weight), std::move(shared_gate_up_scale),
+        if (packed_load_mode == kPackedLoadTma)
+        {
+            return mega_silu_v68_impl<kInterPerTp_TP8, true, kPackedStagesDouble, kPackedLoadTma>(std::move(scores),
+                std::move(hidden_in), std::move(bias), std::move(shared_gate_up_weight),
+                std::move(shared_gate_up_scale), std::move(routed_w3_w1_weight), std::move(routed_w3_w1_scale),
+                routed_scaling_factor);
+        }
+        return mega_silu_v68_impl<kInterPerTp_TP8, true, kPackedStagesDouble, kPackedLoadCpAsync>(std::move(scores),
+            std::move(hidden_in), std::move(bias), std::move(shared_gate_up_weight), std::move(shared_gate_up_scale),
             std::move(routed_w3_w1_weight), std::move(routed_w3_w1_scale), routed_scaling_factor);
     }
     else if (inter_per_tp == kInterPerTp_TP4)
     {
         if (packed_stages == kPackedStagesSingle)
         {
-            return mega_silu_v68_impl<kInterPerTp_TP4, true, kPackedStagesSingle>(std::move(scores),
+            if (packed_load_mode == kPackedLoadTma)
+            {
+                return mega_silu_v68_impl<kInterPerTp_TP4, true, kPackedStagesSingle, kPackedLoadTma>(std::move(scores),
+                    std::move(hidden_in), std::move(bias), std::move(shared_gate_up_weight),
+                    std::move(shared_gate_up_scale), std::move(routed_w3_w1_weight), std::move(routed_w3_w1_scale),
+                    routed_scaling_factor);
+            }
+            return mega_silu_v68_impl<kInterPerTp_TP4, true, kPackedStagesSingle, kPackedLoadCpAsync>(std::move(scores),
                 std::move(hidden_in), std::move(bias), std::move(shared_gate_up_weight),
                 std::move(shared_gate_up_scale), std::move(routed_w3_w1_weight), std::move(routed_w3_w1_scale),
                 routed_scaling_factor);
         }
-        return mega_silu_v68_impl<kInterPerTp_TP4, true, kPackedStagesDouble>(std::move(scores), std::move(hidden_in),
-            std::move(bias), std::move(shared_gate_up_weight), std::move(shared_gate_up_scale),
+        if (packed_load_mode == kPackedLoadTma)
+        {
+            return mega_silu_v68_impl<kInterPerTp_TP4, true, kPackedStagesDouble, kPackedLoadTma>(std::move(scores),
+                std::move(hidden_in), std::move(bias), std::move(shared_gate_up_weight),
+                std::move(shared_gate_up_scale), std::move(routed_w3_w1_weight), std::move(routed_w3_w1_scale),
+                routed_scaling_factor);
+        }
+        return mega_silu_v68_impl<kInterPerTp_TP4, true, kPackedStagesDouble, kPackedLoadCpAsync>(std::move(scores),
+            std::move(hidden_in), std::move(bias), std::move(shared_gate_up_weight), std::move(shared_gate_up_scale),
             std::move(routed_w3_w1_weight), std::move(routed_w3_w1_scale), routed_scaling_factor);
     }
     else

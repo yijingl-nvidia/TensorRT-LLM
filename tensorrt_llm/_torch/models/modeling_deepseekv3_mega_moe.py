@@ -19,6 +19,7 @@ from .modeling_deepseekv3_moe import Deepseekv3MoE
 
 _MEGA_MOE_DEBUG_DUMP_ENV = "TRTLLM_DEEPSEEKV3_MEGAMOE_DUMP_TENSORS"
 _MEGA_MOE_DEBUG_OUTPUT_DIR_ENV = "TRTLLM_DEEPSEEKV3_MEGAMOE_DEBUG_OUTPUT_DIR"
+_MEGA_MOE_PREPACK_V110_ENV = "TRTLLM_DEEPSEEKV3_MEGAMOE_PREPACK_V110"
 _MEGA_MOE_DEBUG_DEFAULT_OUTPUT_DIR = "~/dev/debug_output"
 _TORCH_TENSOR_FILE_SUFFIX = "pt"
 _V68_HIDDEN_SIZE = 6144
@@ -33,10 +34,23 @@ _V68_COL_HALVES_PER_K_SUB = 2
 _V68_COL_QUADS_PER_HALF = 4
 _V68_BYTES_PER_COL_QUAD = 4
 _V68_TILE_BYTES = 49152
+_V110_HIDDEN_SIZE = 6144
+_V110_NUM_CTAS = 148
+_V110_ROWS_PER_CTA = 42
+_V110_MMA_M = 16
+_V110_ROW_TILES_PER_CTA = 3
+_V110_PACKED_ROW_TILES = _V110_NUM_CTAS * _V110_ROW_TILES_PER_CTA
+_V110_BLOCK_K = 128
+_V110_TILE_BYTES = 2048
 
 
 def _mega_moe_debug_dump_enabled() -> bool:
     value = os.environ.get(_MEGA_MOE_DEBUG_DUMP_ENV, "0").strip().lower()
+    return value in ("1", "true", "yes", "on")
+
+
+def _mega_moe_prepack_v110_enabled() -> bool:
+    value = os.environ.get(_MEGA_MOE_PREPACK_V110_ENV, "0").strip().lower()
     return value in ("1", "true", "yes", "on")
 
 
@@ -194,6 +208,82 @@ def prepack_v68_routed_w3_w1_weight(weight: torch.Tensor) -> torch.Tensor:
         except ImportError:
             pass
     return prepack_v68_routed_w3_w1_weight_pytorch(weight)
+
+
+def _v110_packed_indices(device: torch.device, k_local: int) -> tuple[torch.Tensor, torch.Tensor]:
+    if k_local % _V110_BLOCK_K != 0:
+        raise ValueError(
+            f"v110 prepack expects K_local divisible by {_V110_BLOCK_K}, got {k_local}"
+        )
+
+    tile_idx = torch.arange(_V110_PACKED_ROW_TILES, device=device, dtype=torch.int64)
+    row_base = (tile_idx // _V110_ROW_TILES_PER_CTA) * _V110_ROWS_PER_CTA
+    row_base += (tile_idx % _V110_ROW_TILES_PER_CTA) * _V110_MMA_M
+
+    elem = torch.arange(_V110_TILE_BYTES, device=device, dtype=torch.int64)
+    row = elem // _V110_BLOCK_K
+    phys_col = elem - row * _V110_BLOCK_K
+    chunk_phys = phys_col // 16
+    byte = phys_col - chunk_phys * 16
+    logical_col_in_kb = ((chunk_phys ^ (row & 7)) * 16) + byte
+
+    src_rows = row_base[:, None] + row[None, :]
+    src_rows = torch.where(
+        src_rows < _V110_HIDDEN_SIZE,
+        src_rows,
+        torch.full_like(src_rows, _V110_HIDDEN_SIZE),
+    )
+    kb = torch.arange(k_local // _V110_BLOCK_K, device=device, dtype=torch.int64)
+    src_cols = kb[:, None] * _V110_BLOCK_K + logical_col_in_kb[None, :]
+    return src_rows, src_cols
+
+
+def prepack_v110_shared_down_weight_pytorch(weight: torch.Tensor) -> torch.Tensor:
+    # weight: torch.float8_e4m3fn, [H, I].
+    if weight.dtype != torch.float8_e4m3fn:
+        raise TypeError(f"v110 prepack expects float8_e4m3fn weights, got {weight.dtype}")
+    if weight.ndim != 2 or weight.shape[0] != _V110_HIDDEN_SIZE:
+        raise ValueError(f"shared v110 prepack expects [H, I], got {weight.shape}")
+
+    weight = weight.contiguous()
+    src_rows, src_cols = _v110_packed_indices(weight.device, weight.shape[1])
+    padded = torch.empty(
+        (_V110_HIDDEN_SIZE + _V110_MMA_M, weight.shape[1]),
+        device=weight.device,
+        dtype=weight.dtype,
+    )
+    padded[:_V110_HIDDEN_SIZE].copy_(weight)
+    padded[_V110_HIDDEN_SIZE:].zero_()
+    # packed: torch.float8_e4m3fn, [444, I / 128, 2048].
+    return padded[src_rows[:, None, :], src_cols[None, :, :]].contiguous()
+
+
+def prepack_v110_routed_w2_weight_pytorch(weight: torch.Tensor) -> torch.Tensor:
+    # weight: torch.float8_e4m3fn, [E, H, I].
+    if weight.dtype != torch.float8_e4m3fn:
+        raise TypeError(f"v110 prepack expects float8_e4m3fn weights, got {weight.dtype}")
+    if weight.ndim != 3 or weight.shape[1] != _V110_HIDDEN_SIZE:
+        raise ValueError(f"routed v110 prepack expects [E, H, I], got {weight.shape}")
+
+    weight = weight.contiguous()
+    src_rows, src_cols = _v110_packed_indices(weight.device, weight.shape[2])
+    padded = torch.empty(
+        (weight.shape[0], _V110_HIDDEN_SIZE + _V110_MMA_M, weight.shape[2]),
+        device=weight.device,
+        dtype=weight.dtype,
+    )
+    padded[:, :_V110_HIDDEN_SIZE].copy_(weight)
+    padded[:, _V110_HIDDEN_SIZE:].zero_()
+    # packed: torch.float8_e4m3fn, [E, 444, I / 128, 2048].
+    return padded[:, src_rows[:, None, :], src_cols[None, :, :]].contiguous()
+
+
+def prepack_v110_shared_down_weight(weight: torch.Tensor) -> torch.Tensor:
+    return prepack_v110_shared_down_weight_pytorch(weight)
+
+
+def prepack_v110_routed_w2_weight(weight: torch.Tensor) -> torch.Tensor:
+    return prepack_v110_routed_w2_weight_pytorch(weight)
 
 
 class Deepseekv3MegaMoE(nn.Module):
@@ -374,6 +464,7 @@ class Deepseekv3MegaMoE(nn.Module):
 
         old_moe = self._old_moe
         shared_gate_up_proj = old_moe.shared_experts.gate_up_proj
+        shared_down_proj = old_moe.shared_experts.down_proj
         moe_backend = old_moe.experts.backend
 
         if getattr(shared_gate_up_proj, "weight_org_packed_v68", None) is None:
@@ -400,6 +491,32 @@ class Deepseekv3MegaMoE(nn.Module):
                 prepack_v68_routed_w3_w1_weight(routed_w3_w1_weight),
             )
             moe_backend.w3_w1_weight = None
+
+        if _mega_moe_prepack_v110_enabled():
+            if getattr(shared_down_proj, "weight_org_packed_v110", None) is None:
+                shared_down_weight_org = self._retain_linear_original_tensors(
+                    shared_down_proj, "shared_experts.down_proj"
+                )
+                self._set_nonpersistent_buffer(
+                    shared_down_proj,
+                    "weight_org_packed_v110",
+                    prepack_v110_shared_down_weight(shared_down_weight_org),
+                )
+                shared_down_proj.weight_org = None
+
+            if getattr(moe_backend, "w2_weight_packed_v110", None) is None:
+                routed_w2_weight = moe_backend.w2_weight
+                if routed_w2_weight is None:
+                    raise RuntimeError(
+                        "TRTLLM_DEEPSEEKV3_MEGAMOE_MODE=wip_mega_kernel requires "
+                        "moe_backend.w2_weight before v110 prepacking"
+                    )
+                self._set_nonpersistent_buffer(
+                    moe_backend,
+                    "w2_weight_packed_v110",
+                    prepack_v110_routed_w2_weight(routed_w2_weight),
+                )
+                moe_backend.w2_weight = None
 
     def dump_mega_moe_activation_tensors(self, **tensors: torch.Tensor | None) -> None:
         """Dump selected activation tensors from the current MegaMoE forward."""
@@ -1402,12 +1519,27 @@ class Deepseekv3MegaMoE(nn.Module):
                 block_scale_fp32_hidden_size,
             ),
         )
-        check_data(
-            moe_backend.w2_weight,
-            "wip_mega_routed_w2_weight",
-            torch.float8_e4m3fn,
-            (num_router_experts, hidden_size, expert_intermediate_size),
-        )
+        routed_w2_weight_for_v110 = getattr(moe_backend, "w2_weight_packed_v110", None)
+        if routed_w2_weight_for_v110 is not None:
+            check_data(
+                routed_w2_weight_for_v110,
+                "wip_mega_routed_w2_weight_packed_v110",
+                torch.float8_e4m3fn,
+                (
+                    num_router_experts,
+                    _V110_PACKED_ROW_TILES,
+                    block_scale_fp32_expert_intermediate_size,
+                    _V110_TILE_BYTES,
+                ),
+            )
+        else:
+            routed_w2_weight_for_v110 = moe_backend.w2_weight
+            check_data(
+                routed_w2_weight_for_v110,
+                "wip_mega_routed_w2_weight",
+                torch.float8_e4m3fn,
+                (num_router_experts, hidden_size, expert_intermediate_size),
+            )
         check_data(
             moe_backend.w2_weight_scaling_factor,
             "wip_mega_routed_w2_weight_scaling_factor",
@@ -1418,19 +1550,32 @@ class Deepseekv3MegaMoE(nn.Module):
                 block_scale_fp32_expert_intermediate_size,
             ),
         )
-        shared_down_weight_org = getattr(shared_down_proj, "weight_org", None)
+        shared_down_weight_for_v110 = getattr(shared_down_proj, "weight_org_packed_v110", None)
         shared_down_weight_scale_org = getattr(shared_down_proj, "weight_scale_org", None)
-        if shared_down_weight_org is None or shared_down_weight_scale_org is None:
+        if shared_down_weight_scale_org is None:
             raise RuntimeError(
                 "TRTLLM_DEEPSEEKV3_MEGAMOE_MODE=wip_mega_kernel requires "
-                "shared_experts.down_proj.weight_org and weight_scale_org to be retained"
+                "shared_experts.down_proj.weight_scale_org"
             )
-        check_data(
-            shared_down_weight_org,
-            "wip_mega_shared_down_weight_org",
-            torch.float8_e4m3fn,
-            (hidden_size, expert_intermediate_size),
-        )
+        if shared_down_weight_for_v110 is not None:
+            check_data(
+                shared_down_weight_for_v110,
+                "wip_mega_shared_down_weight_packed_v110",
+                torch.float8_e4m3fn,
+                (
+                    _V110_PACKED_ROW_TILES,
+                    block_scale_fp32_expert_intermediate_size,
+                    _V110_TILE_BYTES,
+                ),
+            )
+        else:
+            shared_down_weight_for_v110 = getattr(shared_down_proj, "weight_org", None)
+            check_data(
+                shared_down_weight_for_v110,
+                "wip_mega_shared_down_weight_org",
+                torch.float8_e4m3fn,
+                (hidden_size, expert_intermediate_size),
+            )
         check_data(
             shared_down_weight_scale_org,
             "wip_mega_shared_down_weight_scale_org",
@@ -1497,9 +1642,9 @@ class Deepseekv3MegaMoE(nn.Module):
             slot_swiglu_output,
             expert_indices,
             expert_weights,
-            moe_backend.w2_weight,
+            routed_w2_weight_for_v110,
             moe_backend.w2_weight_scaling_factor,
-            shared_down_weight_org,
+            shared_down_weight_for_v110,
             shared_down_weight_scale_org,
             output_tensor,
         )

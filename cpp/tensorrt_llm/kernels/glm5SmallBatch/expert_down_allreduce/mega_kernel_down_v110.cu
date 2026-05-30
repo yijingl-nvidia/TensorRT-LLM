@@ -284,6 +284,7 @@ constexpr int kMmaM = 16;
 constexpr int kMmaK = 16;
 constexpr int kKItersPerBlock = kBlockK / kMmaK;                   // 8
 constexpr int kRowTilesPerCta = (kRowsPerCta + kMmaM - 1) / kMmaM; // 3
+constexpr int kPackedRowTiles = kNumCtas * kRowTilesPerCta;        // 444
 // [dv85] M=4 hard-specialization: kMaxM is now compile-time 4.
 // Every M-dependent literal (loop bounds, smem offsets, buffer sizes)
 // shrinks accordingly. Kernel ONLY accepts M=4.
@@ -294,6 +295,7 @@ constexpr int kMaxM = 4;
 // parameters to support both TP=4 (kKLocal=512, kNumPeers=4) and TP=8
 // (kKLocal=256, kNumPeers=8).
 constexpr int kSpecFp8Stages = 4; // always 4
+constexpr int kPackedFp8Stages = 2;
 
 // fp8 TMA staging: 16 rows × 128 fp8 bytes = 2048 bytes per stage,
 // 2 stages per warp.
@@ -346,6 +348,27 @@ __device__ __forceinline__ uint4 loadGlobalUint4L2(uint4 const* ptr)
     value = *ptr;
 #endif
     return value;
+}
+
+__device__ __forceinline__ void cp_async_16b(void* smem_dst, void const* global_src)
+{
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+    uint32_t const dst_smem = static_cast<uint32_t>(__cvta_generic_to_shared(smem_dst));
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(dst_smem), "l"(global_src));
+#else
+    *reinterpret_cast<uint4*>(smem_dst) = *reinterpret_cast<uint4 const*>(global_src);
+#endif
+}
+
+__device__ __forceinline__ void load_packed_w_down_tile_v110(
+    uint8_t* __restrict__ smem_tile, __nv_fp8_e4m3 const* __restrict__ packed_tile, int lane)
+{
+    constexpr int kCopyBytes = 16;
+    uint8_t const* const src = reinterpret_cast<uint8_t const*>(packed_tile);
+    for (int byte_off = lane * kCopyBytes; byte_off < kFp8BytesPerStage; byte_off += kWarpSize * kCopyBytes)
+    {
+        cp_async_16b(smem_tile + byte_off, src + byte_off);
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -538,9 +561,10 @@ __device__ __forceinline__ void cvt_fp8_to_afrag_direct(
 // -----------------------------------------------------------------------------
 // Kernel
 // -----------------------------------------------------------------------------
-template <int kKLocal>
+template <int kKLocal, bool kUsePackedWeights>
 __global__ __launch_bounds__(kThreadsPerCta, 1) void mega_down_v110_kernel(
     __grid_constant__ const CUtensorMap routed_w_down_map, __grid_constant__ const CUtensorMap shared_w_down_map,
+    __nv_fp8_e4m3 const* __restrict__ routed_w_down_packed, __nv_fp8_e4m3 const* __restrict__ shared_w_down_packed,
     // Read hidden_in via plain LDG (generic memory proxy) instead of TMA.
     // v68 writes hidden_out through normal global stores, so same-stream
     // kernel ordering is sufficient for this handoff without proxy fences.
@@ -560,8 +584,8 @@ __global__ __launch_bounds__(kThreadsPerCta, 1) void mega_down_v110_kernel(
     //   * num_peers parameter removed; replaced with constexpr (template).
     //   * K_local parameter removed; replaced with constexpr (template).
     //   * kFp8Stages template parameter removed; replaced with constexpr 4.
-    constexpr int kFp8Stages = kSpecFp8Stages; // == 4
-    constexpr int K_local = kKLocal;           // 512 (TP=4) or 256 (TP=8)
+    constexpr int kFp8Stages = kUsePackedWeights ? kPackedFp8Stages : kSpecFp8Stages;
+    constexpr int K_local = kKLocal; // 512 (TP=4) or 256 (TP=8)
     // [dv110-tp8] Per-template derived counts. Same formulas as before;
     // values change for TP=8.
     //   TP=4 (kKLocal=512): kKBlocks=4
@@ -638,8 +662,8 @@ __global__ __launch_bounds__(kThreadsPerCta, 1) void mega_down_v110_kernel(
     size_t mbar_base = num_unique_base + sizeof(int32_t) * 4;
     mbar_base = (mbar_base + 15) & ~size_t(15);
     uint64_t* smem_mbar = reinterpret_cast<uint64_t*>(smem_raw + mbar_base);
-    int const kWdMbarCount = kNumWarps * kFp8Stages;
-    int const kMbarCount = kWdMbarCount;
+    constexpr int kWdMbarCount = kUsePackedWeights ? 0 : kNumWarps * kFp8Stages;
+    constexpr int kMbarCount = kWdMbarCount;
 
     // ---- fp8 TMA W-tile staging.
     //
@@ -662,13 +686,16 @@ __global__ __launch_bounds__(kThreadsPerCta, 1) void mega_down_v110_kernel(
     // We still consume fp8 stage memory in the same place.
 
     // ---- [dv22] Init mbarriers FIRST (W_down ring). ----
-    if (tid < kMbarCount)
+    if constexpr (!kUsePackedWeights)
     {
-        mbarrier_init(&smem_mbar[tid], 1);
-    }
-    if (tid == 0)
-    {
-        fence_proxy_async_shared();
+        if (tid < kMbarCount)
+        {
+            mbarrier_init(&smem_mbar[tid], 1);
+        }
+        if (tid == 0)
+        {
+            fence_proxy_async_shared();
+        }
     }
     __syncthreads();
 
@@ -805,25 +832,47 @@ __global__ __launch_bounds__(kThreadsPerCta, 1) void mega_down_v110_kernel(
     constexpr uint32_t m_stride_bytes_h = (uint32_t) (kTopKPlusShared * kHiddenKChunk * 2); // 9*128*2 = 2304
     constexpr uint32_t slot_stride_bytes_h = (uint32_t) (kHiddenKChunk * 2);                // 128*2 = 256
 
-    // TMA issue helper. Routed weights use z=e_id. The shared expert is a
-    // separate standalone [N, K] matrix represented as a one-expert map with
-    // z=0, matching the existing TRT-LLM weight layout without repacking.
-    auto issue_tma_load = [&](int e_id, int row_base, int k_off, int stage_idx)
+    // Weight issue helper. Raw weights use TMA maps; packed weights are already
+    // in the exact 16x128 swizzled tile layout consumed by cvt_fp8_to_afrag_direct().
+    auto issue_weight_load = [&](int e_id, int row_base, int row_tile_idx, int kb, int stage_idx)
     {
-        if (lane == 0)
+        if constexpr (kUsePackedWeights)
         {
-            int mbar_idx = warp_mbar_base + stage_idx;
             uint8_t* stage_smem = warp_fp8_base + stage_idx * kFp8BytesPerStage;
-            mbarrier_arrive_expect_tx(&smem_mbar[mbar_idx], kFp8BytesPerStage);
+            __nv_fp8_e4m3 const* packed_tile = nullptr;
             if (e_id == kSharedExpertIdx)
             {
-                cp_async_bulk_tensor_3d(stage_smem, &shared_w_down_map,
-                    /*x=*/k_off, /*y=*/row_base, /*z=*/0, &smem_mbar[mbar_idx]);
+                packed_tile = shared_w_down_packed
+                    + ((size_t) row_tile_idx * (size_t) k_blocks + (size_t) kb) * (size_t) kFp8BytesPerStage;
             }
             else
             {
-                cp_async_bulk_tensor_3d(stage_smem, &routed_w_down_map,
-                    /*x=*/k_off, /*y=*/row_base, /*z=*/e_id, &smem_mbar[mbar_idx]);
+                packed_tile = routed_w_down_packed
+                    + (((size_t) e_id * (size_t) kPackedRowTiles + (size_t) row_tile_idx) * (size_t) k_blocks
+                          + (size_t) kb)
+                        * (size_t) kFp8BytesPerStage;
+            }
+            load_packed_w_down_tile_v110(stage_smem, packed_tile, lane);
+            asm volatile("cp.async.commit_group;\n" :::);
+        }
+        else
+        {
+            if (lane == 0)
+            {
+                int mbar_idx = warp_mbar_base + stage_idx;
+                uint8_t* stage_smem = warp_fp8_base + stage_idx * kFp8BytesPerStage;
+                int const k_off = kb * kBlockK;
+                mbarrier_arrive_expect_tx(&smem_mbar[mbar_idx], kFp8BytesPerStage);
+                if (e_id == kSharedExpertIdx)
+                {
+                    cp_async_bulk_tensor_3d(stage_smem, &shared_w_down_map,
+                        /*x=*/k_off, /*y=*/row_base, /*z=*/0, &smem_mbar[mbar_idx]);
+                }
+                else
+                {
+                    cp_async_bulk_tensor_3d(stage_smem, &routed_w_down_map,
+                        /*x=*/k_off, /*y=*/row_base, /*z=*/e_id, &smem_mbar[mbar_idx]);
+                }
             }
         }
     };
@@ -848,6 +897,7 @@ __global__ __launch_bounds__(kThreadsPerCta, 1) void mega_down_v110_kernel(
             int const tile = w;
             int const row_base_in_cta = tile * kMmaM;
             int const row_base = row_lo + row_base_in_cta;
+            int const row_tile_idx = cta_id * kRowTilesPerCta + tile;
 
             int const rows_active = min(kMmaM, row_hi - row_base);
             if (rows_active <= 0)
@@ -862,10 +912,13 @@ __global__ __launch_bounds__(kThreadsPerCta, 1) void mega_down_v110_kernel(
                 constexpr int m_base = 0;
                 float c[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 
-                // Prologue: pre-issue stages 0..min(kFp8Stages-1, k_blocks-1).
-                // For kFp8Stages==1 this issues nothing here (issue-on-demand
-                // in the inner loop below mirrors dv9's single-stage path).
-                if constexpr (kFp8Stages > 1)
+                if constexpr (kUsePackedWeights)
+                {
+                    issue_weight_load(e_id, row_base, row_tile_idx, 0, 0);
+                    asm volatile("cp.async.wait_all;\n" :::);
+                    __syncwarp();
+                }
+                else if constexpr (kFp8Stages > 1)
                 {
                     int const prologue_n = kFp8Stages < k_blocks ? kFp8Stages : k_blocks;
 #pragma unroll
@@ -873,7 +926,7 @@ __global__ __launch_bounds__(kThreadsPerCta, 1) void mega_down_v110_kernel(
                     {
                         if (s < prologue_n)
                         {
-                            issue_tma_load(e_id, row_base, s * kBlockK, s);
+                            issue_weight_load(e_id, row_base, row_tile_idx, s, s);
                         }
                     }
                 }
@@ -901,15 +954,25 @@ __global__ __launch_bounds__(kThreadsPerCta, 1) void mega_down_v110_kernel(
 #pragma unroll
                 for (int kb = 0; kb < k_blocks; ++kb)
                 {
-                    int const stage = (kFp8Stages == 1) ? 0 : (kb % kFp8Stages);
+                    int const stage = kUsePackedWeights ? (kb & 1) : ((kFp8Stages == 1) ? 0 : (kb % kFp8Stages));
 
-                    if constexpr (kFp8Stages == 1)
+                    if constexpr (kUsePackedWeights)
+                    {
+                        if (kb + 1 < k_blocks)
+                        {
+                            issue_weight_load(e_id, row_base, row_tile_idx, kb + 1, (kb + 1) & 1);
+                        }
+                    }
+                    else if constexpr (kFp8Stages == 1)
                     {
                         // 1-stage: issue current then wait.
-                        issue_tma_load(e_id, row_base, kb * kBlockK, 0);
+                        issue_weight_load(e_id, row_base, row_tile_idx, kb, 0);
                     }
-                    wait_stage(stage);
-                    __syncwarp();
+                    if constexpr (!kUsePackedWeights)
+                    {
+                        wait_stage(stage);
+                        __syncwarp();
+                    }
 
                     uint32_t fp8_stage_ptr = warp_fp8_addr + (uint32_t) (stage * kFp8BytesPerStage);
 
@@ -950,12 +1013,20 @@ __global__ __launch_bounds__(kThreadsPerCta, 1) void mega_down_v110_kernel(
 
                     // Steady-state: pre-issue (kb + kFp8Stages) into the
                     // just-consumed stage slot.
-                    if constexpr (kFp8Stages > 1)
+                    if constexpr (kUsePackedWeights)
+                    {
+                        if (kb + 1 < k_blocks)
+                        {
+                            asm volatile("cp.async.wait_all;\n" :::);
+                            __syncwarp();
+                        }
+                    }
+                    else if constexpr (kFp8Stages > 1)
                     {
                         int const next_kb = kb + kFp8Stages;
                         if (next_kb < k_blocks)
                         {
-                            issue_tma_load(e_id, row_base, next_kb * kBlockK, stage);
+                            issue_weight_load(e_id, row_base, row_tile_idx, next_kb, stage);
                         }
                     }
 
@@ -1002,6 +1073,7 @@ __global__ __launch_bounds__(kThreadsPerCta, 1) void mega_down_v110_kernel(
             int const b_idx = w_outer - tile * num_unique;
             int const row_base_in_cta = tile * kMmaM;
             int const row_base = row_lo + row_base_in_cta;
+            int const row_tile_idx = cta_id * kRowTilesPerCta + tile;
             int const rows_active = min(kMmaM, row_hi - row_base);
             if (rows_active <= 0)
                 continue;
@@ -1038,8 +1110,13 @@ __global__ __launch_bounds__(kThreadsPerCta, 1) void mega_down_v110_kernel(
                         lane_has_pair = true;
                     }
                 }
-                // Prologue: pre-issue stages 0..min(kFp8Stages-1, k_blocks-1).
-                if constexpr (kFp8Stages > 1)
+                if constexpr (kUsePackedWeights)
+                {
+                    issue_weight_load(e_id, row_base, row_tile_idx, 0, 0);
+                    asm volatile("cp.async.wait_all;\n" :::);
+                    __syncwarp();
+                }
+                else if constexpr (kFp8Stages > 1)
                 {
                     int const prologue_n = kFp8Stages < k_blocks ? kFp8Stages : k_blocks;
 #pragma unroll
@@ -1047,7 +1124,7 @@ __global__ __launch_bounds__(kThreadsPerCta, 1) void mega_down_v110_kernel(
                     {
                         if (s < prologue_n)
                         {
-                            issue_tma_load(e_id, row_base, s * kBlockK, s);
+                            issue_weight_load(e_id, row_base, row_tile_idx, s, s);
                         }
                     }
                 }
@@ -1068,14 +1145,24 @@ __global__ __launch_bounds__(kThreadsPerCta, 1) void mega_down_v110_kernel(
 #pragma unroll
                 for (int kb = 0; kb < k_blocks; ++kb)
                 {
-                    int const stage = (kFp8Stages == 1) ? 0 : (kb % kFp8Stages);
+                    int const stage = kUsePackedWeights ? (kb & 1) : ((kFp8Stages == 1) ? 0 : (kb % kFp8Stages));
 
-                    if constexpr (kFp8Stages == 1)
+                    if constexpr (kUsePackedWeights)
                     {
-                        issue_tma_load(e_id, row_base, kb * kBlockK, 0);
+                        if (kb + 1 < k_blocks)
+                        {
+                            issue_weight_load(e_id, row_base, row_tile_idx, kb + 1, (kb + 1) & 1);
+                        }
                     }
-                    wait_stage(stage);
-                    __syncwarp();
+                    else if constexpr (kFp8Stages == 1)
+                    {
+                        issue_weight_load(e_id, row_base, row_tile_idx, kb, 0);
+                    }
+                    if constexpr (!kUsePackedWeights)
+                    {
+                        wait_stage(stage);
+                        __syncwarp();
+                    }
 
                     uint32_t fp8_stage_ptr = warp_fp8_addr + (uint32_t) (stage * kFp8BytesPerStage);
 
@@ -1107,12 +1194,20 @@ __global__ __launch_bounds__(kThreadsPerCta, 1) void mega_down_v110_kernel(
 
                     // Steady-state: pre-issue (kb + kFp8Stages) into the
                     // freed stage slot.
-                    if constexpr (kFp8Stages > 1)
+                    if constexpr (kUsePackedWeights)
+                    {
+                        if (kb + 1 < k_blocks)
+                        {
+                            asm volatile("cp.async.wait_all;\n" :::);
+                            __syncwarp();
+                        }
+                    }
+                    else if constexpr (kFp8Stages > 1)
                     {
                         int const next_kb = kb + kFp8Stages;
                         if (next_kb < k_blocks)
                         {
-                            issue_tma_load(e_id, row_base, next_kb * kBlockK, stage);
+                            issue_weight_load(e_id, row_base, row_tile_idx, next_kb, stage);
                         }
                     }
 
@@ -1358,17 +1453,13 @@ torch::Tensor mega_down_project_v110(torch::Tensor hidden_in, torch::Tensor indi
     TORCH_CHECK(hidden_in.size(1) == kTopKPlusShared, "hidden_in dim1 must = 9");
     TORCH_CHECK(indices.dim() == 2 && indices.size(1) == kRoutedSlots, "indices must be [M, 8]");
     TORCH_CHECK(scores.dim() == 2 && scores.size(1) == kRoutedSlots, "scores must be [M, 8]");
-    TORCH_CHECK(
-        routed_w_down.dim() == 3 && routed_w_down.size(0) == kSharedExpertIdx && routed_w_down.size(1) == kHiddenSize,
-        "routed_w_down must be [256, 6144, K_local]");
     TORCH_CHECK(routed_w_down_scale.dim() == 3 && routed_w_down_scale.size(0) == kSharedExpertIdx,
         "routed_w_down_scale must be [256, 48, k_blocks]");
-    TORCH_CHECK(
-        shared_w_down.dim() == 2 && shared_w_down.size(0) == kHiddenSize, "shared_w_down must be [6144, K_local]");
     TORCH_CHECK(shared_w_down_scale.dim() == 2, "shared_w_down_scale must be [48, k_blocks]");
 
     int const M = static_cast<int>(hidden_in.size(0));
     int const K_local = static_cast<int>(hidden_in.size(2));
+    bool const use_packed_weights = routed_w_down.dim() == 4 || shared_w_down.dim() == 3;
     // [dv110-runtimeM] M is now a runtime argument in [1, kMaxM]. Smem
     // buffers are sized for kMaxM (compile-time upper bound); only the
     // active-token loops use the runtime M.
@@ -1376,9 +1467,26 @@ torch::Tensor mega_down_project_v110(torch::Tensor hidden_in, torch::Tensor indi
     TORCH_CHECK(K_local == 512 || K_local == 256,
         "v110 supports K_local=512 [TP=4] or K_local=256 [TP=8]; got K_local=", K_local);
     TORCH_CHECK(output.dim() == 2 && output.size(0) == M && output.size(1) == kHiddenSize, "output must be [M, 6144]");
-    TORCH_CHECK(routed_w_down.size(2) == K_local, "routed_w_down last dim mismatch");
-    TORCH_CHECK(shared_w_down.size(1) == K_local, "shared_w_down last dim mismatch");
     int const k_blocks = K_local / kBlockK; // 4 (TP=4) or 2 (TP=8)
+    if (use_packed_weights)
+    {
+        TORCH_CHECK(routed_w_down.dim() == 4 && routed_w_down.size(0) == kSharedExpertIdx
+                && routed_w_down.size(1) == kPackedRowTiles && routed_w_down.size(2) == k_blocks
+                && routed_w_down.size(3) == kFp8BytesPerStage,
+            "packed routed_w_down must be [256, 444, k_blocks, 2048]");
+        TORCH_CHECK(shared_w_down.dim() == 3 && shared_w_down.size(0) == kPackedRowTiles
+                && shared_w_down.size(1) == k_blocks && shared_w_down.size(2) == kFp8BytesPerStage,
+            "packed shared_w_down must be [444, k_blocks, 2048]");
+    }
+    else
+    {
+        TORCH_CHECK(routed_w_down.dim() == 3 && routed_w_down.size(0) == kSharedExpertIdx
+                && routed_w_down.size(1) == kHiddenSize && routed_w_down.size(2) == K_local,
+            "routed_w_down must be [256, 6144, K_local]");
+        TORCH_CHECK(
+            shared_w_down.dim() == 2 && shared_w_down.size(0) == kHiddenSize && shared_w_down.size(1) == K_local,
+            "shared_w_down must be [6144, K_local]");
+    }
     TORCH_CHECK(routed_w_down_scale.size(1) == kHiddenSize / kBlockN, "routed_w_down_scale dim1 must = 48");
     TORCH_CHECK(routed_w_down_scale.size(2) == k_blocks,
         "routed_w_down_scale dim2 must = k_blocks; got=", routed_w_down_scale.size(2), " expected=", k_blocks);
@@ -1400,22 +1508,24 @@ torch::Tensor mega_down_project_v110(torch::Tensor hidden_in, torch::Tensor indi
     int device_id = 0;
     AT_CUDA_CHECK(cudaGetDevice(&device_id));
 
-    // Build or reuse the TMA descriptors for routed and shared down weights.
-    CUresult routed_tma_err = CUDA_SUCCESS;
-    CUtensorMap routed_w_down_map
-        = get_cached_w_down_tmap(routed_w_down.data_ptr(), kSharedExpertIdx, K_local, device_id, &routed_tma_err);
-    TORCH_CHECK(routed_tma_err == CUDA_SUCCESS,
-        "cuTensorMapEncodeTiled (routed_w_down) failed: CUresult=", (int) routed_tma_err);
-    CUresult shared_tma_err = CUDA_SUCCESS;
-    CUtensorMap shared_w_down_map
-        = get_cached_w_down_tmap(shared_w_down.data_ptr(), 1, K_local, device_id, &shared_tma_err);
-    TORCH_CHECK(shared_tma_err == CUDA_SUCCESS,
-        "cuTensorMapEncodeTiled (shared_w_down) failed: CUresult=", (int) shared_tma_err);
+    CUtensorMap routed_w_down_map = {};
+    CUtensorMap shared_w_down_map = {};
+    if (!use_packed_weights)
+    {
+        // Build or reuse the TMA descriptors for routed and shared down weights.
+        CUresult routed_tma_err = CUDA_SUCCESS;
+        routed_w_down_map
+            = get_cached_w_down_tmap(routed_w_down.data_ptr(), kSharedExpertIdx, K_local, device_id, &routed_tma_err);
+        TORCH_CHECK(routed_tma_err == CUDA_SUCCESS,
+            "cuTensorMapEncodeTiled (routed_w_down) failed: CUresult=", (int) routed_tma_err);
+        CUresult shared_tma_err = CUDA_SUCCESS;
+        shared_w_down_map = get_cached_w_down_tmap(shared_w_down.data_ptr(), 1, K_local, device_id, &shared_tma_err);
+        TORCH_CHECK(shared_tma_err == CUDA_SUCCESS,
+            "cuTensorMapEncodeTiled (shared_w_down) failed: CUresult=", (int) shared_tma_err);
+    }
 
-    // [dv93] kFp8Stages is constexpr 4 (deploy config). Stage selection
-    // and the <1>/<2> variants are eliminated. Smem footprint is fixed.
-    constexpr int chosen_stages = kSpecFp8Stages;
-    auto compute_smem = [&](int stages, int m_for_smem) -> size_t
+    int const chosen_stages = use_packed_weights ? kPackedFp8Stages : kSpecFp8Stages;
+    auto compute_smem = [&](int stages, int m_for_smem, bool packed_weights) -> size_t
     {
         size_t hidden_bytes = sizeof(__half) * (size_t) m_for_smem * kTopKPlusShared * K_local;
         size_t tables_bytes = sizeof(int32_t) * (size_t) m_for_smem * kTopKPlusShared
@@ -1440,31 +1550,31 @@ torch::Tensor mega_down_project_v110(torch::Tensor hidden_in, torch::Tensor indi
 
         size_t mb = num_unique_base + num_unique_bytes;
         mb = (mb + 15) & ~size_t(15);
-        size_t mb_bytes = sizeof(uint64_t) * (size_t) (kNumWarps * stages);
+        size_t mb_bytes = packed_weights ? 0 : sizeof(uint64_t) * (size_t) (kNumWarps * stages);
         size_t fp8b = mb + mb_bytes;
         fp8b = (fp8b + 1023) & ~size_t(1023);
         size_t fp8b_bytes = (size_t) kNumWarps * stages * kFp8BytesPerStage;
         return fp8b + fp8b_bytes;
     };
-    size_t smem_bytes = compute_smem(chosen_stages, M);
-    size_t max_smem_bytes = compute_smem(chosen_stages, kMaxM);
+    size_t smem_bytes = compute_smem(chosen_stages, M, use_packed_weights);
+    size_t max_smem_bytes = compute_smem(chosen_stages, kMaxM, use_packed_weights);
 
     const size_t kSmemCapBytes = 232448; // B200/GB300 maxSharedMemoryPerBlockOptin
     TORCH_CHECK(
         max_smem_bytes <= kSmemCapBytes, "dv110 smem footprint ", max_smem_bytes, " exceeds cap ", kSmemCapBytes);
 
-    using KernelFn = void (*)(const CUtensorMap, const CUtensorMap,
+    using KernelFn = void (*)(const CUtensorMap, const CUtensorMap, __nv_fp8_e4m3 const*, __nv_fp8_e4m3 const*,
         __half const*, // [v68-fp16-hidden] hidden_in_raw (was bf16)
         int32_t const*, float const*, float const*, float const*, __nv_bfloat16*, int);
 
     KernelFn kfn = nullptr;
     if (K_local == 512)
     {
-        kfn = &mega_down_v110_kernel<512>;
+        kfn = use_packed_weights ? &mega_down_v110_kernel<512, true> : &mega_down_v110_kernel<512, false>;
     }
     else if (K_local == 256)
     {
-        kfn = &mega_down_v110_kernel<256>;
+        kfn = use_packed_weights ? &mega_down_v110_kernel<256, true> : &mega_down_v110_kernel<256, false>;
     }
     else
     {
@@ -1489,13 +1599,17 @@ torch::Tensor mega_down_project_v110(torch::Tensor hidden_in, torch::Tensor indi
     TORCH_CHECK(device_id >= 0 && device_id < kMaxCudaDevicesForSmemAttr, "unsupported CUDA device id ", device_id);
     static std::once_flag s_smem_attr_512_per_device[kMaxCudaDevicesForSmemAttr];
     static std::once_flag s_smem_attr_256_per_device[kMaxCudaDevicesForSmemAttr];
+    static std::once_flag s_smem_attr_512_packed_per_device[kMaxCudaDevicesForSmemAttr];
+    static std::once_flag s_smem_attr_256_packed_per_device[kMaxCudaDevicesForSmemAttr];
     if (K_local == 512)
     {
-        set_smem_attribute_once(s_smem_attr_512_per_device[device_id]);
+        set_smem_attribute_once(
+            use_packed_weights ? s_smem_attr_512_packed_per_device[device_id] : s_smem_attr_512_per_device[device_id]);
     }
     else
     {
-        set_smem_attribute_once(s_smem_attr_256_per_device[device_id]);
+        set_smem_attribute_once(
+            use_packed_weights ? s_smem_attr_256_packed_per_device[device_id] : s_smem_attr_256_per_device[device_id]);
     }
 
     dim3 grid(kNumCtas, 1, 1);
@@ -1511,7 +1625,15 @@ torch::Tensor mega_down_project_v110(torch::Tensor hidden_in, torch::Tensor indi
         nullptr,
         nullptr,
         nullptr,
+        nullptr,
+        nullptr,
     };
+    __nv_fp8_e4m3 const* routed_w_down_packed_ptr = use_packed_weights
+        ? reinterpret_cast<__nv_fp8_e4m3 const*>(routed_w_down.data_ptr<at::Float8_e4m3fn>())
+        : nullptr;
+    __nv_fp8_e4m3 const* shared_w_down_packed_ptr = use_packed_weights
+        ? reinterpret_cast<__nv_fp8_e4m3 const*>(shared_w_down.data_ptr<at::Float8_e4m3fn>())
+        : nullptr;
     // Hidden_in is staged in the kernel with generic LDG instead of TMA.
     // [v68-fp16-hidden] hidden_in dtype is now __half (was __nv_bfloat16).
     __half const* hidden_in_ptr = reinterpret_cast<__half const*>(hidden_in.data_ptr<at::Half>());
@@ -1521,13 +1643,15 @@ torch::Tensor mega_down_project_v110(torch::Tensor hidden_in, torch::Tensor indi
     float const* shared_wscale_ptr = shared_w_down_scale.data_ptr<float>();
     __nv_bfloat16* output_ptr = reinterpret_cast<__nv_bfloat16*>(output.data_ptr<at::BFloat16>());
     int m_arg = M;
-    args[2] = &hidden_in_ptr;
-    args[3] = &indices_ptr;
-    args[4] = &scores_ptr;
-    args[5] = &routed_wscale_ptr;
-    args[6] = &shared_wscale_ptr;
-    args[7] = &output_ptr;
-    args[8] = &m_arg;
+    args[2] = &routed_w_down_packed_ptr;
+    args[3] = &shared_w_down_packed_ptr;
+    args[4] = &hidden_in_ptr;
+    args[5] = &indices_ptr;
+    args[6] = &scores_ptr;
+    args[7] = &routed_wscale_ptr;
+    args[8] = &shared_wscale_ptr;
+    args[9] = &output_ptr;
+    args[10] = &m_arg;
 
     cudaError_t launch_err = cudaLaunchKernel((void const*) kfn, grid, block, args, smem_bytes, stream);
     TORCH_CHECK(launch_err == cudaSuccess, "dv110 cudaLaunchKernel failed: ", cudaGetErrorString(launch_err));

@@ -31,6 +31,10 @@ from tensorrt_llm._torch.models.modeling_deepseekv3_mega_moe import (
     prepack_v68_routed_w3_w1_weight_pytorch,
     prepack_v68_shared_gate_up_weight,
     prepack_v68_shared_gate_up_weight_pytorch,
+    prepack_v110_routed_w2_weight,
+    prepack_v110_routed_w2_weight_pytorch,
+    prepack_v110_shared_down_weight,
+    prepack_v110_shared_down_weight_pytorch,
 )
 from tensorrt_llm._torch.modules.linear import FP8BlockScalesLinearMethod
 
@@ -40,6 +44,7 @@ _DEFAULT_DEBUG_OUTPUT_DIR = "~/dev/debug_output"
 _PHASE_ENV = "TRTLLM_DEEPSEEKV3_MEGAMOE_TEST_PHASE"
 _REF_USE_ORG_ENV = "TRTLLM_DEEPSEEKV3_MEGAMOE_REF_USE_SHARED_GATE_UP_WEIGHT_ORG"
 _PREPACK_V68_ENV = "TRTLLM_DEEPSEEKV3_MEGAMOE_TEST_PREPACK_V68"
+_PREPACK_V110_ENV = "TRTLLM_DEEPSEEKV3_MEGAMOE_TEST_PREPACK_V110"
 
 _NUM_RANKS = 8
 _DEFAULT_TOP_K = 8
@@ -52,6 +57,7 @@ _DEFAULT_PROFILE_ITERS = 100
 _ERROR_EPS = 1e-12
 _WIP_ABS_ERROR_THRESHOLD_SLACK = 1.35
 _DEFAULT_PREPACK_V68 = True
+_DEFAULT_PREPACK_V110 = False
 
 # Ideal target is zero WIP slack: abs_error <= reference_abs_threshold.
 # Current dumped GLM-5 baseline-vs-PyTorch max abs thresholds by rank are:
@@ -166,6 +172,10 @@ def _profile_iters() -> int:
 
 def _prepack_v68_enabled() -> bool:
     return _bool_env(_PREPACK_V68_ENV, _DEFAULT_PREPACK_V68)
+
+
+def _prepack_v110_enabled() -> bool:
+    return _bool_env(_PREPACK_V110_ENV, _DEFAULT_PREPACK_V110)
 
 
 def _baseline_tune_max_num_tokens(num_tokens: int) -> int:
@@ -392,6 +402,19 @@ def _ensure_v68_prepacked_tensors(tensors: dict[str, torch.Tensor]) -> None:
     torch.cuda.synchronize()
 
 
+def _ensure_v110_prepacked_tensors(tensors: dict[str, torch.Tensor]) -> None:
+    if "shared_down_weight_packed_v110" in tensors:
+        return
+
+    tensors["shared_down_weight_packed_v110"] = prepack_v110_shared_down_weight(
+        tensors["shared_down_weight_org"]
+    )
+    tensors["routed_w2_weight_packed_v110"] = prepack_v110_routed_w2_weight(
+        tensors["routed_w2_weight"]
+    )
+    torch.cuda.synchronize()
+
+
 @pytest.mark.parametrize("rank", range(_NUM_RANKS))
 def test_deepseekv3_mega_moe_v68_cute_weight_pack_matches_pytorch(rank: int) -> None:
     if not _phase_enabled("pack"):
@@ -421,23 +444,57 @@ def test_deepseekv3_mega_moe_v68_cute_weight_pack_matches_pytorch(rank: int) -> 
         assert torch.equal(actual_routed, expected_routed)
 
 
+@pytest.mark.parametrize("rank", range(_NUM_RANKS))
+def test_deepseekv3_mega_moe_v110_weight_pack_matches_pytorch(rank: int) -> None:
+    if not _phase_enabled("pack"):
+        pytest.skip(f"{_PHASE_ENV} disables v110 pack phase")
+    _require_cuda_and_ops(require_wip_ops=True)
+    group = _dump_group(rank)
+    tensors = _load_inputs(group, max_num_tokens=1)
+
+    with torch.inference_mode():
+        # shared_down_weight_org: torch.float8_e4m3fn, [H, I].
+        expected_shared = prepack_v110_shared_down_weight_pytorch(tensors["shared_down_weight_org"])
+        # actual_shared: torch.float8_e4m3fn, [444, I / 128, 2048].
+        actual_shared = prepack_v110_shared_down_weight(tensors["shared_down_weight_org"])
+        torch.cuda.synchronize()
+        assert torch.equal(actual_shared, expected_shared)
+
+        del actual_shared
+        del expected_shared
+
+        # routed_w2_weight: torch.float8_e4m3fn, [E, H, I].
+        expected_routed = prepack_v110_routed_w2_weight_pytorch(tensors["routed_w2_weight"])
+        # actual_routed: torch.float8_e4m3fn, [E, 444, I / 128, 2048].
+        actual_routed = prepack_v110_routed_w2_weight(tensors["routed_w2_weight"])
+        torch.cuda.synchronize()
+        assert torch.equal(actual_routed, expected_routed)
+
+
 def test_deepseekv3_mega_moe_prepack_wip_weight_init_path(monkeypatch: pytest.MonkeyPatch) -> None:
     if not _phase_enabled("pack"):
         pytest.skip(f"{_PHASE_ENV} disables v68 pack phase")
     _require_cute_dsl()
     monkeypatch.setenv("TRTLLM_DEEPSEEKV3_MEGAMOE_MODE", "wip")
+    monkeypatch.setenv("TRTLLM_DEEPSEEKV3_MEGAMOE_PREPACK_V110", "1")
     group = _dump_group(0)
     tensors = _load_inputs(group, max_num_tokens=1)
 
     shared_gate_up_proj = torch.nn.Module()
     shared_gate_up_proj.weight_org = tensors["shared_gate_up_weight_org"]
+    shared_down_proj = torch.nn.Module()
+    shared_down_proj.weight_org = tensors["shared_down_weight_org"]
     moe_backend = torch.nn.Module()
     moe_backend.w3_w1_weight = tensors["routed_w3_w1_weight"]
+    moe_backend.w2_weight = tensors["routed_w2_weight"]
 
     mega_moe = Deepseekv3MegaMoE.__new__(Deepseekv3MegaMoE)
     torch.nn.Module.__init__(mega_moe)
     mega_moe._old_moe = SimpleNamespace(
-        shared_experts=SimpleNamespace(gate_up_proj=shared_gate_up_proj),
+        shared_experts=SimpleNamespace(
+            gate_up_proj=shared_gate_up_proj,
+            down_proj=shared_down_proj,
+        ),
         experts=SimpleNamespace(backend=moe_backend),
     )
 
@@ -448,11 +505,17 @@ def test_deepseekv3_mega_moe_prepack_wip_weight_init_path(monkeypatch: pytest.Mo
         torch.cuda.synchronize()
 
     assert shared_gate_up_proj.weight_org is None
+    assert shared_down_proj.weight_org is None
     assert moe_backend.w3_w1_weight is None
+    assert moe_backend.w2_weight is None
     assert "weight_org_packed_v68" in shared_gate_up_proj._buffers
+    assert "weight_org_packed_v110" in shared_down_proj._buffers
     assert "w3_w1_weight_packed_v68" in moe_backend._buffers
+    assert "w2_weight_packed_v110" in moe_backend._buffers
     assert shared_gate_up_proj.weight_org_packed_v68.shape[0] == 2
     assert moe_backend.w3_w1_weight_packed_v68.shape[0] == tensors["routed_w3_w1_weight"].shape[0]
+    assert shared_down_proj.weight_org_packed_v110.shape[0] == 444
+    assert moe_backend.w2_weight_packed_v110.shape[0] == tensors["routed_w2_weight"].shape[0]
 
 
 def test_deepseekv3_mega_moe_wip_retains_linear_weight_org(
@@ -743,15 +806,26 @@ def _run_wip(tensors: dict[str, torch.Tensor], *, use_packed_v68: bool = False) 
     # expert_indices: torch.int32, [T, K].
     # expert_weights: torch.float32, [T, K].
     # slot_swiglu_output: torch.float16, [T, K + 1, I].
+    use_packed_v110 = _prepack_v110_enabled()
+    if use_packed_v110:
+        _ensure_v110_prepacked_tensors(tensors)
+    routed_w2_weight = (
+        tensors["routed_w2_weight_packed_v110"] if use_packed_v110 else tensors["routed_w2_weight"]
+    )
+    shared_down_weight = (
+        tensors["shared_down_weight_packed_v110"]
+        if use_packed_v110
+        else tensors["shared_down_weight_org"]
+    )
     output = torch.empty_like(tensors["hidden_states"])
     # output: torch.bfloat16, [T, H].
     return Deepseekv3MegaMoE._run_wip_down_project_chunked(
         slot_swiglu_output,
         expert_indices,
         expert_weights,
-        tensors["routed_w2_weight"],
+        routed_w2_weight,
         tensors["routed_w2_weight_scale"],
-        tensors["shared_down_weight_org"],
+        shared_down_weight,
         tensors["shared_down_weight_scale_org"],
         output,
     )
