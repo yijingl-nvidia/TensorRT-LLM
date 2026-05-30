@@ -1839,6 +1839,8 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
             else:
                 layer.next_layer_layernorm = self.model.layers[
                     idx + 1].input_layernorm
+            if isinstance(layer.mlp, Deepseekv3MegaMoE):
+                layer.mlp.prepack_wip_mega_kernel_weights()
 
 
 @register_auto_model("KimiK25ForConditionalGeneration")

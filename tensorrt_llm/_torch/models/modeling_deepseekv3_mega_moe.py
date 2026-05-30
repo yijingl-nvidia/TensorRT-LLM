@@ -21,6 +21,18 @@ _MEGA_MOE_DEBUG_DUMP_ENV = "TRTLLM_DEEPSEEKV3_MEGAMOE_DUMP_TENSORS"
 _MEGA_MOE_DEBUG_OUTPUT_DIR_ENV = "TRTLLM_DEEPSEEKV3_MEGAMOE_DEBUG_OUTPUT_DIR"
 _MEGA_MOE_DEBUG_DEFAULT_OUTPUT_DIR = "~/dev/debug_output"
 _TORCH_TENSOR_FILE_SUFFIX = "pt"
+_V68_HIDDEN_SIZE = 6144
+_V68_CTA_OUT_ROWS = 64
+_V68_M_TILES_PER_CTA = 4
+_V68_ROW_HALVES_PER_M_TILE = 2
+_V68_ROWS_PER_HALF = 8
+_V68_NUM_K_ITER = 8
+_V68_K_THIRDS_PER_ITER = 6
+_V68_K_SUBS_PER_THIRD = 4
+_V68_COL_HALVES_PER_K_SUB = 2
+_V68_COL_QUADS_PER_HALF = 4
+_V68_BYTES_PER_COL_QUAD = 4
+_V68_TILE_BYTES = 49152
 
 
 def _mega_moe_debug_dump_enabled() -> bool:
@@ -71,6 +83,117 @@ def check_data(tensor: torch.Tensor, name: str, dtype: torch.dtype, shape: tuple
             f"{name} dim {dim} must be {expected_dim}, got "
             f"{tensor.shape[dim]} for shape {tensor.shape}"
         )
+
+
+def _prepack_v68_weight_side_pytorch(weight: torch.Tensor) -> torch.Tensor:
+    # weight: torch.float8_e4m3fn, [..., I, H].
+    if weight.dtype != torch.float8_e4m3fn:
+        raise TypeError(f"v68 prepack expects float8_e4m3fn weights, got {weight.dtype}")
+    if weight.shape[-1] != _V68_HIDDEN_SIZE:
+        raise ValueError(
+            f"v68 prepack expects hidden size {_V68_HIDDEN_SIZE}, got {weight.shape[-1]}"
+        )
+    inter_per_tp = weight.shape[-2]
+    if inter_per_tp % _V68_CTA_OUT_ROWS != 0:
+        raise ValueError(
+            f"v68 prepack expects I to be divisible by {_V68_CTA_OUT_ROWS}, got {inter_per_tp}"
+        )
+
+    prefix_shape = tuple(weight.shape[:-2])
+    num_prefix_dims = len(prefix_shape)
+    sub_rows = inter_per_tp // _V68_CTA_OUT_ROWS
+
+    reshaped = weight.contiguous().reshape(
+        *prefix_shape,
+        sub_rows,
+        _V68_M_TILES_PER_CTA,
+        _V68_ROW_HALVES_PER_M_TILE,
+        _V68_ROWS_PER_HALF,
+        _V68_NUM_K_ITER,
+        _V68_K_THIRDS_PER_ITER,
+        _V68_K_SUBS_PER_THIRD,
+        _V68_COL_HALVES_PER_K_SUB,
+        _V68_COL_QUADS_PER_HALF,
+        _V68_BYTES_PER_COL_QUAD,
+    )
+    # Reorder the raw row-major [64, 768] tile into the exact 48 KiB K-major
+    # lane slab consumed by compute_mma_kiter_v68().
+    permute_order = (
+        *range(num_prefix_dims),
+        num_prefix_dims,
+        num_prefix_dims + 4,
+        num_prefix_dims + 5,
+        num_prefix_dims + 1,
+        num_prefix_dims + 6,
+        num_prefix_dims + 3,
+        num_prefix_dims + 8,
+        num_prefix_dims + 7,
+        num_prefix_dims + 2,
+        num_prefix_dims + 9,
+    )
+    return (
+        reshaped.permute(permute_order)
+        .contiguous()
+        .reshape(*prefix_shape, sub_rows, _V68_NUM_K_ITER, _V68_TILE_BYTES)
+    )
+
+
+def prepack_v68_shared_gate_up_weight_pytorch(weight: torch.Tensor) -> torch.Tensor:
+    # weight: torch.float8_e4m3fn, [2 * I, H], stored as [gate, up].
+    gate_weight, up_weight = weight.chunk(2, dim=0)
+    gate_packed = _prepack_v68_weight_side_pytorch(gate_weight)
+    up_packed = _prepack_v68_weight_side_pytorch(up_weight)
+    packed = torch.empty((2, *gate_packed.shape), device=weight.device, dtype=weight.dtype)
+    # packed: torch.float8_e4m3fn, [2, I / 64, 8, 49152], stored as [gate, up].
+    packed[0].copy_(gate_packed)
+    packed[1].copy_(up_packed)
+    return packed
+
+
+def prepack_v68_routed_w3_w1_weight_pytorch(weight: torch.Tensor) -> torch.Tensor:
+    # weight: torch.float8_e4m3fn, [E, 2 * I, H], stored as [up, gate].
+    up_weight, gate_weight = weight.chunk(2, dim=1)
+    gate_packed = _prepack_v68_weight_side_pytorch(gate_weight)
+    up_packed = _prepack_v68_weight_side_pytorch(up_weight)
+    packed = torch.empty(
+        (weight.shape[0], 2, *gate_packed.shape[1:]),
+        device=weight.device,
+        dtype=weight.dtype,
+    )
+    # packed: torch.float8_e4m3fn, [E, 2, I / 64, 8, 49152], stored as [gate, up].
+    packed[:, 0].copy_(gate_packed)
+    packed[:, 1].copy_(up_packed)
+    return packed
+
+
+def _should_use_cute_v68_weight_pack(weight: torch.Tensor) -> bool:
+    return weight.is_cuda and torch.cuda.is_available()
+
+
+def prepack_v68_shared_gate_up_weight(weight: torch.Tensor) -> torch.Tensor:
+    if _should_use_cute_v68_weight_pack(weight):
+        try:
+            from tensorrt_llm._torch.cute_dsl_kernels.blackwell import (
+                deepseekv3_mega_moe_weight_pack,
+            )
+
+            return deepseekv3_mega_moe_weight_pack.pack_v68_shared_gate_up_weight(weight)
+        except ImportError:
+            pass
+    return prepack_v68_shared_gate_up_weight_pytorch(weight)
+
+
+def prepack_v68_routed_w3_w1_weight(weight: torch.Tensor) -> torch.Tensor:
+    if _should_use_cute_v68_weight_pack(weight):
+        try:
+            from tensorrt_llm._torch.cute_dsl_kernels.blackwell import (
+                deepseekv3_mega_moe_weight_pack,
+            )
+
+            return deepseekv3_mega_moe_weight_pack.pack_v68_routed_w3_w1_weight(weight)
+        except ImportError:
+            pass
+    return prepack_v68_routed_w3_w1_weight_pytorch(weight)
 
 
 class Deepseekv3MegaMoE(nn.Module):
@@ -199,8 +322,12 @@ class Deepseekv3MegaMoE(nn.Module):
             "shared_gate_up_weight_scale": getattr(shared_gate_up_proj, "weight_scale", None),
             "shared_gate_up_weight_org": shared_gate_up_weight_org,
             "shared_gate_up_weight_scale_org": shared_gate_up_weight_scale_org,
+            "shared_gate_up_weight_packed_v68": getattr(
+                shared_gate_up_proj, "weight_org_packed_v68", None
+            ),
             "routed_w3_w1_weight": moe_backend.w3_w1_weight,
             "routed_w3_w1_weight_scaling_factor": moe_backend.w3_w1_weight_scaling_factor,
+            "routed_w3_w1_weight_packed_v68": getattr(moe_backend, "w3_w1_weight_packed_v68", None),
             "routed_w2_weight": moe_backend.w2_weight,
             "routed_w2_weight_scaling_factor": moe_backend.w2_weight_scaling_factor,
             "shared_down_weight": getattr(shared_down_proj, "weight", None),
@@ -211,6 +338,68 @@ class Deepseekv3MegaMoE(nn.Module):
         for tensor_name, tensor in tensors.items():
             if tensor is not None:
                 self._dump_tensor(tensor_name, tensor)
+
+    @staticmethod
+    def _set_nonpersistent_buffer(module: nn.Module, name: str, tensor: torch.Tensor) -> None:
+        if name in module._buffers:
+            module._buffers[name] = tensor
+        elif hasattr(module, name):
+            setattr(module, name, tensor)
+        else:
+            module.register_buffer(name, tensor, persistent=False)
+
+    @staticmethod
+    def _retain_linear_original_tensors(module: nn.Module, module_name: str) -> torch.Tensor:
+        weight_org = getattr(module, "weight_org", None)
+        if weight_org is None:
+            weight = getattr(module, "weight", None)
+            if not isinstance(weight, torch.Tensor):
+                raise RuntimeError(
+                    "TRTLLM_DEEPSEEKV3_MEGAMOE_MODE=wip_mega_kernel requires "
+                    f"{module_name}.weight or {module_name}.weight_org before v68 prepacking"
+                )
+            module.weight_org = weight.detach()
+            weight_org = module.weight_org
+
+        if getattr(module, "weight_scale_org", None) is None:
+            weight_scale = getattr(module, "weight_scale", None)
+            if isinstance(weight_scale, torch.Tensor):
+                module.weight_scale_org = weight_scale.detach()
+
+        return weight_org
+
+    def prepack_wip_mega_kernel_weights(self) -> None:
+        if self._mega_moe_mode() != self._MEGA_MOE_MODE_WIP:
+            return
+
+        old_moe = self._old_moe
+        shared_gate_up_proj = old_moe.shared_experts.gate_up_proj
+        moe_backend = old_moe.experts.backend
+
+        if getattr(shared_gate_up_proj, "weight_org_packed_v68", None) is None:
+            shared_gate_up_weight_org = self._retain_linear_original_tensors(
+                shared_gate_up_proj, "shared_experts.gate_up_proj"
+            )
+            self._set_nonpersistent_buffer(
+                shared_gate_up_proj,
+                "weight_org_packed_v68",
+                prepack_v68_shared_gate_up_weight(shared_gate_up_weight_org),
+            )
+            shared_gate_up_proj.weight_org = None
+
+        if getattr(moe_backend, "w3_w1_weight_packed_v68", None) is None:
+            routed_w3_w1_weight = moe_backend.w3_w1_weight
+            if routed_w3_w1_weight is None:
+                raise RuntimeError(
+                    "TRTLLM_DEEPSEEKV3_MEGAMOE_MODE=wip_mega_kernel requires "
+                    "moe_backend.w3_w1_weight before v68 prepacking"
+                )
+            self._set_nonpersistent_buffer(
+                moe_backend,
+                "w3_w1_weight_packed_v68",
+                prepack_v68_routed_w3_w1_weight(routed_w3_w1_weight),
+            )
+            moe_backend.w3_w1_weight = None
 
     def dump_mega_moe_activation_tensors(self, **tensors: torch.Tensor | None) -> None:
         """Dump selected activation tensors from the current MegaMoE forward."""
@@ -686,6 +875,107 @@ class Deepseekv3MegaMoE(nn.Module):
         )
 
     @classmethod
+    def _run_wip_packed_mega_kernel(
+        cls,
+        hidden_states: torch.Tensor,
+        router_weight: torch.Tensor,
+        routing_bias: torch.Tensor,
+        shared_gate_up_weight_packed_v68: torch.Tensor,
+        shared_gate_up_weight_scale_org: torch.Tensor,
+        routed_w3_w1_weight_packed_v68: torch.Tensor,
+        routed_w3_w1_weight_scale: torch.Tensor,
+        top_k: int,
+        n_group: int,
+        topk_group: int,
+        routed_scaling_factor: float,
+        shared_swiglu_limit: Optional[float],
+        routed_swiglu_limit: Optional[float],
+        activation_dump_callback: Callable[[str, torch.Tensor], None] | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # fp32, [num_tokens, num_router_experts]
+        router_logits = torch.ops.trtllm.dsv3_router_gemm_op(
+            hidden_states, router_weight.t(), bias=None, out_dtype=torch.float32
+        )
+        num_tokens = hidden_states.shape[0]
+        num_router_experts = 256
+        check_data(
+            router_logits,
+            "wip_packed_mega_kernels.router_logits",
+            torch.float32,
+            (num_tokens, num_router_experts),
+        )
+        if activation_dump_callback is not None:
+            activation_dump_callback("router_logits", router_logits)
+
+        assert top_k == 8, f"v68 WIP mega kernel only supports top_k=8, got {top_k}"
+        assert n_group == 1, f"v68 WIP mega kernel only supports n_group=1, got {n_group}"
+        assert topk_group == 1, f"v68 WIP mega kernel only supports topk_group=1, got {topk_group}"
+
+        expert_weights, expert_indices, slot_swiglu_output = (
+            torch.ops.trtllm.glm5_expert_select_up_gate_silu_packed(
+                router_logits.contiguous(),
+                hidden_states.contiguous(),
+                routing_bias.contiguous(),
+                shared_gate_up_weight_packed_v68,
+                shared_gate_up_weight_scale_org,
+                routed_w3_w1_weight_packed_v68,
+                routed_w3_w1_weight_scale,
+                routed_scaling_factor,
+            )
+        )
+        check_data(
+            expert_indices,
+            "wip_packed_mega_kernels.expert_indices",
+            torch.int32,
+            (num_tokens, top_k),
+        )
+        check_data(
+            expert_weights,
+            "wip_packed_mega_kernels.expert_weights",
+            torch.float32,
+            (num_tokens, top_k),
+        )
+        check_data(
+            slot_swiglu_output,
+            "wip_packed_mega_kernels.slot_swiglu_output",
+            torch.float16,
+            (num_tokens, top_k + 1, -1),
+        )
+        if activation_dump_callback is not None:
+            activation_dump_callback("expert_indices", expert_indices)
+            activation_dump_callback("expert_weights", expert_weights)
+            activation_dump_callback("slot_swiglu_output", slot_swiglu_output)
+
+        return expert_indices, expert_weights, slot_swiglu_output
+
+    @classmethod
+    def _run_wip_down_project_chunked(
+        cls,
+        slot_swiglu_output: torch.Tensor,
+        expert_indices: torch.Tensor,
+        expert_weights: torch.Tensor,
+        routed_w2_weight: torch.Tensor,
+        routed_w2_weight_scale: torch.Tensor,
+        shared_down_weight_org: torch.Tensor,
+        shared_down_weight_scale_org: torch.Tensor,
+        output_tensor: torch.Tensor,
+    ) -> torch.Tensor:
+        num_tokens = slot_swiglu_output.size(0)
+        for token_start in range(0, num_tokens, cls._WIP_DOWN_PROJECT_MAX_NUM_TOKENS):
+            token_end = min(token_start + cls._WIP_DOWN_PROJECT_MAX_NUM_TOKENS, num_tokens)
+            torch.ops.trtllm.glm5_expert_down_project(
+                slot_swiglu_output[token_start:token_end].contiguous(),
+                expert_indices[token_start:token_end].contiguous(),
+                expert_weights[token_start:token_end].contiguous(),
+                routed_w2_weight,
+                routed_w2_weight_scale,
+                shared_down_weight_org,
+                shared_down_weight_scale_org,
+                output_tensor[token_start:token_end],
+            )
+        return output_tensor
+
+    @classmethod
     def _routed_down_project_pytorch(
         cls,
         routed_swiglu_output: torch.Tensor,
@@ -1030,7 +1320,17 @@ class Deepseekv3MegaMoE(nn.Module):
         assert moe_backend.num_slots == num_router_experts
         assert moe_backend.hidden_size == hidden_size
         assert moe_backend.intermediate_size_per_partition == expert_intermediate_size
-        assert num_router_experts == moe_backend.w3_w1_weight.size(0)
+        self.prepack_wip_mega_kernel_weights()
+        shared_gate_up_weight_packed_v68 = getattr(
+            shared_gate_up_proj, "weight_org_packed_v68", None
+        )
+        routed_w3_w1_weight_packed_v68 = getattr(moe_backend, "w3_w1_weight_packed_v68", None)
+        if routed_w3_w1_weight_packed_v68 is None:
+            raise RuntimeError(
+                "TRTLLM_DEEPSEEKV3_MEGAMOE_MODE=wip_mega_kernel requires "
+                "moe_backend.w3_w1_weight_packed_v68"
+            )
+        assert num_router_experts == routed_w3_w1_weight_packed_v68.size(0)
 
         routing_params = moe_backend._extract_routing_params()
         routing_bias = routing_params.routing_bias
@@ -1057,24 +1357,17 @@ class Deepseekv3MegaMoE(nn.Module):
             torch.float8_e4m3fn,
             (gate_up_output_size, hidden_size),
         )
-        check_data(
-            shared_gate_up_proj.weight_scale,
-            "wip_mega_shared_gate_up_weight_scale",
-            torch.int32,
-            (gate_up_output_size, block_scale_int32_hidden_size),
-        )
-        shared_gate_up_weight_org = getattr(shared_gate_up_proj, "weight_org", None)
         shared_gate_up_weight_scale_org = getattr(shared_gate_up_proj, "weight_scale_org", None)
-        if shared_gate_up_weight_org is None or shared_gate_up_weight_scale_org is None:
+        if shared_gate_up_weight_packed_v68 is None or shared_gate_up_weight_scale_org is None:
             raise RuntimeError(
                 "TRTLLM_DEEPSEEKV3_MEGAMOE_MODE=wip_mega_kernel requires "
-                "shared_experts.gate_up_proj.weight_org and weight_scale_org to be retained"
+                "shared_experts.gate_up_proj.weight_org_packed_v68 and weight_scale_org"
             )
         check_data(
-            shared_gate_up_weight_org,
-            "wip_mega_shared_gate_up_weight_org",
+            shared_gate_up_weight_packed_v68,
+            "wip_mega_shared_gate_up_weight_packed_v68",
             torch.float8_e4m3fn,
-            (gate_up_output_size, hidden_size),
+            (2, expert_intermediate_size // _V68_CTA_OUT_ROWS, _V68_NUM_K_ITER, _V68_TILE_BYTES),
         )
         check_data(
             shared_gate_up_weight_scale_org,
@@ -1082,11 +1375,22 @@ class Deepseekv3MegaMoE(nn.Module):
             torch.float32,
             (2 * block_scale_fp32_expert_intermediate_size, block_scale_fp32_hidden_size),
         )
+        if routed_w3_w1_weight_packed_v68 is None:
+            raise RuntimeError(
+                "TRTLLM_DEEPSEEKV3_MEGAMOE_MODE=wip_mega_kernel requires "
+                "moe_backend.w3_w1_weight_packed_v68"
+            )
         check_data(
-            moe_backend.w3_w1_weight,
-            "wip_mega_routed_w3_w1_weight",
+            routed_w3_w1_weight_packed_v68,
+            "wip_mega_routed_w3_w1_weight_packed_v68",
             torch.float8_e4m3fn,
-            (num_router_experts, 2 * expert_intermediate_size, hidden_size),
+            (
+                num_router_experts,
+                2,
+                expert_intermediate_size // _V68_CTA_OUT_ROWS,
+                _V68_NUM_K_ITER,
+                _V68_TILE_BYTES,
+            ),
         )
         check_data(
             moe_backend.w3_w1_weight_scaling_factor,
@@ -1138,13 +1442,13 @@ class Deepseekv3MegaMoE(nn.Module):
             expert_indices,
             expert_weights,
             slot_swiglu_output,
-        ) = self._run_wip_mega_kernel(
+        ) = self._run_wip_packed_mega_kernel(
             hidden_states,
             old_moe.gate.weight,
             routing_bias,
-            shared_gate_up_weight_org,
+            shared_gate_up_weight_packed_v68,
             shared_gate_up_weight_scale_org,
-            moe_backend.w3_w1_weight,
+            routed_w3_w1_weight_packed_v68,
             moe_backend.w3_w1_weight_scaling_factor,
             routing_params.top_k,
             routing_params.n_group,
@@ -1189,50 +1493,16 @@ class Deepseekv3MegaMoE(nn.Module):
         if output_tensor is None:
             output_tensor = torch.empty_like(hidden_states)
 
-        if num_tokens > self._WIP_DOWN_PROJECT_MAX_NUM_TOKENS:
-            # v110 down-project is decode-specialized for M <= 4. Larger prefill
-            # and KV-profile shapes use the PyTorch reference down-project path.
-            shared_output = self._shared_down_project_pytorch(
-                slot_swiglu_output[:, 0, :],
-                shared_down_weight_org,
-                shared_down_weight_scale_org,
-                torch.float32,
-            )
-            check_data(
-                shared_output,
-                "wip_mega_pytorch_down_shared_output",
-                torch.float32,
-                tuple(hidden_states.shape),
-            )
-            routed_output = self._routed_down_project_pytorch(
-                slot_swiglu_output[:, 1:, :],
-                expert_indices,
-                expert_weights,
-                moe_backend.w2_weight,
-                moe_backend.w2_weight_scaling_factor,
-                torch.float32,
-            )
-            check_data(
-                routed_output,
-                "wip_mega_pytorch_down_routed_output",
-                torch.float32,
-                tuple(hidden_states.shape),
-            )
-            final_hidden_states = (shared_output + routed_output).to(hidden_states.dtype)
-            if output_tensor is not None:
-                output_tensor.copy_(final_hidden_states)
-                final_hidden_states = output_tensor
-        else:
-            final_hidden_states = torch.ops.trtllm.glm5_expert_down_project(
-                slot_swiglu_output.contiguous(),
-                expert_indices.contiguous(),
-                expert_weights.contiguous(),
-                moe_backend.w2_weight,
-                moe_backend.w2_weight_scaling_factor,
-                shared_down_weight_org,
-                shared_down_weight_scale_org,
-                output_tensor,
-            )
+        final_hidden_states = self._run_wip_down_project_chunked(
+            slot_swiglu_output,
+            expert_indices,
+            expert_weights,
+            moe_backend.w2_weight,
+            moe_backend.w2_weight_scaling_factor,
+            shared_down_weight_org,
+            shared_down_weight_scale_org,
+            output_tensor,
+        )
         check_data(
             final_hidden_states,
             "wip_mega_final_hidden_states",
@@ -1264,9 +1534,12 @@ class Deepseekv3MegaMoE(nn.Module):
         )
 
         num_tokens: int = hidden_states.size(0)
-        if num_tokens > self._WIP_DOWN_PROJECT_MAX_NUM_TOKENS:
-            # The WIP down-project kernel is decode-specialized for M <= 4.
-            # Use the production MoE path for prefill and profiling shapes.
+        mega_moe_mode = self._mega_moe_mode()
+        if num_tokens > self._WIP_DOWN_PROJECT_MAX_NUM_TOKENS and (
+            mega_moe_mode == self._MEGA_MOE_MODE_BASELINE
+        ):
+            # Keep baseline prefill/KV-profile shapes on the production MoE
+            # path. WIP handles M > 4 by chunking the v110 down-project kernel.
             return old_moe(
                 hidden_states,
                 hidden_states_fp4,
@@ -1274,8 +1547,6 @@ class Deepseekv3MegaMoE(nn.Module):
                 final_all_reduce_params=final_all_reduce_params,
                 do_finalize=do_finalize,
             )
-
-        mega_moe_mode = self._mega_moe_mode()
 
         # Direct Blackwell DeepGEMM replacement for shared_experts.gate_up_proj.
         # ========= Shared experts gate_up_proj  =========

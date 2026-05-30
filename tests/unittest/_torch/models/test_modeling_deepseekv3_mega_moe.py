@@ -19,12 +19,20 @@ import statistics
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Callable
 
 import pytest
 import torch
 
-from tensorrt_llm._torch.models.modeling_deepseekv3_mega_moe import Deepseekv3MegaMoE
+from tensorrt_llm._torch.models.modeling_deepseekv3_mega_moe import (
+    Deepseekv3MegaMoE,
+    prepack_v68_routed_w3_w1_weight,
+    prepack_v68_routed_w3_w1_weight_pytorch,
+    prepack_v68_shared_gate_up_weight,
+    prepack_v68_shared_gate_up_weight_pytorch,
+)
+from tensorrt_llm._torch.modules.linear import FP8BlockScalesLinearMethod
 
 _DEBUG_OUTPUT_DIR_ENV = "TRTLLM_DEEPSEEKV3_MEGAMOE_TEST_DEBUG_OUTPUT_DIR"
 _RUNTIME_DEBUG_OUTPUT_DIR_ENV = "TRTLLM_DEEPSEEKV3_MEGAMOE_DEBUG_OUTPUT_DIR"
@@ -44,19 +52,6 @@ _DEFAULT_PROFILE_ITERS = 100
 _ERROR_EPS = 1e-12
 _WIP_ABS_ERROR_THRESHOLD_SLACK = 1.35
 _DEFAULT_PREPACK_V68 = True
-
-_V68_HIDDEN_SIZE = 6144
-_V68_CTA_OUT_ROWS = 64
-_V68_M_TILES_PER_CTA = 4
-_V68_ROW_HALVES_PER_M_TILE = 2
-_V68_ROWS_PER_HALF = 8
-_V68_NUM_K_ITER = 8
-_V68_K_THIRDS_PER_ITER = 6
-_V68_K_SUBS_PER_THIRD = 4
-_V68_COL_HALVES_PER_K_SUB = 2
-_V68_COL_QUADS_PER_HALF = 4
-_V68_BYTES_PER_COL_QUAD = 4
-_V68_TILE_BYTES = 49152
 
 # Ideal target is zero WIP slack: abs_error <= reference_abs_threshold.
 # Current dumped GLM-5 baseline-vs-PyTorch max abs thresholds by rank are:
@@ -98,7 +93,7 @@ def _phase_enabled(phase: str) -> bool:
     }
     selected_phase = phase_aliases.get(selected_phase, selected_phase)
     if selected_phase == "both":
-        return phase in ("reference", "test")
+        return phase in ("reference", "test", "pack")
     return selected_phase in ("all", phase)
 
 
@@ -318,6 +313,15 @@ def _require_cuda_and_ops(
         pytest.skip(f"missing torch.ops.trtllm ops: {missing_ops}")
 
 
+def _require_cute_dsl() -> None:
+    from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
+
+    if not torch.cuda.is_available():
+        pytest.skip("Deepseekv3MegaMoE CuTe DSL packing tests require CUDA")
+    if not IS_CUTLASS_DSL_AVAILABLE:
+        pytest.skip("CUTLASS DSL is not available")
+
+
 def _load_inputs(
     group: MegaMoeDumpGroup, max_num_tokens: int | None = None
 ) -> dict[str, torch.Tensor]:
@@ -375,102 +379,151 @@ def _load_inputs(
     }
 
 
-def _prepack_v68_weight_side(weight: torch.Tensor) -> torch.Tensor:
-    # weight: torch.float8_e4m3fn, [..., I, H].
-    if weight.dtype != torch.float8_e4m3fn:
-        raise TypeError(f"v68 prepack expects float8_e4m3fn weights, got {weight.dtype}")
-    if weight.shape[-1] != _V68_HIDDEN_SIZE:
-        raise ValueError(
-            f"v68 prepack expects hidden size {_V68_HIDDEN_SIZE}, got {weight.shape[-1]}"
-        )
-    inter_per_tp = weight.shape[-2]
-    if inter_per_tp % _V68_CTA_OUT_ROWS != 0:
-        raise ValueError(
-            f"v68 prepack expects I to be divisible by {_V68_CTA_OUT_ROWS}, got {inter_per_tp}"
-        )
-
-    prefix_shape = tuple(weight.shape[:-2])
-    num_prefix_dims = len(prefix_shape)
-    sub_rows = inter_per_tp // _V68_CTA_OUT_ROWS
-
-    reshaped = weight.contiguous().reshape(
-        *prefix_shape,
-        sub_rows,
-        _V68_M_TILES_PER_CTA,
-        _V68_ROW_HALVES_PER_M_TILE,
-        _V68_ROWS_PER_HALF,
-        _V68_NUM_K_ITER,
-        _V68_K_THIRDS_PER_ITER,
-        _V68_K_SUBS_PER_THIRD,
-        _V68_COL_HALVES_PER_K_SUB,
-        _V68_COL_QUADS_PER_HALF,
-        _V68_BYTES_PER_COL_QUAD,
-    )
-    # Reorder the raw row-major [64, 768] tile into the exact 48 KiB K-major
-    # lane slab consumed by compute_mma_kiter_v68().
-    permute_order = (
-        *range(num_prefix_dims),
-        num_prefix_dims,
-        num_prefix_dims + 4,
-        num_prefix_dims + 5,
-        num_prefix_dims + 1,
-        num_prefix_dims + 6,
-        num_prefix_dims + 3,
-        num_prefix_dims + 8,
-        num_prefix_dims + 7,
-        num_prefix_dims + 2,
-        num_prefix_dims + 9,
-    )
-    return (
-        reshaped.permute(permute_order)
-        .contiguous()
-        .reshape(*prefix_shape, sub_rows, _V68_NUM_K_ITER, _V68_TILE_BYTES)
-    )
-
-
-def _prepack_v68_shared_gate_up_weight(weight: torch.Tensor) -> torch.Tensor:
-    # weight: torch.float8_e4m3fn, [2 * I, H], stored as [gate, up].
-    gate_weight, up_weight = weight.chunk(2, dim=0)
-    gate_packed = _prepack_v68_weight_side(gate_weight)
-    up_packed = _prepack_v68_weight_side(up_weight)
-    packed = torch.empty(
-        (2, *gate_packed.shape),
-        device=weight.device,
-        dtype=weight.dtype,
-    )
-    # packed: torch.float8_e4m3fn, [2, I / 64, 8, 49152], stored as [gate, up].
-    packed[0].copy_(gate_packed)
-    packed[1].copy_(up_packed)
-    return packed
-
-
-def _prepack_v68_routed_w3_w1_weight(weight: torch.Tensor) -> torch.Tensor:
-    # weight: torch.float8_e4m3fn, [E, 2 * I, H], stored as [up, gate].
-    up_weight, gate_weight = weight.chunk(2, dim=1)
-    gate_packed = _prepack_v68_weight_side(gate_weight)
-    up_packed = _prepack_v68_weight_side(up_weight)
-    packed = torch.empty(
-        (weight.shape[0], 2, *gate_packed.shape[1:]),
-        device=weight.device,
-        dtype=weight.dtype,
-    )
-    # packed: torch.float8_e4m3fn, [E, 2, I / 64, 8, 49152], stored as [gate, up].
-    packed[:, 0].copy_(gate_packed)
-    packed[:, 1].copy_(up_packed)
-    return packed
-
-
 def _ensure_v68_prepacked_tensors(tensors: dict[str, torch.Tensor]) -> None:
     if "shared_gate_up_weight_packed_v68" in tensors:
         return
 
-    tensors["shared_gate_up_weight_packed_v68"] = _prepack_v68_shared_gate_up_weight(
+    tensors["shared_gate_up_weight_packed_v68"] = prepack_v68_shared_gate_up_weight(
         tensors["shared_gate_up_weight_org"]
     )
-    tensors["routed_w3_w1_weight_packed_v68"] = _prepack_v68_routed_w3_w1_weight(
+    tensors["routed_w3_w1_weight_packed_v68"] = prepack_v68_routed_w3_w1_weight(
         tensors["routed_w3_w1_weight"]
     )
     torch.cuda.synchronize()
+
+
+@pytest.mark.parametrize("rank", range(_NUM_RANKS))
+def test_deepseekv3_mega_moe_v68_cute_weight_pack_matches_pytorch(rank: int) -> None:
+    if not _phase_enabled("pack"):
+        pytest.skip(f"{_PHASE_ENV} disables v68 pack phase")
+    _require_cute_dsl()
+    group = _dump_group(rank)
+    tensors = _load_inputs(group, max_num_tokens=1)
+
+    with torch.inference_mode():
+        # shared_gate_up_weight_org: torch.float8_e4m3fn, [2 * I, H], stored as [gate, up].
+        expected_shared = prepack_v68_shared_gate_up_weight_pytorch(
+            tensors["shared_gate_up_weight_org"]
+        )
+        # actual_shared: torch.float8_e4m3fn, [2, I / 64, 8, 49152], stored as [gate, up].
+        actual_shared = prepack_v68_shared_gate_up_weight(tensors["shared_gate_up_weight_org"])
+        torch.cuda.synchronize()
+        assert torch.equal(actual_shared, expected_shared)
+
+        del actual_shared
+        del expected_shared
+
+        # routed_w3_w1_weight: torch.float8_e4m3fn, [E, 2 * I, H], stored as [up, gate].
+        expected_routed = prepack_v68_routed_w3_w1_weight_pytorch(tensors["routed_w3_w1_weight"])
+        # actual_routed: torch.float8_e4m3fn, [E, 2, I / 64, 8, 49152], stored as [gate, up].
+        actual_routed = prepack_v68_routed_w3_w1_weight(tensors["routed_w3_w1_weight"])
+        torch.cuda.synchronize()
+        assert torch.equal(actual_routed, expected_routed)
+
+
+def test_deepseekv3_mega_moe_prepack_wip_weight_init_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    if not _phase_enabled("pack"):
+        pytest.skip(f"{_PHASE_ENV} disables v68 pack phase")
+    _require_cute_dsl()
+    monkeypatch.setenv("TRTLLM_DEEPSEEKV3_MEGAMOE_MODE", "wip")
+    group = _dump_group(0)
+    tensors = _load_inputs(group, max_num_tokens=1)
+
+    shared_gate_up_proj = torch.nn.Module()
+    shared_gate_up_proj.weight_org = tensors["shared_gate_up_weight_org"]
+    moe_backend = torch.nn.Module()
+    moe_backend.w3_w1_weight = tensors["routed_w3_w1_weight"]
+
+    mega_moe = Deepseekv3MegaMoE.__new__(Deepseekv3MegaMoE)
+    torch.nn.Module.__init__(mega_moe)
+    mega_moe._old_moe = SimpleNamespace(
+        shared_experts=SimpleNamespace(gate_up_proj=shared_gate_up_proj),
+        experts=SimpleNamespace(backend=moe_backend),
+    )
+
+    with torch.inference_mode():
+        mega_moe.prepack_wip_mega_kernel_weights()
+        torch.cuda.synchronize()
+        mega_moe.prepack_wip_mega_kernel_weights()
+        torch.cuda.synchronize()
+
+    assert shared_gate_up_proj.weight_org is None
+    assert moe_backend.w3_w1_weight is None
+    assert "weight_org_packed_v68" in shared_gate_up_proj._buffers
+    assert "w3_w1_weight_packed_v68" in moe_backend._buffers
+    assert shared_gate_up_proj.weight_org_packed_v68.shape[0] == 2
+    assert moe_backend.w3_w1_weight_packed_v68.shape[0] == tensors["routed_w3_w1_weight"].shape[0]
+
+
+def test_deepseekv3_mega_moe_wip_retains_linear_weight_org(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not _phase_enabled("pack"):
+        pytest.skip(f"{_PHASE_ENV} disables v68 pack phase")
+    monkeypatch.setenv("TRTLLM_DEEPSEEKV3_MEGAMOE_MODE", "wip")
+
+    module = torch.nn.Module()
+    module.weight = torch.nn.Parameter(
+        torch.empty((128, 128), dtype=torch.float8_e4m3fn), requires_grad=False
+    )
+    module.weight_scale = torch.nn.Parameter(
+        torch.empty((1, 1), dtype=torch.float32), requires_grad=False
+    )
+    module.retain_pre_deep_gemm_weight = True
+    module.use_cute_dsl_blockscaling_mm = False
+    module.disable_deep_gemm = False
+
+    FP8BlockScalesLinearMethod().post_load_weights(module)
+
+    assert module.weight_org.data_ptr() == module.weight.data_ptr()
+    assert module.weight_scale_org.data_ptr() == module.weight_scale.data_ptr()
+    assert module.weight_scale.dtype == torch.float32
+
+
+def test_deepseekv3_mega_moe_wip_down_project_chunked_matches_per_chunk() -> None:
+    if not _phase_enabled("test"):
+        pytest.skip(f"{_PHASE_ENV} disables test phase")
+    _require_cuda_and_ops(require_wip_ops=True)
+    group = _dump_group(0)
+    tensors = _load_inputs(group, max_num_tokens=_max_wip_num_tokens())
+
+    with torch.inference_mode():
+        _ensure_v68_prepacked_tensors(tensors)
+        expert_indices, expert_weights, slot_swiglu_output = _run_wip_select_packed_v68(tensors)
+        output = torch.empty_like(tensors["hidden_states"])
+        expected_chunk = torch.ops.trtllm.glm5_expert_down_project(
+            slot_swiglu_output.contiguous(),
+            expert_indices.contiguous(),
+            expert_weights.contiguous(),
+            tensors["routed_w2_weight"],
+            tensors["routed_w2_weight_scale"],
+            tensors["shared_down_weight_org"],
+            tensors["shared_down_weight_scale_org"],
+            output,
+        )
+
+        doubled_slot_swiglu_output = torch.cat([slot_swiglu_output, slot_swiglu_output], dim=0)
+        doubled_expert_indices = torch.cat([expert_indices, expert_indices], dim=0)
+        doubled_expert_weights = torch.cat([expert_weights, expert_weights], dim=0)
+        doubled_output = torch.empty(
+            (doubled_slot_swiglu_output.size(0), tensors["hidden_states"].size(1)),
+            dtype=tensors["hidden_states"].dtype,
+            device=tensors["hidden_states"].device,
+        )
+        actual = Deepseekv3MegaMoE._run_wip_down_project_chunked(
+            doubled_slot_swiglu_output,
+            doubled_expert_indices,
+            doubled_expert_weights,
+            tensors["routed_w2_weight"],
+            tensors["routed_w2_weight_scale"],
+            tensors["shared_down_weight_org"],
+            tensors["shared_down_weight_scale_org"],
+            doubled_output,
+        )
+        torch.cuda.synchronize()
+
+    expected = torch.cat([expected_chunk, expected_chunk], dim=0)
+    assert torch.equal(actual, expected)
 
 
 def _shared_down_project(
@@ -692,10 +745,10 @@ def _run_wip(tensors: dict[str, torch.Tensor], *, use_packed_v68: bool = False) 
     # slot_swiglu_output: torch.float16, [T, K + 1, I].
     output = torch.empty_like(tensors["hidden_states"])
     # output: torch.bfloat16, [T, H].
-    return torch.ops.trtllm.glm5_expert_down_project(
-        slot_swiglu_output.contiguous(),
-        expert_indices.contiguous(),
-        expert_weights.contiguous(),
+    return Deepseekv3MegaMoE._run_wip_down_project_chunked(
+        slot_swiglu_output,
+        expert_indices,
+        expert_weights,
         tensors["routed_w2_weight"],
         tensors["routed_w2_weight_scale"],
         tensors["shared_down_weight_org"],
