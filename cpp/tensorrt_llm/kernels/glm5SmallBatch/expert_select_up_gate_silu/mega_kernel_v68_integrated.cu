@@ -211,6 +211,10 @@ constexpr int kNumUpWorkers = 4;
 constexpr int kTileBytes = kCtaOutRows * kKTile; // 49152 (48 KiB)
 
 constexpr int kStages = 1;
+constexpr int kPackedStagesSingle = 1;
+// The packed path can afford a second weight stage because this kernel runs one CTA per SM.
+constexpr int kPackedStagesDouble = 2;
+constexpr int kPackedStagesDefault = kPackedStagesDouble;
 
 constexpr float kInvalidScore = -INFINITY;
 constexpr float kFp8Max = 448.f;
@@ -533,7 +537,7 @@ __device__ __forceinline__ void quant_act_blocks_v68(cg::thread_block_tile<kWarp
 #define V68_LB_BLOCKS_PER_SM 1
 #endif
 
-template <int kInterPerTpParam, bool kUsePackedWeights>
+template <int kInterPerTpParam, bool kUsePackedWeights, int kPackedWeightStagesParam = kPackedStagesDefault>
 __global__ __launch_bounds__(384, V68_LB_BLOCKS_PER_SM) void mega_kernel_v68(float const* __restrict__ scores,
     __nv_bfloat16 const* __restrict__ hidden_in, __nv_bfloat16 const* __restrict__ bias,
     __nv_fp8_e4m3 const* __restrict__ shared_gate_up_weight, float const* __restrict__ shared_gate_up_scale,
@@ -547,6 +551,9 @@ __global__ __launch_bounds__(384, V68_LB_BLOCKS_PER_SM) void mega_kernel_v68(flo
 
     constexpr int kInterPerTp = kInterPerTpParam;
     constexpr int kSubRowsPerExpert = sub_rows_per_expert(kInterPerTp);
+    static_assert(kPackedWeightStagesParam == kPackedStagesSingle || kPackedWeightStagesParam == kPackedStagesDouble);
+    constexpr int kWeightStages = kUsePackedWeights ? kPackedWeightStagesParam : kStages;
+    constexpr bool kDoubleBufferedWeights = kUsePackedWeights && (kWeightStages == kPackedStagesDouble);
 
     int const token = blockIdx.x;
     int const cta_y = blockIdx.y;
@@ -561,9 +568,9 @@ __global__ __launch_bounds__(384, V68_LB_BLOCKS_PER_SM) void mega_kernel_v68(flo
     extern __shared__ __align__(128) unsigned char smem_buf[];
 
     __nv_fp8_e4m3* const smem_gate_tiles = reinterpret_cast<__nv_fp8_e4m3*>(smem_buf);
-    __nv_fp8_e4m3* const smem_up_tiles = smem_gate_tiles + kStages * kTileBytes;
+    __nv_fp8_e4m3* const smem_up_tiles = smem_gate_tiles + kWeightStages * kTileBytes;
 
-    __nv_bfloat16* const smem_act_bf16 = reinterpret_cast<__nv_bfloat16*>(smem_up_tiles + kStages * kTileBytes);
+    __nv_bfloat16* const smem_act_bf16 = reinterpret_cast<__nv_bfloat16*>(smem_up_tiles + kWeightStages * kTileBytes);
     // In-kernel per-128-col act quant writes fp8 to a SEPARATE buffer
     // (not aliased over bf16) so multiple warps can read bf16 / write fp8
     // in parallel without aliasing races. Costs 6 KiB.
@@ -723,10 +730,39 @@ __global__ __launch_bounds__(384, V68_LB_BLOCKS_PER_SM) void mega_kernel_v68(flo
     float d_gate[4] = {0.f, 0.f, 0.f, 0.f};
     float d_up[4] = {0.f, 0.f, 0.f, 0.f};
 
+    if constexpr (kDoubleBufferedWeights)
+    {
+        // Prime stage 0 before entering the loop; later iterations preload the next K tile into the other stage.
+        load_packed_weight_tile_v68<kInterPerTpParam, true>(
+            smem_gate_tiles, shared_gate_up_weight, routed_w3_w1_weight, my_expert, sub_row, 0, tidx);
+        load_packed_weight_tile_v68<kInterPerTpParam, false>(
+            smem_up_tiles, shared_gate_up_weight, routed_w3_w1_weight, my_expert, sub_row, 0, tidx);
+        asm volatile("cp.async.commit_group;\n" :::);
+        asm volatile("cp.async.wait_all;\n" :::);
+        __syncthreads();
+    }
+
     // ---- v68 K-LOOP - per-K-BLOCK scaling (6 scales per K-iter, applied
     //      block-wise inside the inner MMA loop). ----
     for (int k = 0; k < kNumKIter; ++k)
     {
+        int constexpr kRawStage = 0;
+        int const current_stage = kDoubleBufferedWeights ? (k & 1) : kRawStage;
+
+        if constexpr (kDoubleBufferedWeights)
+        {
+            if (k + 1 < kNumKIter)
+            {
+                int const preload_stage = (k + 1) & 1;
+                // Keep this prefetch ahead of MMA so cp.async latency overlaps with the current K tile.
+                load_packed_weight_tile_v68<kInterPerTpParam, true>(smem_gate_tiles + preload_stage * kTileBytes,
+                    shared_gate_up_weight, routed_w3_w1_weight, my_expert, sub_row, k + 1, tidx);
+                load_packed_weight_tile_v68<kInterPerTpParam, false>(smem_up_tiles + preload_stage * kTileBytes,
+                    shared_gate_up_weight, routed_w3_w1_weight, my_expert, sub_row, k + 1, tidx);
+                asm volatile("cp.async.commit_group;\n" :::);
+            }
+        }
+
         // Per-K-iter, per-K-block scale load: 6 fp32 weight scales per K-iter.
         // Also load the corresponding 6 per-128-col activation dequant scales
         // (produced by the in-kernel 1x128 quant during Phase 1) so the
@@ -787,7 +823,7 @@ __global__ __launch_bounds__(384, V68_LB_BLOCKS_PER_SM) void mega_kernel_v68(flo
             }
         }
 
-        if constexpr (kUsePackedWeights)
+        if constexpr (kUsePackedWeights && !kDoubleBufferedWeights)
         {
             load_packed_weight_tile_v68<kInterPerTpParam, true>(
                 smem_gate_tiles, shared_gate_up_weight, routed_w3_w1_weight, my_expert, sub_row, k, tidx);
@@ -795,25 +831,33 @@ __global__ __launch_bounds__(384, V68_LB_BLOCKS_PER_SM) void mega_kernel_v68(flo
                 smem_up_tiles, shared_gate_up_weight, routed_w3_w1_weight, my_expert, sub_row, k, tidx);
             asm volatile("cp.async.commit_group;\n" :::);
             asm volatile("cp.async.wait_all;\n" :::);
+            __syncthreads();
         }
-        else
+        else if constexpr (!kUsePackedWeights)
         {
             load_raw_weight_tile_v68<kInterPerTpParam, true>(
                 smem_gate_tiles, shared_gate_up_weight, routed_w3_w1_weight, my_expert, sub_row, k, tidx);
             load_raw_weight_tile_v68<kInterPerTpParam, false>(
                 smem_up_tiles, shared_gate_up_weight, routed_w3_w1_weight, my_expert, sub_row, k, tidx);
+            __syncthreads();
         }
-        __syncthreads();
 
         if (is_gate_worker)
         {
-            compute_mma_kiter_v68(
-                smem_gate_tiles, smem_act_fp8, k, my_m_gate, lane, gate_block_scales, act_block_scales, d_gate);
+            compute_mma_kiter_v68(smem_gate_tiles + current_stage * kTileBytes, smem_act_fp8, k, my_m_gate, lane,
+                gate_block_scales, act_block_scales, d_gate);
         }
         if (is_up_worker)
         {
-            compute_mma_kiter_v68(
-                smem_up_tiles, smem_act_fp8, k, my_m_up, lane, up_block_scales, act_block_scales, d_up);
+            compute_mma_kiter_v68(smem_up_tiles + current_stage * kTileBytes, smem_act_fp8, k, my_m_up, lane,
+                up_block_scales, act_block_scales, d_up);
+        }
+        if constexpr (kDoubleBufferedWeights)
+        {
+            if (k + 1 < kNumKIter)
+            {
+                asm volatile("cp.async.wait_all;\n" :::);
+            }
         }
         __syncthreads();
     }
@@ -881,12 +925,14 @@ __global__ __launch_bounds__(384, V68_LB_BLOCKS_PER_SM) void mega_kernel_v68(flo
 }
 
 // Dynamic smem sizing.
+template <bool kUsePackedWeights, int kPackedWeightStagesParam = kPackedStagesDefault>
 static inline size_t v68_smem_bytes()
 {
     auto align_up_128 = [](size_t p) -> size_t { return (p + 127u) & ~size_t(127); };
+    constexpr int kWeightStages = kUsePackedWeights ? kPackedWeightStagesParam : kStages;
     size_t bytes = 0;
-    bytes += static_cast<size_t>(kStages) * kTileBytes;
-    bytes += static_cast<size_t>(kStages) * kTileBytes;
+    bytes += static_cast<size_t>(kWeightStages) * kTileBytes;
+    bytes += static_cast<size_t>(kWeightStages) * kTileBytes;
     bytes += static_cast<size_t>(kHidden) * sizeof(__nv_bfloat16);
     // Separate fp8 act buffer (no longer aliased over bf16). +6 KiB.
     bytes += static_cast<size_t>(kHidden) * sizeof(__nv_fp8_e4m3);
@@ -912,7 +958,21 @@ static inline size_t v68_smem_bytes()
     return bytes;
 }
 
-template <int kInterPerTpParam, bool kUsePackedWeights>
+static int v68_packed_weight_stages()
+{
+    char const* const env = std::getenv("TRTLLM_DEEPSEEKV3_MEGAMOE_V68_PACKED_STAGES");
+    if (env == nullptr || env[0] == '\0')
+    {
+        return kPackedStagesDefault;
+    }
+
+    int const stages = std::atoi(env);
+    TORCH_CHECK(stages == kPackedStagesSingle || stages == kPackedStagesDouble,
+        "TRTLLM_DEEPSEEKV3_MEGAMOE_V68_PACKED_STAGES must be 1 or 2, got: ", env);
+    return stages;
+}
+
+template <int kInterPerTpParam, bool kUsePackedWeights, int kPackedWeightStagesParam = kPackedStagesDefault>
 static std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> mega_silu_v68_impl(torch::Tensor scores,
     torch::Tensor hidden_in, torch::Tensor bias, torch::Tensor shared_gate_up_weight,
     torch::Tensor shared_gate_up_scale, torch::Tensor routed_w3_w1_weight, torch::Tensor routed_w3_w1_scale,
@@ -922,6 +982,8 @@ static std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> mega_silu_v68_imp
     constexpr int kSubRowsPerExpert = sub_rows_per_expert(kInterPerTp);
     constexpr int kCtasPerToken = ctas_per_token(kInterPerTp);
     constexpr int kWeightScaleMBlocks = weight_scale_m_blocks(kInterPerTp);
+    static_assert(kPackedWeightStagesParam == kPackedStagesSingle || kPackedWeightStagesParam == kPackedStagesDouble);
+    constexpr int kWeightStages = kUsePackedWeights ? kPackedWeightStagesParam : kStages;
 
     auto const M = scores.size(0);
 
@@ -960,7 +1022,7 @@ static std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> mega_silu_v68_imp
         printf(
             "[v68_integrated] kKTile=%d, kStages=%d, LB(384,%d), "
             "kInterPerTp=%d (%s weights)\n",
-            kKTile, kStages, V68_LB_BLOCKS_PER_SM, kInterPerTp, kUsePackedWeights ? "packed" : "raw");
+            kKTile, kWeightStages, V68_LB_BLOCKS_PER_SM, kInterPerTp, kUsePackedWeights ? "packed" : "raw");
         s_logged = true;
     }
 
@@ -974,19 +1036,20 @@ static std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> mega_silu_v68_imp
     dim3 grid(static_cast<unsigned>(M), kCtasPerToken, 1);
     dim3 block(kThreadsPerCta, 1, 1);
 
-    size_t const smem_bytes = v68_smem_bytes();
+    size_t const smem_bytes = v68_smem_bytes<kUsePackedWeights, kPackedWeightStagesParam>();
 
     static bool s_smem_opt_done = false;
     if (!s_smem_opt_done)
     {
-        cudaError_t err = cudaFuncSetAttribute(mega_kernel_v68<kInterPerTpParam, kUsePackedWeights>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem_bytes));
+        cudaError_t err
+            = cudaFuncSetAttribute(mega_kernel_v68<kInterPerTpParam, kUsePackedWeights, kPackedWeightStagesParam>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem_bytes));
         TORCH_CHECK(err == cudaSuccess, "cudaFuncSetAttribute(v68, maxDynSmem) failed: ", cudaGetErrorString(err));
         s_smem_opt_done = true;
     }
 
-    mega_kernel_v68<kInterPerTpParam, kUsePackedWeights><<<grid, block, smem_bytes, stream>>>(scores.data_ptr<float>(),
-        reinterpret_cast<__nv_bfloat16 const*>(hidden_in.data_ptr<at::BFloat16>()),
+    mega_kernel_v68<kInterPerTpParam, kUsePackedWeights, kPackedWeightStagesParam><<<grid, block, smem_bytes, stream>>>(
+        scores.data_ptr<float>(), reinterpret_cast<__nv_bfloat16 const*>(hidden_in.data_ptr<at::BFloat16>()),
         reinterpret_cast<__nv_bfloat16 const*>(bias.data_ptr<at::BFloat16>()),
         reinterpret_cast<__nv_fp8_e4m3 const*>(shared_gate_up_weight.data_ptr<at::Float8_e4m3fn>()),
         shared_gate_up_scale.data_ptr<float>(),
@@ -1122,18 +1185,33 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> mega_silu_v68_packed_int
         shared_gate_up_scale.size(0) == 2 * (inter_per_tp / 128) && shared_gate_up_scale.size(1) == kWeightScaleKBlocks,
         "shared_gate_up_scale shape mismatch");
     TORCH_CHECK(routed_w3_w1_scale.size(1) == 2 * (inter_per_tp / 128), "routed_w3_w1_scale shape mismatch");
+    int const packed_stages = v68_packed_weight_stages();
 
     if (inter_per_tp == kInterPerTp_TP8)
     {
-        return mega_silu_v68_impl<kInterPerTp_TP8, true>(std::move(scores), std::move(hidden_in), std::move(bias),
-            std::move(shared_gate_up_weight), std::move(shared_gate_up_scale), std::move(routed_w3_w1_weight),
-            std::move(routed_w3_w1_scale), routed_scaling_factor);
+        if (packed_stages == kPackedStagesSingle)
+        {
+            return mega_silu_v68_impl<kInterPerTp_TP8, true, kPackedStagesSingle>(std::move(scores),
+                std::move(hidden_in), std::move(bias), std::move(shared_gate_up_weight),
+                std::move(shared_gate_up_scale), std::move(routed_w3_w1_weight), std::move(routed_w3_w1_scale),
+                routed_scaling_factor);
+        }
+        return mega_silu_v68_impl<kInterPerTp_TP8, true, kPackedStagesDouble>(std::move(scores), std::move(hidden_in),
+            std::move(bias), std::move(shared_gate_up_weight), std::move(shared_gate_up_scale),
+            std::move(routed_w3_w1_weight), std::move(routed_w3_w1_scale), routed_scaling_factor);
     }
     else if (inter_per_tp == kInterPerTp_TP4)
     {
-        return mega_silu_v68_impl<kInterPerTp_TP4, true>(std::move(scores), std::move(hidden_in), std::move(bias),
-            std::move(shared_gate_up_weight), std::move(shared_gate_up_scale), std::move(routed_w3_w1_weight),
-            std::move(routed_w3_w1_scale), routed_scaling_factor);
+        if (packed_stages == kPackedStagesSingle)
+        {
+            return mega_silu_v68_impl<kInterPerTp_TP4, true, kPackedStagesSingle>(std::move(scores),
+                std::move(hidden_in), std::move(bias), std::move(shared_gate_up_weight),
+                std::move(shared_gate_up_scale), std::move(routed_w3_w1_weight), std::move(routed_w3_w1_scale),
+                routed_scaling_factor);
+        }
+        return mega_silu_v68_impl<kInterPerTp_TP4, true, kPackedStagesDouble>(std::move(scores), std::move(hidden_in),
+            std::move(bias), std::move(shared_gate_up_weight), std::move(shared_gate_up_scale),
+            std::move(routed_w3_w1_weight), std::move(routed_w3_w1_scale), routed_scaling_factor);
     }
     else
     {
