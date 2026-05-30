@@ -1,0 +1,69 @@
+explain the 49152 tile in more details
+
+ For one gate/up side, the packed shape is:
+
+  shared: [2, I / 64, 8, 49152]        # [gate/up, sub_row, k_iter, tile_bytes]
+  routed: [E, 2, I / 64, 8, 49152]     # [expert, gate/up, sub_row, k_iter, tile_bytes]
+  dtype: torch.float8_e4m3fn
+
+  For routed weights, the original dump is [up, gate], but the packed format normalizes it to [gate, up].
+
+
+• The 49152 tile is one v68 weight tile for:
+
+  64 output rows x 768 K columns x 1 byte per fp8 = 49152 bytes
+
+  v68 processes the hidden dimension H=6144 as 8 K-iterations:
+
+  6144 / 768 = 8
+
+  For each k_iter, each CTA owns one 64 x 768 slice of the gate or up matrix. That slice is packed into a 1D byte slab of length 49152.
+
+  The slab is organized as:
+
+  [6, 4, 4, 32, 16]
+
+  Meaning:
+
+  6    k_sixths          # 768 cols split into 6 chunks of 128 cols
+  4    m_tiles           # 64 rows split into 4 chunks of 16 rows
+  4    k_subs            # each 128-col chunk split into 4 chunks of 32 cols
+  32   lanes             # one warp's lanes
+  16   bytes per lane    # the A fragment bytes this lane will load
+
+  So:
+
+  6 * 4 * 4 * 32 * 16 = 49152
+
+  The byte offset is:
+
+  offset = k_sixth * 8192
+         + m_tile * 2048
+         + k_sub_in_sixth * 512
+         + lane * 16
+         + byte
+
+  For one lane record, the 16 bytes are arranged as four fp8 groups of 4 bytes:
+
+  bytes  0..3   = row_lo, cols col      : col + 4
+  bytes  4..7   = row_hi, cols col      : col + 4
+  bytes  8..11  = row_lo, cols col + 16 : col + 20
+  bytes 12..15  = row_hi, cols col + 16 : col + 20
+
+  where:
+
+  row_lo = sub_row * 64 + m_tile * 16 + lane / 4
+  row_hi = row_lo + 8
+
+  col = k_iter * 768
+      + k_sixth * 128
+      + k_sub_in_sixth * 32
+      + (lane % 4) * 4
+
+  Why this shape: compute_mma_kiter_v68() consumes the tile by doing two shared-memory vector loads per lane:
+
+  lds64_b32x2(a_frag[0], a_frag[1], lane_base);
+  lds64_b32x2(a_frag[2], a_frag[3], lane_base + 8);
+
+  So each lane wants its 16 bytes to already be contiguous in the MMA A-fragment order. The prepack creates exactly that layout ahead of time,
+  so the kernel only copies the slab into shared memory instead of reconstructing this layout from raw row-major weights every CTA.
