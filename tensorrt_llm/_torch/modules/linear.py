@@ -34,6 +34,11 @@ from ..utils import (Fp4QuantizedTensor, get_model_extra_attrs,
                      replace_parameter_and_save_metadata, unswizzle_sf)
 
 
+def _deepseekv3_mega_moe_mode_is_wip() -> bool:
+    mode = os.environ.get("TRTLLM_DEEPSEEKV3_MEGAMOE_MODE", "").strip().lower()
+    return mode in ("mega", "mega_kernel", "wip", "wip_mega_kernel")
+
+
 class WeightMode(str, enum.Enum):
     # weight of a vanilla layer
     VANILLA = 'vanilla'
@@ -1245,6 +1250,13 @@ class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):
         retain_pre_deep_gemm_weight = getattr(module,
                                               "retain_pre_deep_gemm_weight",
                                               False)
+        if retain_pre_deep_gemm_weight and _deepseekv3_mega_moe_mode_is_wip():
+            if getattr(module, "weight_org_packed_v68", None) is None:
+                module.weight_org = module.weight.detach()
+            if getattr(module, "weight_scale_org", None) is None:
+                module.weight_scale_org = module.weight_scale.detach()
+            return
+
         if (is_sm_100f() and not (module.use_cute_dsl_blockscaling_mm
                                  or module.disable_deep_gemm)) or \
            get_sm_version() == 120:

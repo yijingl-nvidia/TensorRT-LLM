@@ -1090,10 +1090,9 @@ class DeepseekV3DecoderLayer(DecoderLayer):
             self.fusion_config.PRE_MOE_FUSION = self.enable_fusion and has_tp
             self.fusion_config.POST_MOE_FUSION = self.fusion_config.PRE_MOE_FUSION
 
+            mega_moe_mode = Deepseekv3MegaMoE._mega_moe_mode()
             mlp_cls = Deepseekv3MegaMoE
-            if os.environ.get(
-                    "TRTLLM_DEEPSEEKV3_MOE_BASELINE",
-                    "").strip().lower() in ["true", "1", "y", "yes", "t", "on"]:
+            if mega_moe_mode == Deepseekv3MegaMoE._MEGA_MOE_MODE_BASELINE:
                 mlp_cls = Deepseekv3MoE
             if layer_idx == 10:
                 print(
@@ -1849,8 +1848,6 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
             else:
                 layer.next_layer_layernorm = self.model.layers[
                     idx + 1].input_layernorm
-            if isinstance(layer.mlp, Deepseekv3MegaMoE):
-                layer.mlp.prepack_wip_mega_kernel_weights()
 
 
 @register_auto_model("KimiK25ForConditionalGeneration")

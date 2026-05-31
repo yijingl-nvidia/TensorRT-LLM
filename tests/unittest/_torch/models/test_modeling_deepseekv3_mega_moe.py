@@ -19,7 +19,6 @@ import statistics
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Callable
 
 import pytest
@@ -468,53 +467,6 @@ def test_deepseekv3_mega_moe_v110_weight_pack_matches_pytorch(rank: int) -> None
         actual_routed = prepack_v110_routed_w2_weight(tensors["routed_w2_weight"])
         torch.cuda.synchronize()
         assert torch.equal(actual_routed, expected_routed)
-
-
-def test_deepseekv3_mega_moe_prepack_wip_weight_init_path(monkeypatch: pytest.MonkeyPatch) -> None:
-    if not _phase_enabled("pack"):
-        pytest.skip(f"{_PHASE_ENV} disables v68 pack phase")
-    _require_cute_dsl()
-    monkeypatch.setenv("TRTLLM_DEEPSEEKV3_MEGAMOE_MODE", "wip")
-    monkeypatch.setenv("TRTLLM_DEEPSEEKV3_MEGAMOE_PREPACK_V110", "1")
-    group = _dump_group(0)
-    tensors = _load_inputs(group, max_num_tokens=1)
-
-    shared_gate_up_proj = torch.nn.Module()
-    shared_gate_up_proj.weight_org = tensors["shared_gate_up_weight_org"]
-    shared_down_proj = torch.nn.Module()
-    shared_down_proj.weight_org = tensors["shared_down_weight_org"]
-    moe_backend = torch.nn.Module()
-    moe_backend.w3_w1_weight = tensors["routed_w3_w1_weight"]
-    moe_backend.w2_weight = tensors["routed_w2_weight"]
-
-    mega_moe = Deepseekv3MegaMoE.__new__(Deepseekv3MegaMoE)
-    torch.nn.Module.__init__(mega_moe)
-    mega_moe._old_moe = SimpleNamespace(
-        shared_experts=SimpleNamespace(
-            gate_up_proj=shared_gate_up_proj,
-            down_proj=shared_down_proj,
-        ),
-        experts=SimpleNamespace(backend=moe_backend),
-    )
-
-    with torch.inference_mode():
-        mega_moe.prepack_wip_mega_kernel_weights()
-        torch.cuda.synchronize()
-        mega_moe.prepack_wip_mega_kernel_weights()
-        torch.cuda.synchronize()
-
-    assert shared_gate_up_proj.weight_org is None
-    assert shared_down_proj.weight_org is None
-    assert moe_backend.w3_w1_weight is None
-    assert moe_backend.w2_weight is None
-    assert "weight_org_packed_v68" in shared_gate_up_proj._buffers
-    assert "weight_org_packed_v110" in shared_down_proj._buffers
-    assert "w3_w1_weight_packed_v68" in moe_backend._buffers
-    assert "w2_weight_packed_v110" in moe_backend._buffers
-    assert shared_gate_up_proj.weight_org_packed_v68.shape[0] == 2
-    assert moe_backend.w3_w1_weight_packed_v68.shape[0] == tensors["routed_w3_w1_weight"].shape[0]
-    assert shared_down_proj.weight_org_packed_v110.shape[0] == 444
-    assert moe_backend.w2_weight_packed_v110.shape[0] == tensors["routed_w2_weight"].shape[0]
 
 
 def test_deepseekv3_mega_moe_wip_down_project_chunked_matches_per_chunk() -> None:
