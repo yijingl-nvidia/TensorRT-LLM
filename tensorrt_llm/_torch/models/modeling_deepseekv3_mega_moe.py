@@ -1,5 +1,7 @@
 import os
+import threading
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Callable, Dict, Optional
 
 import torch
@@ -14,6 +16,7 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 from ..distributed import AllReduceParams
 from ..model_config import ModelConfig
 from ..modules.fused_moe import MoE
+from ..modules.linear import TensorParallelMode, load_weight_shard
 from ..utils import AuxStreamType, Fp4QuantizedTensor
 from .modeling_deepseekv3_moe import Deepseekv3MoE
 
@@ -22,6 +25,7 @@ _MEGA_MOE_DEBUG_OUTPUT_DIR_ENV = "TRTLLM_DEEPSEEKV3_MEGAMOE_DEBUG_OUTPUT_DIR"
 _MEGA_MOE_PREPACK_V110_ENV = "TRTLLM_DEEPSEEKV3_MEGAMOE_PREPACK_V110"
 _MEGA_MOE_DEBUG_DEFAULT_OUTPUT_DIR = "~/dev/debug_output"
 _TORCH_TENSOR_FILE_SUFFIX = "pt"
+_MEGA_MOE_WIP_WEIGHT_LOAD_LOCK = threading.Lock()
 _V68_HIDDEN_SIZE = 6144
 _V68_CTA_OUT_ROWS = 64
 _V68_M_TILES_PER_CTA = 4
@@ -302,27 +306,85 @@ class Deepseekv3MegaMoE(nn.Module):
         override_quant_config: Optional[QuantConfig] = None,
     ):
         super().__init__()
-        self._old_moe = Deepseekv3MoE(
-            num_experts=num_experts,
-            top_k=top_k,
-            hidden_size=hidden_size,
-            intermediate_size=intermediate_size,
-            shared_expert_intermediate_size=shared_expert_intermediate_size,
-            aux_stream_dict=aux_stream_dict,
-            layer_idx=layer_idx,
-            dtype=dtype,
-            model_config=model_config,
-            override_quant_config=override_quant_config,
-        )
-        self._old_moe.shared_experts.gate_up_proj.retain_pre_deep_gemm_weight = True
-        self._old_moe.shared_experts.down_proj.retain_pre_deep_gemm_weight = True
+        self._old_moe: Deepseekv3MoE | None = None
+        self._wip_owns_weights = self._mega_moe_mode() == self._MEGA_MOE_MODE_WIP
+        self.num_experts = num_experts
+        self.top_k = top_k
+        self.hidden_size = hidden_size
+        self.intermediate_size = intermediate_size
+        self.shared_expert_intermediate_size = shared_expert_intermediate_size
+        self.model_config = model_config
+        self.mapping = model_config.mapping
+        self.use_dp = model_config.mapping.enable_attention_dp
+        self.use_cute_dsl_blockscaling_mm = model_config.use_cute_dsl_blockscaling_mm
         self.layer_idx = layer_idx
         self._debug_dump_weights_on_next_forward = False
         self._debug_dump_activations_on_next_forward = False
+        self._wip_weights_loaded = False
+
+        if not self._wip_owns_weights:
+            self._old_moe = Deepseekv3MoE(
+                num_experts=num_experts,
+                top_k=top_k,
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+                shared_expert_intermediate_size=shared_expert_intermediate_size,
+                aux_stream_dict=aux_stream_dict,
+                layer_idx=layer_idx,
+                dtype=dtype,
+                model_config=model_config,
+                override_quant_config=override_quant_config,
+            )
+            self._old_moe.shared_experts.gate_up_proj.retain_pre_deep_gemm_weight = True
+            self._old_moe.shared_experts.down_proj.retain_pre_deep_gemm_weight = True
+            return
+
+        from ..distributed import AllReduce
+
+        config = model_config.pretrained_config
+        self.n_group = config.n_group
+        self.topk_group = config.topk_group
+        self.routed_scaling_factor = config.routed_scaling_factor
+        self.swiglu_limit = Deepseekv3MoE._create_swiglu_limit_tensor(model_config, num_experts)
+        self.swiglu_limit_scalar = None
+        self.experts_stub = SimpleNamespace(has_nvfp4=False)
+        self.moe_tp_size = model_config.mapping.moe_tp_size
+        self.moe_tp_rank = model_config.mapping.moe_tp_rank
+        self.moe_ep_size = model_config.mapping.moe_ep_size
+        self.moe_ep_rank = model_config.mapping.moe_ep_rank
+        self.routed_intermediate_size_per_partition = intermediate_size // self.moe_tp_size
+
+        shared_quant_config = Deepseekv3MoE._get_shared_experts_quant_config(
+            model_config, layer_idx
+        )
+        block_size = 1
+        if (
+            shared_quant_config is not None
+            and shared_quant_config.quant_algo is not None
+            and shared_quant_config.group_size is not None
+        ):
+            block_size = shared_quant_config.group_size
+        self.shared_tp_size, self.shared_output_scale = (
+            Deepseekv3MoE._compute_shared_expert_tp_size(
+                self, shared_expert_intermediate_size, block_size
+            )
+        )
+        self.shared_tp_rank = self.mapping.rank % self.shared_tp_size
+        self.shared_intermediate_size_per_partition = (
+            shared_expert_intermediate_size // self.shared_tp_size
+        )
+
+        self.allreduce = None
+        if not self.use_dp and self.mapping.tp_size > 1:
+            self.allreduce = AllReduce(
+                mapping=model_config.mapping, strategy=model_config.allreduce_strategy
+            )
 
     @property
     def experts(self) -> MoE:
-        return self._old_moe.experts
+        if self._old_moe is not None:
+            return self._old_moe.experts
+        return self.experts_stub
 
     _MEGA_MOE_MODE_BASELINE = "baseline"
     _MEGA_MOE_MODE_PYTORCH_REF = "pytorch_ref"
@@ -392,7 +454,40 @@ class Deepseekv3MegaMoE(nn.Module):
 
     def dump_mega_moe_weight_tensors(self) -> None:
         """Dump the weight tensors consumed by MegaMoE and baseline MoE paths."""
+        if self._old_moe is None:
+            tensors: dict[str, torch.Tensor | None] = {
+                "router_weight": getattr(self, "router_weight", None),
+                "routing_bias": getattr(self, "routing_bias", None),
+                "shared_gate_up_weight_scale_org": getattr(
+                    self, "shared_gate_up_weight_scale_org", None
+                ),
+                "shared_gate_up_weight_packed_v68": getattr(
+                    self, "shared_gate_up_weight_packed_v68", None
+                ),
+                "routed_w3_w1_weight_scaling_factor": getattr(
+                    self, "routed_w3_w1_weight_scaling_factor", None
+                ),
+                "routed_w3_w1_weight_packed_v68": getattr(
+                    self, "routed_w3_w1_weight_packed_v68", None
+                ),
+                "routed_w2_weight": getattr(self, "routed_w2_weight", None),
+                "routed_w2_weight_scaling_factor": getattr(
+                    self, "routed_w2_weight_scaling_factor", None
+                ),
+                "routed_w2_weight_packed_v110": getattr(self, "routed_w2_weight_packed_v110", None),
+                "shared_down_weight_org": getattr(self, "shared_down_weight_org", None),
+                "shared_down_weight_scale_org": getattr(self, "shared_down_weight_scale_org", None),
+                "shared_down_weight_packed_v110": getattr(
+                    self, "shared_down_weight_packed_v110", None
+                ),
+            }
+            for tensor_name, tensor in tensors.items():
+                if tensor is not None:
+                    self._dump_tensor(tensor_name, tensor)
+            return
+
         old_moe = self._old_moe
+        assert old_moe is not None
         shared_experts = old_moe.shared_experts
         shared_gate_up_proj = shared_experts.gate_up_proj
         shared_down_proj = shared_experts.down_proj
@@ -430,13 +525,22 @@ class Deepseekv3MegaMoE(nn.Module):
                 self._dump_tensor(tensor_name, tensor)
 
     @staticmethod
-    def _set_nonpersistent_buffer(module: nn.Module, name: str, tensor: torch.Tensor) -> None:
+    def _set_nonpersistent_buffer(
+        module: nn.Module, name: str, tensor: torch.Tensor | None
+    ) -> None:
         if name in module._buffers:
             module._buffers[name] = tensor
         elif hasattr(module, name):
-            setattr(module, name, tensor)
+            if getattr(module, name) is None:
+                delattr(module, name)
+                module.register_buffer(name, tensor, persistent=False)
+            else:
+                setattr(module, name, tensor)
         else:
             module.register_buffer(name, tensor, persistent=False)
+
+    def uses_wip_mega_kernel_weights(self) -> bool:
+        return self._wip_owns_weights
 
     @staticmethod
     def _retain_linear_original_tensors(module: nn.Module, module_name: str) -> torch.Tensor:
@@ -458,8 +562,309 @@ class Deepseekv3MegaMoE(nn.Module):
 
         return weight_org
 
+    @staticmethod
+    def _checkpoint_tensor(weights, key: str) -> torch.Tensor:
+        if key not in weights:
+            raise KeyError(f"Missing Deepseekv3MegaMoE WIP weight: {key}")
+        tensor = weights[key]
+        return tensor[:] if hasattr(tensor, "__getitem__") else tensor
+
+    @staticmethod
+    def _normalize_fp8_block_scale(scale: torch.Tensor) -> torch.Tensor:
+        if scale.dim() == 4:
+            scale = scale.squeeze(1).squeeze(-1)
+        return scale
+
+    @classmethod
+    def _load_checkpoint_shard(
+        cls,
+        weights,
+        key: str,
+        tensor_parallel_size: int,
+        tensor_parallel_rank: int,
+        tensor_parallel_mode: TensorParallelMode,
+        *,
+        normalize_scale: bool = False,
+    ) -> torch.Tensor:
+        tensor = cls._checkpoint_tensor(weights, key)
+        if normalize_scale:
+            tensor = cls._normalize_fp8_block_scale(tensor)
+        return load_weight_shard(
+            tensor,
+            tensor_parallel_size,
+            tensor_parallel_rank,
+            tensor_parallel_mode,
+            torch.device("cuda"),
+        )
+
+    @staticmethod
+    def _as_fp8_weight(weight: torch.Tensor) -> torch.Tensor:
+        weight = weight.contiguous()
+        if weight.dtype != torch.float8_e4m3fn:
+            weight = weight.view(torch.float8_e4m3fn)
+        return weight
+
+    @staticmethod
+    def _scale_suffix(weights, prefix: str) -> str:
+        if f"{prefix}.weight_scale_inv" in weights:
+            return "weight_scale_inv"
+        return "weight_scale"
+
+    def _load_shared_gate_up_weight(
+        self, prefix: str, weights
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        gate_prefix = f"{prefix}.shared_experts.gate_proj"
+        up_prefix = f"{prefix}.shared_experts.up_proj"
+        scale_suffix = self._scale_suffix(weights, gate_prefix)
+        gate_weight = self._load_checkpoint_shard(
+            weights,
+            f"{gate_prefix}.weight",
+            self.shared_tp_size,
+            self.shared_tp_rank,
+            TensorParallelMode.COLUMN,
+        )
+        up_weight = self._load_checkpoint_shard(
+            weights,
+            f"{up_prefix}.weight",
+            self.shared_tp_size,
+            self.shared_tp_rank,
+            TensorParallelMode.COLUMN,
+        )
+        gate_scale = self._load_checkpoint_shard(
+            weights,
+            f"{gate_prefix}.{scale_suffix}",
+            self.shared_tp_size,
+            self.shared_tp_rank,
+            TensorParallelMode.COLUMN,
+            normalize_scale=True,
+        )
+        up_scale = self._load_checkpoint_shard(
+            weights,
+            f"{up_prefix}.{scale_suffix}",
+            self.shared_tp_size,
+            self.shared_tp_rank,
+            TensorParallelMode.COLUMN,
+            normalize_scale=True,
+        )
+        return (
+            torch.cat((self._as_fp8_weight(gate_weight), self._as_fp8_weight(up_weight))),
+            torch.cat((gate_scale.to(torch.float32), up_scale.to(torch.float32))),
+        )
+
+    def _load_shared_down_weight(self, prefix: str, weights) -> tuple[torch.Tensor, torch.Tensor]:
+        down_prefix = f"{prefix}.shared_experts.down_proj"
+        scale_suffix = self._scale_suffix(weights, down_prefix)
+        weight = self._load_checkpoint_shard(
+            weights,
+            f"{down_prefix}.weight",
+            self.shared_tp_size,
+            self.shared_tp_rank,
+            TensorParallelMode.ROW,
+        )
+        scale = self._load_checkpoint_shard(
+            weights,
+            f"{down_prefix}.{scale_suffix}",
+            self.shared_tp_size,
+            self.shared_tp_rank,
+            TensorParallelMode.ROW,
+            normalize_scale=True,
+        )
+        return self._as_fp8_weight(weight), scale.to(torch.float32)
+
+    @staticmethod
+    def _expert_proj_prefix(prefix: str, expert_id: int, proj_name: str) -> str:
+        return f"{prefix}.experts.{expert_id}.{proj_name}"
+
+    def _load_routed_expert_weights(
+        self, prefix: str, weights
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self.moe_ep_size != 1:
+            raise RuntimeError(
+                "TRTLLM_DEEPSEEKV3_MEGAMOE_MODE=wip_mega_kernel currently requires "
+                f"moe_ep_size=1, got {self.moe_ep_size}"
+            )
+
+        hidden_size = self.hidden_size
+        intermediate_size = self.routed_intermediate_size_per_partition
+        block_scale_hidden_size = (hidden_size + 127) // 128
+        block_scale_intermediate_size = (intermediate_size + 127) // 128
+        routed_w3_w1_weight = torch.empty(
+            (self.num_experts, 2 * intermediate_size, hidden_size),
+            device="cuda",
+            dtype=torch.float8_e4m3fn,
+        )
+        routed_w2_weight = torch.empty(
+            (self.num_experts, hidden_size, intermediate_size),
+            device="cuda",
+            dtype=torch.float8_e4m3fn,
+        )
+        routed_w3_w1_weight_scale = torch.empty(
+            (self.num_experts, 2 * block_scale_intermediate_size, block_scale_hidden_size),
+            device="cuda",
+            dtype=torch.float32,
+        )
+        routed_w2_weight_scale = torch.empty(
+            (self.num_experts, block_scale_hidden_size, block_scale_intermediate_size),
+            device="cuda",
+            dtype=torch.float32,
+        )
+
+        for expert_id in range(self.num_experts):
+            gate_prefix = self._expert_proj_prefix(prefix, expert_id, "gate_proj")
+            up_prefix = self._expert_proj_prefix(prefix, expert_id, "up_proj")
+            down_prefix = self._expert_proj_prefix(prefix, expert_id, "down_proj")
+            gate_scale_suffix = self._scale_suffix(weights, gate_prefix)
+            up_scale_suffix = self._scale_suffix(weights, up_prefix)
+            down_scale_suffix = self._scale_suffix(weights, down_prefix)
+
+            w1_weight = self._load_checkpoint_shard(
+                weights,
+                f"{gate_prefix}.weight",
+                self.moe_tp_size,
+                self.moe_tp_rank,
+                TensorParallelMode.COLUMN,
+            )
+            w3_weight = self._load_checkpoint_shard(
+                weights,
+                f"{up_prefix}.weight",
+                self.moe_tp_size,
+                self.moe_tp_rank,
+                TensorParallelMode.COLUMN,
+            )
+            w2_weight = self._load_checkpoint_shard(
+                weights,
+                f"{down_prefix}.weight",
+                self.moe_tp_size,
+                self.moe_tp_rank,
+                TensorParallelMode.ROW,
+            )
+            w1_scale = self._load_checkpoint_shard(
+                weights,
+                f"{gate_prefix}.{gate_scale_suffix}",
+                self.moe_tp_size,
+                self.moe_tp_rank,
+                TensorParallelMode.COLUMN,
+                normalize_scale=True,
+            )
+            w3_scale = self._load_checkpoint_shard(
+                weights,
+                f"{up_prefix}.{up_scale_suffix}",
+                self.moe_tp_size,
+                self.moe_tp_rank,
+                TensorParallelMode.COLUMN,
+                normalize_scale=True,
+            )
+            w2_scale = self._load_checkpoint_shard(
+                weights,
+                f"{down_prefix}.{down_scale_suffix}",
+                self.moe_tp_size,
+                self.moe_tp_rank,
+                TensorParallelMode.ROW,
+                normalize_scale=True,
+            )
+
+            routed_w3_w1_weight[expert_id, :intermediate_size].copy_(
+                self._as_fp8_weight(w3_weight), non_blocking=True
+            )
+            routed_w3_w1_weight[expert_id, intermediate_size:].copy_(
+                self._as_fp8_weight(w1_weight), non_blocking=True
+            )
+            routed_w2_weight[expert_id].copy_(self._as_fp8_weight(w2_weight), non_blocking=True)
+            routed_w3_w1_weight_scale[expert_id, :block_scale_intermediate_size].copy_(
+                w3_scale.to(torch.float32), non_blocking=True
+            )
+            routed_w3_w1_weight_scale[expert_id, block_scale_intermediate_size:].copy_(
+                w1_scale.to(torch.float32), non_blocking=True
+            )
+            routed_w2_weight_scale[expert_id].copy_(w2_scale.to(torch.float32), non_blocking=True)
+
+        return (
+            routed_w3_w1_weight,
+            routed_w3_w1_weight_scale,
+            routed_w2_weight,
+            routed_w2_weight_scale,
+        )
+
+    def load_wip_mega_kernel_weights(self, prefix: str, weights) -> None:
+        # Weight loading is parallelized by layer; serialize WIP packing to avoid
+        # duplicate first-use CuTe DSL compilation and lower peak temporary memory.
+        with _MEGA_MOE_WIP_WEIGHT_LOAD_LOCK:
+            self._load_wip_mega_kernel_weights_locked(prefix, weights)
+
+    def _load_wip_mega_kernel_weights_locked(self, prefix: str, weights) -> None:
+        if not self._wip_owns_weights:
+            return
+
+        router_weight = self._checkpoint_tensor(weights, f"{prefix}.gate.weight").to(
+            device="cuda", dtype=torch.bfloat16
+        )
+        routing_bias = self._checkpoint_tensor(
+            weights, f"{prefix}.gate.e_score_correction_bias"
+        ).to(device="cuda", dtype=torch.bfloat16)
+        shared_gate_up_weight, shared_gate_up_weight_scale = self._load_shared_gate_up_weight(
+            prefix, weights
+        )
+        shared_down_weight, shared_down_weight_scale = self._load_shared_down_weight(
+            prefix, weights
+        )
+        (
+            routed_w3_w1_weight,
+            routed_w3_w1_weight_scale,
+            routed_w2_weight,
+            routed_w2_weight_scale,
+        ) = self._load_routed_expert_weights(prefix, weights)
+
+        self._set_nonpersistent_buffer(self, "router_weight", router_weight)
+        self._set_nonpersistent_buffer(self, "routing_bias", routing_bias)
+        self._set_nonpersistent_buffer(
+            self, "shared_gate_up_weight_scale_org", shared_gate_up_weight_scale
+        )
+        self._set_nonpersistent_buffer(
+            self,
+            "shared_gate_up_weight_packed_v68",
+            prepack_v68_shared_gate_up_weight(shared_gate_up_weight),
+        )
+        self._set_nonpersistent_buffer(
+            self, "routed_w3_w1_weight_scaling_factor", routed_w3_w1_weight_scale
+        )
+        self._set_nonpersistent_buffer(
+            self,
+            "routed_w3_w1_weight_packed_v68",
+            prepack_v68_routed_w3_w1_weight(routed_w3_w1_weight),
+        )
+        self._set_nonpersistent_buffer(
+            self, "routed_w2_weight_scaling_factor", routed_w2_weight_scale
+        )
+        self._set_nonpersistent_buffer(
+            self, "shared_down_weight_scale_org", shared_down_weight_scale
+        )
+        if _mega_moe_prepack_v110_enabled():
+            self._set_nonpersistent_buffer(
+                self,
+                "shared_down_weight_packed_v110",
+                prepack_v110_shared_down_weight(shared_down_weight),
+            )
+            self._set_nonpersistent_buffer(
+                self,
+                "routed_w2_weight_packed_v110",
+                prepack_v110_routed_w2_weight(routed_w2_weight),
+            )
+        else:
+            self._set_nonpersistent_buffer(self, "shared_down_weight_org", shared_down_weight)
+            self._set_nonpersistent_buffer(self, "routed_w2_weight", routed_w2_weight)
+
+        self._wip_weights_loaded = True
+
     def prepack_wip_mega_kernel_weights(self) -> None:
         if self._mega_moe_mode() != self._MEGA_MOE_MODE_WIP:
+            return
+
+        if self._old_moe is None:
+            if not self._wip_weights_loaded:
+                raise RuntimeError(
+                    "TRTLLM_DEEPSEEKV3_MEGAMOE_MODE=wip_mega_kernel requires "
+                    "Deepseekv3MegaMoE.load_wip_mega_kernel_weights() during weight loading"
+                )
             return
 
         old_moe = self._old_moe
@@ -1387,6 +1792,212 @@ class Deepseekv3MegaMoE(nn.Module):
 
         return final_hidden_states
 
+    def _forward_wip_mega_kernel_owned(
+        self,
+        hidden_states: torch.Tensor,
+        all_rank_num_tokens: list[int] | None,
+        num_tokens: int,
+        hidden_size: int,
+        num_router_experts: int,
+        expert_intermediate_size: int,
+        block_scale_fp32_hidden_size: int,
+        block_scale_int32_hidden_size: int,
+        block_scale_fp32_expert_intermediate_size: int,
+        gate_up_output_size: int,
+        activation_dump_callback: Callable[[str, torch.Tensor], None] | None = None,
+    ) -> torch.Tensor:
+        del all_rank_num_tokens, block_scale_int32_hidden_size, gate_up_output_size
+        if not self._wip_weights_loaded:
+            raise RuntimeError(
+                "TRTLLM_DEEPSEEKV3_MEGAMOE_MODE=wip_mega_kernel requires "
+                "Deepseekv3MegaMoE WIP weights to be loaded before forward()"
+            )
+        if (
+            self.shared_intermediate_size_per_partition
+            != self.routed_intermediate_size_per_partition
+        ):
+            raise RuntimeError(
+                "Deepseekv3MegaMoE WIP kernels require matching shared and routed "
+                "intermediate partitions, got "
+                f"{self.shared_intermediate_size_per_partition} and "
+                f"{self.routed_intermediate_size_per_partition}"
+            )
+        assert self.shared_output_scale is None, (
+            f"shared_output_scale must be None, got {self.shared_output_scale}"
+        )
+        assert self.num_experts == num_router_experts
+        assert self.top_k == 8, f"v68 WIP mega kernel only supports top_k=8, got {self.top_k}"
+        assert self.n_group == 1, f"v68 WIP mega kernel only supports n_group=1, got {self.n_group}"
+        assert self.topk_group == 1, (
+            f"v68 WIP mega kernel only supports topk_group=1, got {self.topk_group}"
+        )
+
+        router_weight = self.router_weight
+        routing_bias = self.routing_bias
+        shared_gate_up_weight_packed_v68 = self.shared_gate_up_weight_packed_v68
+        shared_gate_up_weight_scale_org = self.shared_gate_up_weight_scale_org
+        routed_w3_w1_weight_packed_v68 = self.routed_w3_w1_weight_packed_v68
+        routed_w3_w1_weight_scale = self.routed_w3_w1_weight_scaling_factor
+        routed_w2_weight_scale = self.routed_w2_weight_scaling_factor
+        shared_down_weight_scale_org = self.shared_down_weight_scale_org
+        routed_w2_weight_for_v110 = getattr(self, "routed_w2_weight_packed_v110", None)
+        if routed_w2_weight_for_v110 is None:
+            routed_w2_weight_for_v110 = self.routed_w2_weight
+        shared_down_weight_for_v110 = getattr(self, "shared_down_weight_packed_v110", None)
+        if shared_down_weight_for_v110 is None:
+            shared_down_weight_for_v110 = self.shared_down_weight_org
+
+        check_data(
+            router_weight,
+            "wip_mega_router_weight",
+            torch.bfloat16,
+            (num_router_experts, hidden_size),
+        )
+        check_data(
+            routing_bias,
+            "wip_mega_router_logit_offset",
+            torch.bfloat16,
+            (num_router_experts,),
+        )
+        check_data(
+            shared_gate_up_weight_packed_v68,
+            "wip_mega_shared_gate_up_weight_packed_v68",
+            torch.float8_e4m3fn,
+            (2, expert_intermediate_size // _V68_CTA_OUT_ROWS, _V68_NUM_K_ITER, _V68_TILE_BYTES),
+        )
+        check_data(
+            shared_gate_up_weight_scale_org,
+            "wip_mega_shared_gate_up_weight_scale_org",
+            torch.float32,
+            (2 * block_scale_fp32_expert_intermediate_size, block_scale_fp32_hidden_size),
+        )
+        check_data(
+            routed_w3_w1_weight_packed_v68,
+            "wip_mega_routed_w3_w1_weight_packed_v68",
+            torch.float8_e4m3fn,
+            (
+                num_router_experts,
+                2,
+                expert_intermediate_size // _V68_CTA_OUT_ROWS,
+                _V68_NUM_K_ITER,
+                _V68_TILE_BYTES,
+            ),
+        )
+        check_data(
+            routed_w3_w1_weight_scale,
+            "wip_mega_routed_w3_w1_weight_scaling_factor",
+            torch.float32,
+            (
+                num_router_experts,
+                2 * block_scale_fp32_expert_intermediate_size,
+                block_scale_fp32_hidden_size,
+            ),
+        )
+        if getattr(self, "routed_w2_weight_packed_v110", None) is not None:
+            check_data(
+                routed_w2_weight_for_v110,
+                "wip_mega_routed_w2_weight_packed_v110",
+                torch.float8_e4m3fn,
+                (
+                    num_router_experts,
+                    _V110_PACKED_ROW_TILES,
+                    block_scale_fp32_expert_intermediate_size,
+                    _V110_TILE_BYTES,
+                ),
+            )
+        else:
+            check_data(
+                routed_w2_weight_for_v110,
+                "wip_mega_routed_w2_weight",
+                torch.float8_e4m3fn,
+                (num_router_experts, hidden_size, expert_intermediate_size),
+            )
+        check_data(
+            routed_w2_weight_scale,
+            "wip_mega_routed_w2_weight_scaling_factor",
+            torch.float32,
+            (
+                num_router_experts,
+                block_scale_fp32_hidden_size,
+                block_scale_fp32_expert_intermediate_size,
+            ),
+        )
+        if getattr(self, "shared_down_weight_packed_v110", None) is not None:
+            check_data(
+                shared_down_weight_for_v110,
+                "wip_mega_shared_down_weight_packed_v110",
+                torch.float8_e4m3fn,
+                (
+                    _V110_PACKED_ROW_TILES,
+                    block_scale_fp32_expert_intermediate_size,
+                    _V110_TILE_BYTES,
+                ),
+            )
+        else:
+            check_data(
+                shared_down_weight_for_v110,
+                "wip_mega_shared_down_weight_org",
+                torch.float8_e4m3fn,
+                (hidden_size, expert_intermediate_size),
+            )
+        check_data(
+            shared_down_weight_scale_org,
+            "wip_mega_shared_down_weight_scale_org",
+            torch.float32,
+            (block_scale_fp32_hidden_size, block_scale_fp32_expert_intermediate_size),
+        )
+
+        expert_indices, expert_weights, slot_swiglu_output = self._run_wip_packed_mega_kernel(
+            hidden_states,
+            router_weight,
+            routing_bias,
+            shared_gate_up_weight_packed_v68,
+            shared_gate_up_weight_scale_org,
+            routed_w3_w1_weight_packed_v68,
+            routed_w3_w1_weight_scale,
+            self.top_k,
+            self.n_group,
+            self.topk_group,
+            self.routed_scaling_factor,
+            None,
+            self.swiglu_limit_scalar,
+            activation_dump_callback,
+        )
+        check_data(
+            slot_swiglu_output,
+            "wip_mega_slot_swiglu_output",
+            torch.float16,
+            (num_tokens, self.top_k + 1, expert_intermediate_size),
+        )
+
+        output_tensor = None
+        if not self.use_dp and self.mapping.tp_size > 1:
+            w, actual_kind = torch.ops.trtllm.allocate_output(
+                hidden_states, self.allreduce.output_buffer_kind, self.mapping.tp_group
+            )
+            if actual_kind == int(BufferKind.NCCL_WINDOW):
+                output_tensor = w
+        if output_tensor is None:
+            output_tensor = torch.empty_like(hidden_states)
+
+        final_hidden_states = self._run_wip_down_project_chunked(
+            slot_swiglu_output,
+            expert_indices,
+            expert_weights,
+            routed_w2_weight_for_v110,
+            routed_w2_weight_scale,
+            shared_down_weight_for_v110,
+            shared_down_weight_scale_org,
+            output_tensor,
+        )
+        check_data(
+            final_hidden_states,
+            "wip_mega_final_hidden_states",
+            torch.bfloat16,
+            tuple(hidden_states.shape),
+        )
+        return final_hidden_states
+
     def _forward_wip_mega_kernel(
         self,
         hidden_states: torch.Tensor,
@@ -1404,7 +2015,25 @@ class Deepseekv3MegaMoE(nn.Module):
         """
         WIP CUDA mega-kernel implementation of forward().
         """
+        if self._old_moe is None:
+            return self._forward_wip_mega_kernel_owned(
+                hidden_states=hidden_states,
+                all_rank_num_tokens=all_rank_num_tokens,
+                num_tokens=num_tokens,
+                hidden_size=hidden_size,
+                num_router_experts=num_router_experts,
+                expert_intermediate_size=expert_intermediate_size,
+                block_scale_fp32_hidden_size=block_scale_fp32_hidden_size,
+                block_scale_int32_hidden_size=block_scale_int32_hidden_size,
+                block_scale_fp32_expert_intermediate_size=(
+                    block_scale_fp32_expert_intermediate_size
+                ),
+                gate_up_output_size=gate_up_output_size,
+                activation_dump_callback=activation_dump_callback,
+            )
+
         old_moe = self._old_moe
+        assert old_moe is not None
         shared_experts = old_moe.shared_experts
         shared_gate_up_proj = shared_experts.gate_up_proj
         shared_down_proj = shared_experts.down_proj
@@ -1671,7 +2300,6 @@ class Deepseekv3MegaMoE(nn.Module):
     ) -> torch.Tensor:
         # if self._old_moe.mapping.rank == 0:
         #     print("Using old MoE forward!")
-        old_moe = self._old_moe
         assert do_finalize is True, "Deepseekv3MegaMoE only supports do_finalize=True"
 
         activation_dump_callback = self._dump_requested_forward_start_tensors(
@@ -1680,6 +2308,40 @@ class Deepseekv3MegaMoE(nn.Module):
 
         num_tokens: int = hidden_states.size(0)
         mega_moe_mode = self._mega_moe_mode()
+        hidden_size: int = hidden_states.size(1)
+        block_scale_fp32_hidden_Size: int = int(triton.cdiv(hidden_size, 128))
+        block_scale_int32_hidden_size: int = int(triton.cdiv(hidden_size, 128 * 4))
+
+        if mega_moe_mode == self._MEGA_MOE_MODE_WIP and self._old_moe is None:
+            check_data(hidden_states, "hidden_states", torch.bfloat16, (-1, 6144))
+            assert is_sm_100f(), "fp8_quantize_1x128_packed_ue8m0 requires SM100-family Blackwell"
+            num_router_experts = self.num_experts
+            expert_intermediate_size = self.shared_intermediate_size_per_partition
+            block_scale_fp32_expert_intermediate_size = int(
+                triton.cdiv(expert_intermediate_size, 128)
+            )
+            gate_up_output_size = 2 * expert_intermediate_size
+            return self._forward_wip_mega_kernel(
+                hidden_states=hidden_states,
+                all_rank_num_tokens=all_rank_num_tokens,
+                num_tokens=num_tokens,
+                hidden_size=hidden_size,
+                num_router_experts=num_router_experts,
+                expert_intermediate_size=expert_intermediate_size,
+                block_scale_fp32_hidden_size=block_scale_fp32_hidden_Size,
+                block_scale_int32_hidden_size=block_scale_int32_hidden_size,
+                block_scale_fp32_expert_intermediate_size=(
+                    block_scale_fp32_expert_intermediate_size
+                ),
+                gate_up_output_size=gate_up_output_size,
+                activation_dump_callback=activation_dump_callback,
+            )
+
+        old_moe = self._old_moe
+        assert old_moe is not None, (
+            "Deepseekv3MegaMoE was constructed for wip_mega_kernel mode and cannot "
+            f"run {mega_moe_mode!r}"
+        )
         if num_tokens > self._WIP_DOWN_PROJECT_MAX_NUM_TOKENS and (
             mega_moe_mode == self._MEGA_MOE_MODE_BASELINE
         ):
@@ -1712,9 +2374,6 @@ class Deepseekv3MegaMoE(nn.Module):
             f"shared_gate_up_proj.weight_scale must be a tensor, got {type(shared_gate_up_proj.weight_scale)}"
         )
 
-        hidden_size: int = hidden_states.size(1)
-        block_scale_fp32_hidden_Size: int = int(triton.cdiv(hidden_size, 128))
-        block_scale_int32_hidden_size: int = int(triton.cdiv(hidden_size, 128 * 4))
         num_router_experts: int = 256
         # The weight combines gate and up projection matrices.
         expert_intermediate_size: int = shared_gate_up_proj.weight.size(0) // 2

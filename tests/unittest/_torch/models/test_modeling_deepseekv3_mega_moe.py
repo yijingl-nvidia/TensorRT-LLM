@@ -36,7 +36,6 @@ from tensorrt_llm._torch.models.modeling_deepseekv3_mega_moe import (
     prepack_v110_shared_down_weight,
     prepack_v110_shared_down_weight_pytorch,
 )
-from tensorrt_llm._torch.modules.linear import FP8BlockScalesLinearMethod
 
 _DEBUG_OUTPUT_DIR_ENV = "TRTLLM_DEEPSEEKV3_MEGAMOE_TEST_DEBUG_OUTPUT_DIR"
 _RUNTIME_DEBUG_OUTPUT_DIR_ENV = "TRTLLM_DEEPSEEKV3_MEGAMOE_DEBUG_OUTPUT_DIR"
@@ -516,31 +515,6 @@ def test_deepseekv3_mega_moe_prepack_wip_weight_init_path(monkeypatch: pytest.Mo
     assert moe_backend.w3_w1_weight_packed_v68.shape[0] == tensors["routed_w3_w1_weight"].shape[0]
     assert shared_down_proj.weight_org_packed_v110.shape[0] == 444
     assert moe_backend.w2_weight_packed_v110.shape[0] == tensors["routed_w2_weight"].shape[0]
-
-
-def test_deepseekv3_mega_moe_wip_retains_linear_weight_org(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    if not _phase_enabled("pack"):
-        pytest.skip(f"{_PHASE_ENV} disables v68 pack phase")
-    monkeypatch.setenv("TRTLLM_DEEPSEEKV3_MEGAMOE_MODE", "wip")
-
-    module = torch.nn.Module()
-    module.weight = torch.nn.Parameter(
-        torch.empty((128, 128), dtype=torch.float8_e4m3fn), requires_grad=False
-    )
-    module.weight_scale = torch.nn.Parameter(
-        torch.empty((1, 1), dtype=torch.float32), requires_grad=False
-    )
-    module.retain_pre_deep_gemm_weight = True
-    module.use_cute_dsl_blockscaling_mm = False
-    module.disable_deep_gemm = False
-
-    FP8BlockScalesLinearMethod().post_load_weights(module)
-
-    assert module.weight_org.data_ptr() == module.weight.data_ptr()
-    assert module.weight_scale_org.data_ptr() == module.weight_scale.data_ptr()
-    assert module.weight_scale.dtype == torch.float32
 
 
 def test_deepseekv3_mega_moe_wip_down_project_chunked_matches_per_chunk() -> None:

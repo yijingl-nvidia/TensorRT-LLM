@@ -179,7 +179,10 @@ class DeepseekV3WeightLoader:
         module_groups: dict[str, list[tuple[str,
                                             nn.Module]]] = defaultdict(list)
         for name, module in all_named_modules.items():
-            if len(module._parameters) <= 0 or name.startswith("draft_model"):
+            is_wip_mega_moe = (isinstance(module, Deepseekv3MegaMoE)
+                               and module.uses_wip_mega_kernel_weights())
+            if (len(module._parameters) <= 0
+                    and not is_wip_mega_moe) or name.startswith("draft_model"):
                 # skip empty modules and draft models
                 # draft models will be loaded elsewhere
                 continue
@@ -468,7 +471,14 @@ class DeepseekV3WeightLoader:
                                    self.config.num_nextn_predict_layers +
                                    self.config.num_hidden_layers)
                     name = '.'.join(names)
-                if names[-1] == "kv_b_proj":
+                if (isinstance(module, Deepseekv3MegaMoE)
+                        and module.uses_wip_mega_kernel_weights()):
+                    module.load_wip_mega_kernel_weights(name, weights)
+                    if can_mark_consumed:
+                        weights.mark_consumed(f"{name}.gate")
+                        weights.mark_consumed(f"{name}.shared_experts")
+                        weights.mark_consumed(f"{name}.experts")
+                elif names[-1] == "kv_b_proj":
                     # For the self_attn.kv_b_proj module, split it into k_b_proj and v_b_proj
                     # Assigns:
                     # - self_attn.kv_b_proj.weight = kv_b_proj
