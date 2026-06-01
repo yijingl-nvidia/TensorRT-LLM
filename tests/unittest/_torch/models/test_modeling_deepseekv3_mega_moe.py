@@ -16,7 +16,6 @@
 import importlib
 import os
 import statistics
-from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -40,7 +39,6 @@ _DEBUG_OUTPUT_DIR_ENV = "TRTLLM_DEEPSEEKV3_MEGAMOE_TEST_DEBUG_OUTPUT_DIR"
 _RUNTIME_DEBUG_OUTPUT_DIR_ENV = "TRTLLM_DEEPSEEKV3_MEGAMOE_DEBUG_OUTPUT_DIR"
 _DEFAULT_DEBUG_OUTPUT_DIR = "~/dev/debug_output"
 _PHASE_ENV = "TRTLLM_DEEPSEEKV3_MEGAMOE_TEST_PHASE"
-_REF_USE_ORG_ENV = "TRTLLM_DEEPSEEKV3_MEGAMOE_REF_USE_SHARED_GATE_UP_WEIGHT_ORG"
 _PREPACK_V68_ENV = "TRTLLM_DEEPSEEKV3_MEGAMOE_TEST_PREPACK_V68"
 _PREPACK_V110_ENV = "TRTLLM_DEEPSEEKV3_MEGAMOE_TEST_PREPACK_V110"
 
@@ -255,19 +253,6 @@ def _save_profile_summary(
     path.write_text("\n".join(lines_by_rank[idx] for idx in sorted(lines_by_rank)) + "\n")
 
 
-@contextmanager
-def _ref_use_org_weight(enabled: bool):
-    old_value = os.environ.get(_REF_USE_ORG_ENV)
-    os.environ[_REF_USE_ORG_ENV] = "1" if enabled else "0"
-    try:
-        yield
-    finally:
-        if old_value is None:
-            os.environ.pop(_REF_USE_ORG_ENV, None)
-        else:
-            os.environ[_REF_USE_ORG_ENV] = old_value
-
-
 def _single_match(pattern: str) -> Path:
     matches = sorted(_debug_output_dir().glob(pattern))
     if not matches:
@@ -331,7 +316,9 @@ def _require_cute_dsl() -> None:
 
 
 def _load_inputs(
-    group: MegaMoeDumpGroup, max_num_tokens: int | None = None
+    group: MegaMoeDumpGroup,
+    max_num_tokens: int | None = None,
+    include_wip_tensors: bool = True,
 ) -> dict[str, torch.Tensor]:
     weight_layer_idx = group.weight_layer_idx
     activation_layer_idx = group.activation_layer_idx
@@ -339,7 +326,7 @@ def _load_inputs(
     if max_num_tokens is not None:
         hidden_states = hidden_states[:max_num_tokens].contiguous()
 
-    return {
+    tensors = {
         # torch.bfloat16, [T, H].
         "hidden_states": hidden_states,
         # torch.bfloat16, [E, H].
@@ -351,14 +338,6 @@ def _load_inputs(
         # torch.int32, [2 * I, PH], four packed UE8M0 scale bytes per int32.
         "shared_gate_up_weight_scale": _load_tensor(
             group, weight_layer_idx, "shared_gate_up_weight_scale"
-        ),
-        # torch.float8_e4m3fn, [2 * I, H].
-        "shared_gate_up_weight_org": _load_tensor(
-            group, weight_layer_idx, "shared_gate_up_weight_org"
-        ),
-        # torch.float32, [B2I, BH].
-        "shared_gate_up_weight_scale_org": _load_tensor(
-            group, weight_layer_idx, "shared_gate_up_weight_scale_org"
         ),
         # torch.float8_e4m3fn, [E, 2 * I, H].
         "routed_w3_w1_weight": _load_tensor(group, weight_layer_idx, "routed_w3_w1_weight"),
@@ -378,13 +357,29 @@ def _load_inputs(
         "shared_down_weight_scale": _load_tensor(
             group, weight_layer_idx, "shared_down_weight_scale"
         ),
-        # torch.float8_e4m3fn, [H, I].
-        "shared_down_weight_org": _load_tensor(group, weight_layer_idx, "shared_down_weight_org"),
-        # torch.float32, [BH, BI].
-        "shared_down_weight_scale_org": _load_tensor(
-            group, weight_layer_idx, "shared_down_weight_scale_org"
-        ),
     }
+    if include_wip_tensors:
+        tensors.update(
+            {
+                # torch.float8_e4m3fn, [2 * I, H].
+                "shared_gate_up_weight_org": _load_tensor(
+                    group, weight_layer_idx, "shared_gate_up_weight_org"
+                ),
+                # torch.float32, [B2I, BH].
+                "shared_gate_up_weight_scale_org": _load_tensor(
+                    group, weight_layer_idx, "shared_gate_up_weight_scale_org"
+                ),
+                # torch.float8_e4m3fn, [H, I].
+                "shared_down_weight_org": _load_tensor(
+                    group, weight_layer_idx, "shared_down_weight_org"
+                ),
+                # torch.float32, [BH, BI].
+                "shared_down_weight_scale_org": _load_tensor(
+                    group, weight_layer_idx, "shared_down_weight_scale_org"
+                ),
+            }
+        )
+    return tensors
 
 
 def _ensure_v68_prepacked_tensors(tensors: dict[str, torch.Tensor]) -> None:
@@ -624,32 +619,24 @@ def _run_trtllm_baseline(tensors: dict[str, torch.Tensor]) -> torch.Tensor:
 
 def _run_pytorch_decomposed(
     tensors: dict[str, torch.Tensor],
-    *,
-    use_org_shared_gate_up: bool,
-    use_org_shared_down: bool,
 ) -> torch.Tensor:
-    shared_gate_up_weight_org = tensors["shared_gate_up_weight_org"]
-    shared_gate_up_weight_scale_org = tensors["shared_gate_up_weight_scale_org"]
-    with _ref_use_org_weight(use_org_shared_gate_up):
-        expert_indices, expert_weights, shared_swiglu_output, routed_swiglu_output = (
-            Deepseekv3MegaMoE._run_pytorch_ref_mega_kernel(
-                tensors["hidden_states"],
-                tensors["router_weight"],
-                tensors["routing_bias"],
-                tensors["shared_gate_up_weight"],
-                tensors["shared_gate_up_weight_scale"],
-                shared_gate_up_weight_org,
-                shared_gate_up_weight_scale_org,
-                tensors["routed_w3_w1_weight"],
-                tensors["routed_w3_w1_weight_scale"],
-                _top_k(),
-                _n_group(),
-                _topk_group(),
-                _routed_scaling_factor(),
-                _shared_swiglu_limit(),
-                _routed_swiglu_limit(),
-            )
+    expert_indices, expert_weights, shared_swiglu_output, routed_swiglu_output = (
+        Deepseekv3MegaMoE._run_pytorch_ref_mega_kernel(
+            tensors["hidden_states"],
+            tensors["router_weight"],
+            tensors["routing_bias"],
+            tensors["shared_gate_up_weight"],
+            tensors["shared_gate_up_weight_scale"],
+            tensors["routed_w3_w1_weight"],
+            tensors["routed_w3_w1_weight_scale"],
+            _top_k(),
+            _n_group(),
+            _topk_group(),
+            _routed_scaling_factor(),
+            _shared_swiglu_limit(),
+            _routed_swiglu_limit(),
         )
+    )
     # expert_indices: torch.int32, [T, K].
     # expert_weights: torch.bfloat16, [T, K].
     # shared_swiglu_output: torch.bfloat16, [T, I].
@@ -664,16 +651,10 @@ def _run_pytorch_decomposed(
         tensors["hidden_states"].dtype,
     )
 
-    if use_org_shared_down:
-        shared_down_weight = tensors["shared_down_weight_org"]
-        shared_down_weight_scale = tensors["shared_down_weight_scale_org"]
-    else:
-        shared_down_weight = tensors["shared_down_weight"]
-        shared_down_weight_scale = tensors["shared_down_weight_scale"]
     shared_output = _shared_down_project(
         shared_swiglu_output,
-        shared_down_weight,
-        shared_down_weight_scale,
+        tensors["shared_down_weight"],
+        tensors["shared_down_weight_scale"],
         tensors["hidden_states"].dtype,
     )
     # shared_output, routed_output, and the returned hidden states:
@@ -817,17 +798,13 @@ def test_deepseekv3_mega_moe_reference_phase(rank: int) -> None:
         pytest.skip(f"{_PHASE_ENV} disables reference phase")
     _require_cuda_and_ops(require_baseline_ops=True)
     group = _dump_group(rank)
-    tensors = _load_inputs(group, max_num_tokens=_max_wip_num_tokens())
+    tensors = _load_inputs(group, max_num_tokens=_max_wip_num_tokens(), include_wip_tensors=False)
 
     with torch.inference_mode():
         # baseline_output: torch.bfloat16, [T, H].
         baseline_output = _run_trtllm_baseline(tensors)
         # pytorch_ref_output: torch.bfloat16, [T, H].
-        pytorch_ref_output = _run_pytorch_decomposed(
-            tensors,
-            use_org_shared_gate_up=True,
-            use_org_shared_down=True,
-        )
+        pytorch_ref_output = _run_pytorch_decomposed(tensors)
         torch.cuda.synchronize()
 
     _save_tensor(group, "baseline_output", baseline_output)

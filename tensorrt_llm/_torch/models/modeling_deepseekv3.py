@@ -70,7 +70,7 @@ from ..modules.rms_norm import RMSNorm
 from ..peft.lora.layer import LoraLayer
 from ..speculative import SpecMetadata
 from ..utils import (AuxStreamType, EventType, Fp4QuantizedTensor,
-                     create_lm_head_tp_mapping, get_model_extra_attrs)
+                     create_lm_head_tp_mapping)
 from .modeling_deepseekv3_mega_moe import Deepseekv3MegaMoE
 from .modeling_deepseekv3_moe import Deepseekv3MoE
 from .modeling_speculative import SpecDecOneEngineForCausalLM
@@ -1636,13 +1636,6 @@ class DeepseekV3Model(DecoderModel):
         return int(seed)
 
     @staticmethod
-    def _is_mega_moe_debug_warmup_forward() -> bool:
-        extra_attrs = get_model_extra_attrs()
-        if extra_attrs is None:
-            return False
-        return bool(extra_attrs.get("is_warmup", False))
-
-    @staticmethod
     def _is_cuda_graph_capture_active() -> bool:
         return (torch.cuda.is_available()
                 and torch.cuda.is_current_stream_capturing())
@@ -1660,7 +1653,6 @@ class DeepseekV3Model(DecoderModel):
     def _maybe_request_mega_moe_weight_dump(self) -> None:
         if (self._mega_moe_debug_weight_dump_requested
                 or not Deepseekv3MegaMoE.debug_tensor_dump_enabled()
-                or self._is_mega_moe_debug_warmup_forward()
                 or self._is_cuda_graph_capture_active()):
             return
 
@@ -1675,7 +1667,6 @@ class DeepseekV3Model(DecoderModel):
             self, attn_metadata: AttentionMetadata) -> None:
         if (self._mega_moe_debug_activation_dump_requested
                 or not Deepseekv3MegaMoE.debug_tensor_dump_enabled()
-                or self._is_mega_moe_debug_warmup_forward()
                 or self._is_cuda_graph_capture_active()
                 or attn_metadata.num_contexts != 0
                 or attn_metadata.num_generations <= 0):
