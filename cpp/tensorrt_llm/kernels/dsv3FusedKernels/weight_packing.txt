@@ -9,15 +9,16 @@ explain the 49152 tile in more details
   For routed weights, the original dump is [up, gate], but the packed format normalizes it to [gate, up].
 
 
-• The 49152 tile is one v68 weight tile for:
+• The 49152 tile is one fused expert up weight tile for:
 
   64 output rows x 768 K columns x 1 byte per fp8 = 49152 bytes
 
-  v68 processes the hidden dimension H=6144 as 8 K-iterations:
+  fused expert up processes the hidden dimension H=6144 as 8 K-iterations:
 
   6144 / 768 = 8
 
-  For each k_iter, each CTA owns one 64 x 768 slice of the gate or up matrix. That slice is packed into a 1D byte slab of length 49152.
+  For each k_iter, each CTA owns one 64 x 768 slice of the gate or up matrix. That slice is packed
+  into a 1D byte slab of length 49152.
 
   The slab is organized as:
 
@@ -60,10 +61,12 @@ explain the 49152 tile in more details
       + k_sub_in_sixth * 32
       + (lane % 4) * 4
 
-  Why this shape: compute_mma_kiter_v68() consumes the tile by doing two shared-memory vector loads per lane:
+  Why this shape: compute_mma_kiter_fused_expert_up() consumes the tile by doing two shared-memory
+  vector loads per lane:
 
   lds64_b32x2(a_frag[0], a_frag[1], lane_base);
   lds64_b32x2(a_frag[2], a_frag[3], lane_base + 8);
 
-  So each lane wants its 16 bytes to already be contiguous in the MMA A-fragment order. The prepack creates exactly that layout ahead of time,
-  so the kernel only copies the slab into shared memory instead of reconstructing this layout from raw row-major weights every CTA.
+  So each lane wants its 16 bytes to already be contiguous in the MMA A-fragment order. The prepack
+  creates exactly that layout ahead of time, so the kernel only copies the slab into shared memory
+  instead of reconstructing this layout from raw row-major weights every CTA.

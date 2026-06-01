@@ -30,11 +30,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
     import cutlass.cute as cute
     from cutlass.cute.runtime import from_dlpack
 
-_V68_HIDDEN_SIZE = 6144
-_V68_CTA_OUT_ROWS = 64
-_V68_NUM_K_ITER = 8
-_V68_TILE_BYTES = 49152
-_V68_NUM_THREADS = 256
+_FUSED_EXPERT_UP_HIDDEN_SIZE = 6144
+_FUSED_EXPERT_UP_CTA_OUT_ROWS = 64
+_FUSED_EXPERT_UP_NUM_K_ITER = 8
+_FUSED_EXPERT_UP_TILE_BYTES = 49152
+_FUSED_EXPERT_UP_NUM_THREADS = 256
 
 _pack_compile_cache: dict[tuple[object, ...], object] = {}
 _pack_compile_lock = threading.Lock()
@@ -55,59 +55,61 @@ class _CUDAGraphCompatibleWrapper:
 
 def _validate_shared_gate_up_weight(weight: torch.Tensor) -> int:
     if weight.dtype != torch.float8_e4m3fn:
-        raise TypeError(f"v68 pack expects float8_e4m3fn weights, got {weight.dtype}")
+        raise TypeError(f"fused expert up pack expects float8_e4m3fn weights, got {weight.dtype}")
     if weight.ndim != 2:
-        raise ValueError(f"shared v68 pack expects rank-2 weight, got {weight.shape}")
-    if weight.shape[1] != _V68_HIDDEN_SIZE:
+        raise ValueError(f"shared fused expert up pack expects rank-2 weight, got {weight.shape}")
+    if weight.shape[1] != _FUSED_EXPERT_UP_HIDDEN_SIZE:
         raise ValueError(
-            f"shared v68 pack expects hidden size {_V68_HIDDEN_SIZE}, got {weight.shape[1]}"
+            f"shared fused expert up pack expects hidden size {_FUSED_EXPERT_UP_HIDDEN_SIZE}, got {weight.shape[1]}"
         )
     if weight.shape[0] % 2 != 0:
-        raise ValueError(f"shared v68 pack expects [2 * I, H], got {weight.shape}")
+        raise ValueError(f"shared fused expert up pack expects [2 * I, H], got {weight.shape}")
     inter_per_tp = weight.shape[0] // 2
-    if inter_per_tp % _V68_CTA_OUT_ROWS != 0:
+    if inter_per_tp % _FUSED_EXPERT_UP_CTA_OUT_ROWS != 0:
         raise ValueError(
-            f"shared v68 pack expects I to be divisible by {_V68_CTA_OUT_ROWS}, got {inter_per_tp}"
+            "shared fused expert up pack expects I to be divisible by "
+            f"{_FUSED_EXPERT_UP_CTA_OUT_ROWS}, got {inter_per_tp}"
         )
     return inter_per_tp
 
 
 def _validate_routed_w3_w1_weight(weight: torch.Tensor) -> tuple[int, int]:
     if weight.dtype != torch.float8_e4m3fn:
-        raise TypeError(f"v68 pack expects float8_e4m3fn weights, got {weight.dtype}")
+        raise TypeError(f"fused expert up pack expects float8_e4m3fn weights, got {weight.dtype}")
     if weight.ndim != 3:
-        raise ValueError(f"routed v68 pack expects rank-3 weight, got {weight.shape}")
-    if weight.shape[2] != _V68_HIDDEN_SIZE:
+        raise ValueError(f"routed fused expert up pack expects rank-3 weight, got {weight.shape}")
+    if weight.shape[2] != _FUSED_EXPERT_UP_HIDDEN_SIZE:
         raise ValueError(
-            f"routed v68 pack expects hidden size {_V68_HIDDEN_SIZE}, got {weight.shape[2]}"
+            f"routed fused expert up pack expects hidden size {_FUSED_EXPERT_UP_HIDDEN_SIZE}, got {weight.shape[2]}"
         )
     if weight.shape[1] % 2 != 0:
-        raise ValueError(f"routed v68 pack expects [E, 2 * I, H], got {weight.shape}")
+        raise ValueError(f"routed fused expert up pack expects [E, 2 * I, H], got {weight.shape}")
     inter_per_tp = weight.shape[1] // 2
-    if inter_per_tp % _V68_CTA_OUT_ROWS != 0:
+    if inter_per_tp % _FUSED_EXPERT_UP_CTA_OUT_ROWS != 0:
         raise ValueError(
-            f"routed v68 pack expects I to be divisible by {_V68_CTA_OUT_ROWS}, got {inter_per_tp}"
+            "routed fused expert up pack expects I to be divisible by "
+            f"{_FUSED_EXPERT_UP_CTA_OUT_ROWS}, got {inter_per_tp}"
         )
     return weight.shape[0], inter_per_tp
 
 
 if IS_CUTLASS_DSL_AVAILABLE:
 
-    class _PackV68SharedGateUpKernel:
+    class _PackFusedExpertUpSharedGateUpKernel:
         def __init__(self, inter_per_tp: int):
             self.inter_per_tp = inter_per_tp
-            self.sub_rows = inter_per_tp // _V68_CTA_OUT_ROWS
+            self.sub_rows = inter_per_tp // _FUSED_EXPERT_UP_CTA_OUT_ROWS
 
         @cute.kernel
         def pack_kernel(self, raw: cute.Tensor, packed: cute.Tensor):
             tidx, _, _ = cute.arch.thread_idx()
             tile_idx, _, _ = cute.arch.block_idx()
 
-            k_iter = tile_idx % _V68_NUM_K_ITER
-            sub_row = (tile_idx // _V68_NUM_K_ITER) % self.sub_rows
-            side = tile_idx // (self.sub_rows * _V68_NUM_K_ITER)
+            k_iter = tile_idx % _FUSED_EXPERT_UP_NUM_K_ITER
+            sub_row = (tile_idx // _FUSED_EXPERT_UP_NUM_K_ITER) % self.sub_rows
+            side = tile_idx // (self.sub_rows * _FUSED_EXPERT_UP_NUM_K_ITER)
 
-            for elem in range(tidx, _V68_TILE_BYTES, _V68_NUM_THREADS):
+            for elem in range(tidx, _FUSED_EXPERT_UP_TILE_BYTES, _FUSED_EXPERT_UP_NUM_THREADS):
                 byte = elem % 4
                 row_half = (elem // 4) % 2
                 col_half = (elem // 8) % 2
@@ -121,35 +123,35 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 src_col = (
                     k_iter * 768 + k_third * 128 + k_sub * 32 + col_half * 16 + col_quad * 4 + byte
                 )
-                src_offset = src_row * _V68_HIDDEN_SIZE + src_col
-                dst_offset = tile_idx * _V68_TILE_BYTES + elem
+                src_offset = src_row * _FUSED_EXPERT_UP_HIDDEN_SIZE + src_col
+                dst_offset = tile_idx * _FUSED_EXPERT_UP_TILE_BYTES + elem
                 packed[dst_offset] = raw[src_offset]
 
         @cute.jit
         def __call__(self, raw: cute.Tensor, packed: cute.Tensor, stream: cuda.CUstream):
             self.pack_kernel(raw, packed).launch(
-                grid=(2 * self.sub_rows * _V68_NUM_K_ITER, 1, 1),
-                block=(_V68_NUM_THREADS, 1, 1),
+                grid=(2 * self.sub_rows * _FUSED_EXPERT_UP_NUM_K_ITER, 1, 1),
+                block=(_FUSED_EXPERT_UP_NUM_THREADS, 1, 1),
                 stream=stream,
             )
 
-    class _PackV68RoutedW3W1Kernel:
+    class _PackFusedExpertUpRoutedW3W1Kernel:
         def __init__(self, num_experts: int, inter_per_tp: int):
             self.num_experts = num_experts
             self.inter_per_tp = inter_per_tp
-            self.sub_rows = inter_per_tp // _V68_CTA_OUT_ROWS
+            self.sub_rows = inter_per_tp // _FUSED_EXPERT_UP_CTA_OUT_ROWS
 
         @cute.kernel
         def pack_kernel(self, raw: cute.Tensor, packed: cute.Tensor):
             tidx, _, _ = cute.arch.thread_idx()
             tile_idx, _, _ = cute.arch.block_idx()
 
-            k_iter = tile_idx % _V68_NUM_K_ITER
-            sub_row = (tile_idx // _V68_NUM_K_ITER) % self.sub_rows
-            side = (tile_idx // (self.sub_rows * _V68_NUM_K_ITER)) % 2
-            expert_idx = tile_idx // (2 * self.sub_rows * _V68_NUM_K_ITER)
+            k_iter = tile_idx % _FUSED_EXPERT_UP_NUM_K_ITER
+            sub_row = (tile_idx // _FUSED_EXPERT_UP_NUM_K_ITER) % self.sub_rows
+            side = (tile_idx // (self.sub_rows * _FUSED_EXPERT_UP_NUM_K_ITER)) % 2
+            expert_idx = tile_idx // (2 * self.sub_rows * _FUSED_EXPERT_UP_NUM_K_ITER)
 
-            for elem in range(tidx, _V68_TILE_BYTES, _V68_NUM_THREADS):
+            for elem in range(tidx, _FUSED_EXPERT_UP_TILE_BYTES, _FUSED_EXPERT_UP_NUM_THREADS):
                 byte = elem % 4
                 row_half = (elem // 4) % 2
                 col_half = (elem // 8) % 2
@@ -167,18 +169,18 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     k_iter * 768 + k_third * 128 + k_sub * 32 + col_half * 16 + col_quad * 4 + byte
                 )
                 src_offset = (
-                    expert_idx * 2 * self.inter_per_tp * _V68_HIDDEN_SIZE
-                    + src_row * _V68_HIDDEN_SIZE
+                    expert_idx * 2 * self.inter_per_tp * _FUSED_EXPERT_UP_HIDDEN_SIZE
+                    + src_row * _FUSED_EXPERT_UP_HIDDEN_SIZE
                     + src_col
                 )
-                dst_offset = tile_idx * _V68_TILE_BYTES + elem
+                dst_offset = tile_idx * _FUSED_EXPERT_UP_TILE_BYTES + elem
                 packed[dst_offset] = raw[src_offset]
 
         @cute.jit
         def __call__(self, raw: cute.Tensor, packed: cute.Tensor, stream: cuda.CUstream):
             self.pack_kernel(raw, packed).launch(
-                grid=(self.num_experts * 2 * self.sub_rows * _V68_NUM_K_ITER, 1, 1),
-                block=(_V68_NUM_THREADS, 1, 1),
+                grid=(self.num_experts * 2 * self.sub_rows * _FUSED_EXPERT_UP_NUM_K_ITER, 1, 1),
+                block=(_FUSED_EXPERT_UP_NUM_THREADS, 1, 1),
                 stream=stream,
             )
 
@@ -198,28 +200,28 @@ def _run_pack_kernel(
         compiled = _pack_compile_cache.get(compile_key)
         if compiled is None:
             if kind == "shared":
-                kernel = _PackV68SharedGateUpKernel(inter_per_tp=shape_key[0])
+                kernel = _PackFusedExpertUpSharedGateUpKernel(inter_per_tp=shape_key[0])
             elif kind == "routed":
-                kernel = _PackV68RoutedW3W1Kernel(
+                kernel = _PackFusedExpertUpRoutedW3W1Kernel(
                     num_experts=shape_key[0], inter_per_tp=shape_key[1]
                 )
             else:
-                raise ValueError(f"unknown v68 pack kind: {kind}")
+                raise ValueError(f"unknown fused expert up pack kind: {kind}")
             compiled = cute.compile(kernel, raw_cute, packed_cute, current_stream)
             _pack_compile_cache[compile_key] = compiled
     compiled(raw_cute, packed_cute, current_stream)
 
 
-def pack_v68_shared_gate_up_weight(weight: torch.Tensor) -> torch.Tensor:
+def pack_fused_expert_up_shared_gate_up_weight(weight: torch.Tensor) -> torch.Tensor:
     if not IS_CUTLASS_DSL_AVAILABLE:
         raise ImportError("CUTLASS DSL is not available")
     if not weight.is_cuda:
-        raise ValueError("CuTe DSL v68 pack expects a CUDA tensor")
+        raise ValueError("CuTe DSL fused expert up pack expects a CUDA tensor")
     inter_per_tp = _validate_shared_gate_up_weight(weight)
     weight = weight.contiguous()
-    sub_rows = inter_per_tp // _V68_CTA_OUT_ROWS
+    sub_rows = inter_per_tp // _FUSED_EXPERT_UP_CTA_OUT_ROWS
     packed = torch.empty(
-        (2, sub_rows, _V68_NUM_K_ITER, _V68_TILE_BYTES),
+        (2, sub_rows, _FUSED_EXPERT_UP_NUM_K_ITER, _FUSED_EXPERT_UP_TILE_BYTES),
         device=weight.device,
         dtype=weight.dtype,
     )
@@ -227,16 +229,16 @@ def pack_v68_shared_gate_up_weight(weight: torch.Tensor) -> torch.Tensor:
     return packed
 
 
-def pack_v68_routed_w3_w1_weight(weight: torch.Tensor) -> torch.Tensor:
+def pack_fused_expert_up_routed_w3_w1_weight(weight: torch.Tensor) -> torch.Tensor:
     if not IS_CUTLASS_DSL_AVAILABLE:
         raise ImportError("CUTLASS DSL is not available")
     if not weight.is_cuda:
-        raise ValueError("CuTe DSL v68 pack expects a CUDA tensor")
+        raise ValueError("CuTe DSL fused expert up pack expects a CUDA tensor")
     num_experts, inter_per_tp = _validate_routed_w3_w1_weight(weight)
     weight = weight.contiguous()
-    sub_rows = inter_per_tp // _V68_CTA_OUT_ROWS
+    sub_rows = inter_per_tp // _FUSED_EXPERT_UP_CTA_OUT_ROWS
     packed = torch.empty(
-        (num_experts, 2, sub_rows, _V68_NUM_K_ITER, _V68_TILE_BYTES),
+        (num_experts, 2, sub_rows, _FUSED_EXPERT_UP_NUM_K_ITER, _FUSED_EXPERT_UP_TILE_BYTES),
         device=weight.device,
         dtype=weight.dtype,
     )

@@ -70,7 +70,9 @@ from ..peft.lora.layer import LoraLayer
 from ..speculative import SpecMetadata
 from ..utils import (AuxStreamType, EventType, Fp4QuantizedTensor,
                      create_lm_head_tp_mapping)
-from .modeling_deepseekv3_mega_moe import Deepseekv3MegaMoE
+from .modeling_deepseekv3_fused_moe import (FUSED_MOE_MODE_WIP,
+                                            Deepseekv3FusedMoE,
+                                            get_fused_moe_mode)
 from .modeling_deepseekv3_moe import Deepseekv3MoE
 from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import (DecoderModel, EagerFusionConfig, filter_weights,
@@ -178,10 +180,9 @@ class DeepseekV3WeightLoader:
         module_groups: dict[str, list[tuple[str,
                                             nn.Module]]] = defaultdict(list)
         for name, module in all_named_modules.items():
-            is_wip_mega_moe = (isinstance(module, Deepseekv3MegaMoE)
-                               and module.uses_wip_mega_kernel_weights())
-            if (len(module._parameters) <= 0
-                    and not is_wip_mega_moe) or name.startswith("draft_model"):
+            is_dsv3_fused_expert_moe = isinstance(module, Deepseekv3FusedMoE)
+            if (len(module._parameters) <= 0 and not is_dsv3_fused_expert_moe
+                ) or name.startswith("draft_model"):
                 # skip empty modules and draft models
                 # draft models will be loaded elsewhere
                 continue
@@ -468,9 +469,8 @@ class DeepseekV3WeightLoader:
                                    self.config.num_nextn_predict_layers +
                                    self.config.num_hidden_layers)
                     name = '.'.join(names)
-                if (isinstance(module, Deepseekv3MegaMoE)
-                        and module.uses_wip_mega_kernel_weights()):
-                    module.load_wip_mega_kernel_weights(name, weights)
+                if isinstance(module, Deepseekv3FusedMoE):
+                    module.load_dsv3_fused_expert_weights(name, weights)
                     if can_mark_consumed:
                         weights.mark_consumed(f"{name}.gate")
                         weights.mark_consumed(f"{name}.shared_experts")
@@ -1087,13 +1087,9 @@ class DeepseekV3DecoderLayer(DecoderLayer):
             self.fusion_config.PRE_MOE_FUSION = self.enable_fusion and has_tp
             self.fusion_config.POST_MOE_FUSION = self.fusion_config.PRE_MOE_FUSION
 
-            mega_moe_mode = Deepseekv3MegaMoE._mega_moe_mode()
-            mlp_cls = Deepseekv3MegaMoE
-            if mega_moe_mode == Deepseekv3MegaMoE._MEGA_MOE_MODE_BASELINE:
-                mlp_cls = Deepseekv3MoE
-            if layer_idx == 10:
-                print(
-                    f"Using {mlp_cls.__name__} for DeepseekV3DecoderLayer MLP")
+            mlp_cls = Deepseekv3MoE
+            if get_fused_moe_mode() == FUSED_MOE_MODE_WIP:
+                mlp_cls = Deepseekv3FusedMoE
 
             self.mlp = mlp_cls(
                 num_experts=self.num_experts,
@@ -1244,7 +1240,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         residual = maybe_slice_for_helix_cp(residual, attn_metadata,
                                             self.mapping_with_cp,
                                             self.layer_idx)
-        if isinstance(self.mlp, (Deepseekv3MoE, Deepseekv3MegaMoE)):
+        if isinstance(self.mlp, (Deepseekv3MoE, Deepseekv3FusedMoE)):
             if spec_metadata is not None and spec_metadata.is_layer_capture(
                     self.layer_idx):
                 self.fusion_config.POST_MOE_FUSION = False

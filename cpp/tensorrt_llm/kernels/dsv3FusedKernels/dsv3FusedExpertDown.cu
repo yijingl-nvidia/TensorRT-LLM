@@ -15,240 +15,15 @@
  * limitations under the License.
  */
 
-// v110 ExpertDownProject mega kernel — dv103 base + TileRT SASS pattern match.
-// This local-development variant strips the residual add and peer allreduce from
-// the original branch kernel. It computes only:
-//   shared_down(slot 0) + sum_i routed_weight_i * routed_down(slot i + 1).
+// DeepSeek-V3 fused expert-down kernel.
 //
-// dv103's K-loop body has 320 SEL + 263 SHF.R.U32.HI integer ops to do
-// byte-selection from 2 wide LDS.128 loads. dv110 bakes col_lo into the
-// LDS address and uses 4 narrow LDS.U16 per K-iter instead, matching TileRT's
-// BS=4 pattern (narrow per-lane loads after LDGSTS prefetch).
+// This kernel consumes fp16 expert slots from dsv3_fused_expert_up and computes
+// shared_down(slot 0) + sum_i topk_weight_i * routed_down(slot i + 1) into
+// the caller-provided bf16 output tensor. It supports M in [1, 4] and the
+// DeepSeek-V3 TP layouts with K_local=512 (TP=4) or K_local=256 (TP=8).
 //
-// Predicted SASS delta per-spec K-loop body: -320 SEL, -263 SHF.R.U32.HI,
-// -128 LDS.128, +256 LDS.U16 = -455 integer/wide-LDS ops, +256 narrow-LDS
-// = net 199 fewer ops, ~4× narrower smem traffic.
-//
-// Current WIP delta: hidden_in is staged with generic LDG instead of TMA, while
-// preserving dv22's [K_chunks, M, 9, 128] SMEM layout. This keeps the v68->v110
-// handoff in the generic proxy and avoids expensive cross-proxy/system fences.
-//
-// Per D107/D108: mechanism levers null lately; this is a SASS-pattern lever
-// targeting the largest opcode-count delta vs TileRT BS=4. Honest a-priori:
-// 0.5-2% if compiler issues are smem-pipe-throttled, may regress if narrow
-// LDS bank conflicts dominate.
-//
-// All other dv103 levers preserved unchanged.
-//
-// =========================================================================
-// Original dv103 header (PRESERVED FOR CONTEXT):
-// =========================================================================
-// v103 ExpertDownAllReduce mega kernel — dv93 base + add_residual TEMPLATE
-// + my_rank PER-RANK SPECIALIZATION (per dv100 audit C01 + C02).
-//
-// On top of dv93's K_local=512/num_peers=4/kFp8Stages=4 hard-spec, dv110 adds:
-//   * `bool kAddRes` template parameter — replaces the runtime `add_residual`
-//     bool. Each rank-0 launch instantiates kAddRes=true; rank>0 launches
-//     instantiate kAddRes=false. Eliminates the `if (add_residual)` branch
-//     and 2 residual LDG.E.U16 + 2 BF16->F32 + 2 FADD per pair-cell + tail.
-//
-//   * `int kMyRank` template parameter (0..3) — replaces the runtime
-//     `my_rank` int32. Each rank launches its own kernel instantiation.
-//     The compiler folds the writer_stride offset to a compile-time literal
-//     and unrolls the `for (p=0; p<4; ++p) if (p==my_rank) continue;` peer
-//     loops into 3 straight-line iterations with literal peer indices,
-//     eliminating the per-iter ISETP+BRA skip-self compare.
-//
-// Total kernel specializations: 2 (kAddRes) x 4 (kMyRank) = 8 variants,
-// dispatched at launch time. Production-deploy ONLY (same fixed config
-// as dv93: M=4, K_local=512, TP=4).
-//
-// =========================================================================
-// Original dv93 header (PRESERVED FOR CONTEXT):
-// =========================================================================
-// v93 ExpertDownAllReduce mega kernel — dv85 base + EXTENDED hard-spec
-// to additional deploy constants (K_local=512, num_peers=4 [TP=4],
-// kFp8Stages=4). Tests D89 compile-time-spec stall-budget expansion with
-// more constant folding.
-//
-// On top of dv85's M=4 specialization, dv93 hard-codes:
-//   * K_local = 512  (TP=4, GLM-5 deploy)
-//   * k_blocks = K_local / kBlockK = 4
-//   * n_groups = k_blocks / kKBlocksPerGroup = 1
-//   * hidden_k_chunks = K_local / kHiddenKChunk = 4
-//   * num_peers = 4  (TP=4 test rig)
-//   * kFp8Stages = 4 (always — k_blocks=4 always supports it; launcher
-//     drops the runtime stage-selection logic)
-//   * kb_stride_bytes, m_stride_bytes_h, slot_stride_bytes_h fold to
-//     compile-time u32 literals.
-//
-// All M-dependent foldings preserved from dv85.
-//
-// Estimated SASS savings (audit-predicted):
-//   * Eliminates n_groups=1 outer kg-loop (was 1 trip but produced a loop
-//     counter, kg-stride add, scale-table index calc each kig).
-//   * Steady-state `next_kb < k_blocks` check: with stages=4 and
-//     k_blocks=4, next_kb (= kb+4) is always >= 4, so the entire
-//     steady-state re-issue is dead code and can be removed.
-//   * Prologue computes min(kFp8Stages, k_blocks) = 4: simplifies to
-//     unconditional 4-iter prologue.
-//   * `if (num_peers <= 1)` single-rank fast-path: dead at TP=4.
-//   * `if (p >= num_peers) break;` in peer loops: replaced with
-//     `p < 4` direct bound; eliminates per-iteration compare-break.
-//   * AR poll/publish loops: 4 iters each; the conditional skip-self
-//     (`p == my_rank`) stays runtime (varies per rank).
-//   * Launcher: only `mega_down_v110_kernel<4>` compiled; the `<2>` /
-//     `<1>` stage variants and chosen_stages selector are deleted.
-//
-// Trade-off: ONLY works at the FIXED deploy config (M=4, K_local=512,
-// num_peers=4). Launcher TORCH_CHECKs enforce these.
-//
-// All dv56 levers (fp16 MMA, fp16 unpack, bf16->fp16 in-place narrow,
-// TMA SWIZZLE_128B, kStages=4, batched-publish AR, etc.) preserved.
-//
-// =========================================================================
-// Original dv56 header (PRESERVED FOR CONTEXT):
-// =========================================================================
-// v56 ExpertDownAllReduce mega kernel — dv53 base + fp16 MMA retry.
-//
-// dv56 takes dv53 (TMA SWIZZLE_128B + 1024B alignment + STS reduction)
-// and swaps the MMA inputs from bf16 to fp16. Three mechanism levers
-// (same as dv12 on dv9, applied on the new dv53 base):
-//
-//   1) fp8 -> fp16 unpack: single instr `cvt.rn.f16x2.e4m3x2`
-//      (the bf16x2 variant isn't supported on sm_103a; the f16x2
-//      variant is).  Replaces dv53's two-step f32 -> bf16x2 path.
-//
-//   2) MMA dtype: `m16n8k16.row.col.f32.f16.f16.f32` replaces the
-//      bf16.bf16 variant. fp32 accumulator unchanged.
-//
-//   3) hidden_in narrowing: bf16 -> fp16 in smem AFTER the dv22 TMA
-//      bulk staging (same byte footprint, in-place reinterpret).
-//      B-fragment pack: fp16x2 pairs sourced from the f16 smem.
-//
-// Risk per D34/D47: dv12 (fp16 MMA) + dv14 (kStages=4) interfered on
-// dv9 base via HMMA-dispatch slack. dv53 already includes kStages=4.
-// May again interfere. Empirical test.
-//
-// Honest a-priori range: -3% to +3% at M=4. The hypothesis is that
-// dv53's new smem profile (SWIZZLE_128B + STS reduction + L2_256B)
-// re-exposes the F2FP unpack as a binding cost, in which case fp16
-// (single-cycle latency) + single-instr unpack saves cycles.
-//
-// fp16 dynamic range is ±65504. Per-block scale pre-fold (dv8b) keeps
-// activations in a controlled range. MMA accumulator stays fp32.
-//
-// dv53 details preserved verbatim:
-// dv53 changes vs dv30: eliminate the bf16-mini staging path. dv30
-// converts fp8→bf16 into a 16×16 per-warp smem mini-buffer (1 STS.128
-// per lane per K-iter), then `ldmatrix.x4.b16` reads it into A-frag.
-// dv53 reads the 4 specific 2-byte (fp8x2) chunks each lane needs for
-// the m16n8k16 A-fragment DIRECTLY from the fp8 stage via 4 LDS.U16
-// per lane per K-iter, converts in registers, and skips the mini buffer
-// and the LDSM.x4 entirely.
-//
-// Per-K-iter smem-op delta per warp:
-//   * REMOVED: 1 LDS.64 (cvt source) + 1 STS.128 (mini) + 1 LDSM.x4 (A-frag)
-//   * ADDED:   4 LDS.U16 (direct fp8 reads for a_frag[0..3])
-// Net: -1 LDS.64 -1 STS.128 -1 LDSM.x4 +4 LDS.U16 per warp per K-iter.
-// STS.128 count from this site drops to zero. Total smem-op width drops
-// (LDS.U16 narrow but no STS pipe pressure). Brief D55: throughput-bound,
-// so reducing STS count and total smem-op count relieves L1/TEX pipe.
-//
-// The mini-buffer smem allocation is kept zero-size (helper deleted).
-//
-// All other dv30 levers preserved unchanged:
-//   * Grid (148, 1, 1), block (384, 1, 1)
-//   * 3-phase AR tail (Phase A compute / B publish / C poll)
-//   * dv11 self-publish elimination, dv14 kStages=4, dv16 L2_256B,
-//     dv21 ldmatrix.x2 B-frag (B-frag still uses LDSM.x2 — same-warp
-//     register-feasible was NOT possible there because the B operand
-//     reads from a wide bf16 row in smem_hidden that requires the
-//     ldmatrix lane permutation, not a per-lane register pack).
-//   * dv22 TMA bulk hidden_in.
-//   * dv30 batched-publish AR.
-//
-// SASS audit (dv30 baseline):
-//   * 648 STS.128 — ALL from cvt_fp8_to_bf16_mini → eliminated in dv53.
-//   * 357 plain STS — smem_part writes (cross-warp, CANNOT eliminate).
-//   * 45 STS.U16 — smem_bucket_pairs (cross-warp, CANNOT eliminate).
-//   * 45 STS.U8 — smem_bucket_count atomic helpers (cross-warp).
-//   * 6 STS.64 — smem_expert_ids/smem_weights table fill (cross-warp).
-//
-// Note (D17 retrospective context): dv6a hoisted publish INTO compute,
-//
-// dv30 changes vs dv25: restructure the AR tail from
-//   per-cell { compute → publish-to-all-peers → poll-all-peers → FADD → store }
-// into a 3-phase pipeline:
-//   Phase A: each thread computes ALL its owned cells' acc values; caches
-//            them to a local smem `smem_ar_acc` buffer keyed by per-thread
-//            cell index. NO STG/LDG here.
-//   Phase B: TIGHT publish-loop — each thread iterates its cells and
-//            issues STG.E.128.STRONG.SYS to every remote peer in a
-//            no-branch back-to-back burst. NVLink can hold many STGs in
-//            flight per SM; bursting all owned cells' peer-publishes
-//            keeps the wire saturated.
-//   Phase C: poll-loop — each thread iterates its cells, spin-polls each
-//            remote peer's slot, FADDs into local acc, then writes the
-//            final bf16 output.
-//
-// Single CTA-scope `__threadfence_system()` is hoisted from per-cell
-// (dv25 dynamic count = N_cells per thread) to one-per-CTA before the
-// publish burst. Skipping self-rank is preserved from dv11.
-//
-// The hypothesis (per the brief): NVLink intra-node latency per STG is
-// ~1-2 µs but the wire can hold many in flight. dv25's per-cell
-// publish→poll serialization pays the full RTT before issuing the next
-// cell's STG. dv30's burst-publish PIPELINES the publishes so the
-// AGGREGATE wall-time approaches max(per-STG latency, total / throughput)
-// rather than the sum.
-//
-// CAVEAT (from dv6a/D16 retrospective). At M=4, total_cells = 42×4 = 168
-// across 384 threads → only 168 threads active in the AR tail; each does
-// at most 1 cell in the pair-cell path. dv6a confirmed simple burst at
-// M=4 is wash. dv30 differentiates from dv6a by doing the FULL 3-phase
-// split (cache the acc value so the publish-loop can stay purely
-// STG-only), and by keeping the v25 super-stack compute base. The
-// pair-cell loop already amortizes 2 cells per thread → publish loop
-// issues 2 × (num_peers-1) = 6 STGs back-to-back per thread, which is
-// what we want NVLink to pipeline.
-//
-// All other dv25 levers (dv11/dv14/dv16/dv21/dv22) PRESERVED unchanged.
-//
-// SUPER STACK from dv25 retained:
-//   1) [dv11] AR self-publish elimination
-//   2) [dv14] kStages=4 deeper TMA pipeline
-//   3) [dv16] TMA L2 cache promotion = 256B
-//   4) [dv21] B-fragment via ldmatrix.sync.aligned.m8n8.x2.b16
-//   5) [dv22] TMA bulk activation prologue (hidden_in)
-//
-// SMEM accounting (worst case M=4, kStages=4):
-//   * hidden buffer: 4 chunks × M × 9 × 128 × 2 = 4 × 4 × 9 × 128 × 2
-//     = 36 KiB at M=4 (same total as dv9's per-K layout).
-//   * partial accumulator: 9 × 3 × 16 × 16 × 4 = ~28 KiB.
-//   * mbarriers: 12 × kFp8Stages × 8 + 8 (hidden mbarrier).
-//   * fp8 W-tile ring: 12 warps × kStages × 2048 = 96 KiB at kStages=4.
-//   * bf16 mini: 12 × 512 = 6 KiB.
-//   * bucket tables, expert ids, weights: ~6 KiB.
-//   Total ≈ 172 KiB at M=4, well within 232 KiB cap.
-//
-// Integration notes:
-//   * dv22 changes smem_hidden to [K_chunks, M, 9, 128] row-major.
-//     dv21's ldmatrix.x2 row-address scheme is updated to compute
-//     per-(kb, m, slot) row offsets from this new layout.
-//   * dv22's hidden mbarrier sits AFTER all per-warp W_down mbarriers
-//     in the smem ring; index = kNumWarps * kFp8Stages.
-//   * dv16's L2_256B applies to the W_down map; the new hidden map
-//     uses L2_128B by default (kept narrow because hidden is small).
-//
-// Unchanged from dv9 base:
-//   * Grid (148, 1, 1), block (384, 1, 1).
-//   * HMMA.16816.F32.BF16 (NOT fp16).
-//   * Routed-slot MMA dedup (atomicAdd-bucket by expert_id).
-//   * 16-byte STG/LDG.E.128 AR vec.
-//   * Sym-heap sentinel-flag AR primitive.
-//   * Per-K-block fp32 scale pre-fold (dv8b).
-//   * ldmatrix.x4.b16 A-fragment load (dv8c, from cvt fp8→bf16 mini).
+// The deployed path uses packed down weights. The raw-weight path remains for
+// diagnostics and uses TMA staging from the original row-major tensors.
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -285,15 +60,9 @@ constexpr int kMmaK = 16;
 constexpr int kKItersPerBlock = kBlockK / kMmaK;                   // 8
 constexpr int kRowTilesPerCta = (kRowsPerCta + kMmaM - 1) / kMmaM; // 3
 constexpr int kPackedRowTiles = kNumCtas * kRowTilesPerCta;        // 444
-// [dv85] M=4 hard-specialization: kMaxM is now compile-time 4.
-// Every M-dependent literal (loop bounds, smem offsets, buffer sizes)
-// shrinks accordingly. Kernel ONLY accepts M=4.
+// Smem buffers are sized for the maximum decode-token count this kernel supports.
 constexpr int kMaxM = 4;
 
-// [dv93/dv110-tp8] EXTENDED hard-spec for kFp8Stages. Other constants
-// (kKLocal, kNumPeers, kKBlocksPerGroup, etc.) are now per-kernel template
-// parameters to support both TP=4 (kKLocal=512, kNumPeers=4) and TP=8
-// (kKLocal=256, kNumPeers=8).
 constexpr int kSpecFp8Stages = 4; // always 4
 constexpr int kPackedFp8Stages = 2;
 
@@ -310,12 +79,10 @@ constexpr int kFp8BytesPerStage = kWtRows * kWtKChunk; // 2048
 // design always yields a single K-group per (N-block, expert)).
 // Host-side TORCH_CHECK enforces divisibility.
 
-// [dv85] At M=4: kMaxRoutedPairs = 4 * 8 = 32 (was 128 at M=16).
 constexpr int kMaxRoutedPairs = kMaxM * kRoutedSlots; // 32
 constexpr int kMaxBuckets = kMaxRoutedPairs;          // 32
 
-// [dv22] Hidden TMA box K-chunk granularity (innermost K bytes per TMA tile).
-constexpr int kHiddenKChunk = kBlockK; // = 128
+constexpr int kHiddenKChunk = kBlockK;                // = 128
 
 // -----------------------------------------------------------------------------
 // fp8 (e4m3) -> fp16 conversion (single instr — was the lever-killer
@@ -360,7 +127,7 @@ __device__ __forceinline__ void cp_async_16b(void* smem_dst, void const* global_
 #endif
 }
 
-__device__ __forceinline__ void load_packed_w_down_tile_v110(
+__device__ __forceinline__ void load_packed_w_down_tile(
     uint8_t* __restrict__ smem_tile, __nv_fp8_e4m3 const* __restrict__ packed_tile, int lane)
 {
     constexpr int kCopyBytes = 16;
@@ -388,7 +155,7 @@ __device__ __forceinline__ void mma_m16n8k16_f16(uint32_t a0, uint32_t a1, uint3
 }
 
 // -----------------------------------------------------------------------------
-// ldmatrix.sync.aligned.x2.b16 — [dv21].
+// ldmatrix.sync.aligned.x2.b16.
 //
 // 2 8x8 b16 matrices. Lanes 0..7 supply rows of matrix 0; lanes 8..15
 // supply rows of matrix 1; lanes 16..31 are ignored for addressing
@@ -459,71 +226,24 @@ __device__ __forceinline__ void fence_proxy_async_shared()
 }
 
 // -----------------------------------------------------------------------------
-// [dv53] Direct fp8 -> A-fragment loader (STS-elimination).
+// Direct fp8 -> A-fragment loader. It fetches the exact fp8 bytes the
+// m16n8k16 A-fragment requires and converts directly to fp16x2 registers.
 //
-// Replaces the dv30 sequence:
-//   cvt_fp8_to_bf16_mini  -> STS.128 the bf16 mini
-//   __syncwarp
-//   ldmatrix.x4.b16       -> LDSM into A-frag
-// with 2 LDS.U32 per lane that fetch the exact fp8 bytes the
-// m16n8k16 A-fragment requires, plus 4 fp8x2->bf16x2 cvts.
-//
-// m16n8k16 A-fragment layout (per lane T in warp):
+// m16n8k16 A-fragment layout per lane:
 //   a_frag[0] = bf16x2 at (row T/4,     cols 2*(T%4)..2*(T%4)+1)  -> 2 bf16
 //   a_frag[1] = bf16x2 at (row T/4 + 8, cols 2*(T%4)..2*(T%4)+1)
 //   a_frag[2] = bf16x2 at (row T/4,     cols 2*(T%4)+8..2*(T%4)+9)
 //   a_frag[3] = bf16x2 at (row T/4 + 8, cols 2*(T%4)+8..2*(T%4)+9)
 //
-// Observation: a_frag[0] (cols col_lo..col_lo+1) and a_frag[2]
-// (cols col_lo+8..col_lo+9) come from the SAME row (row_lo). The
-// pair spans 10 fp8 bytes. We can read these by ONE LDS.64 (8 B)
-// from a re-arranged 16-byte tile... but actually we can do it
-// with just 2 LDS.32 — one of (row_lo, [col_lo..col_lo+3]) and one
-// of (row_lo, [col_lo+8..col_lo+11]). Reading 4 bytes (LDS.32) but
-// using only the low 2 bytes is wasteful; smarter is one LDS.64
-// per row, taking bytes [col_lo, col_lo+1] (low half) and
-// [col_lo+8, col_lo+9] (high half from byte 8..11). Wait — the
-// 8-byte stride is exactly an LDS.64 worth, so within a single
-// LDS.64 reading bytes [col_lo..col_lo+7], we only get col_lo+1
-// adjacent bytes, NOT col_lo+8.
-//
-// Simpler approach: 2 LDS.U32 per row. Lane T reads col_lo..col_lo+3
-// (LDS.32 #1) and col_lo+8..col_lo+11 (LDS.32 #2). From #1 take the
-// low 2 bytes as fp8x2_a0; from #2 take low 2 bytes as fp8x2_a2.
-// Total: 4 LDS.U32 per K-iter per lane (2 rows × 2 reads each).
-//
-// [dv110] TileRT SASS pattern match: eliminate the 320 SEL + 263 SHF.R.U32.HI
-// per-K-iter byte-extraction chain that dominates dv103's K-loop body.
-//
-// dv103 used 2 LDS.128 (32 bytes total per K-iter per lane) + 4× SEL +
-// 4× SHF.R.U32.HI + 4× LOP3 to extract 8 bytes from 32. The bake-in of
-// col_lo into the LDS address removes the runtime byte-select entirely.
-//
-// Per-lane needed bytes (= 8 bytes total per K-iter):
+// Per-lane bytes needed per K-iteration:
 //   p0_u16 (row_lo, byte col_lo..col_lo+1)
 //   p2_u16 (row_lo, byte col_lo+8..col_lo+9)
 //   p1_u16 (row_hi, byte col_lo..col_lo+1)
 //   p3_u16 (row_hi, byte col_lo+8..col_lo+9)
 //
-// dv110 loads 2 LDS.U16 per row (one at col_lo, one at col_lo+8), 4 LDS.U16
-// total per K-iter per lane. Address fold:
+// The kernel loads 2 LDS.U16 per row. Address fold:
 //   base + row*kWtKChunk + ki_phys*kMmaK + col_lo
 //   base + row*kWtKChunk + ki_phys*kMmaK + col_lo + 8
-// where col_lo = (lane & 3) << 1 is pre-computed and stays in a register
-// once per K-iter (not 4× per K-iter as in dv103's SEL chain).
-//
-// Predicted SASS delta vs dv103 K-loop body:
-//   -320 SEL (R, R, R, !P0)         → 0
-//   -263 SHF.R.U32.HI               → 0
-//   -128 LDS.128 (2 per K-iter × 64)→ 0
-//   +256 LDS.U16 (4 per K-iter × 64)→ +256
-//   net opcode count delta: -455 ops removed, +256 ops added = -199 ops.
-//   Byte-traffic delta: 32 bytes/K-iter → 8 bytes/K-iter (4× narrower).
-//
-// Trade-off: more smem-load issues but narrower bandwidth + zero
-// integer-pipe pressure for the extract. Matches TileRT's BS=4 pattern
-// where post-LDGSTS layout is consumed via per-lane narrow LDS reads
-// rather than wide-load+extract.
 // -----------------------------------------------------------------------------
 __device__ __forceinline__ void cvt_fp8_to_afrag_direct(
     uint32_t fp8_stage_smem, int ki, int lane, uint32_t& a0, uint32_t& a1, uint32_t& a2, uint32_t& a3)
@@ -532,13 +252,12 @@ __device__ __forceinline__ void cvt_fp8_to_afrag_direct(
     int const row_hi = row_lo + 8;      // 8..15
     int const col_lo = (lane & 3) << 1; // 0,2,4,6
 
-    // [dv53] SWIZZLE_128B de-swizzle: TMA wrote fp8 weight tile with
-    // CU_TENSOR_MAP_SWIZZLE_128B (period 8 rows × 8 chunks of 16B each).
+    // TMA writes fp8 weight tiles with CU_TENSOR_MAP_SWIZZLE_128B.
     // For logical (row, chunk=ki), physical chunk = ki XOR (row & 7).
     int const ki_phys_lo = ki ^ (row_lo & 7);
     int const ki_phys_hi = ki ^ (row_hi & 7); // == ki_phys_lo
 
-    // [dv110] LDS.U16 with col_lo baked into the address. No SEL, no SHF.R.
+    // Use LDS.U16 with col_lo baked into the address.
     const uint32_t row_lo_base = fp8_stage_smem + (uint32_t) (row_lo * (int) kWtKChunk + ki_phys_lo * (int) kMmaK);
     const uint32_t row_hi_base = fp8_stage_smem + (uint32_t) (row_hi * (int) kWtKChunk + ki_phys_hi * (int) kMmaK);
     const uint32_t addr_p0 = row_lo_base + (uint32_t) col_lo;
@@ -562,34 +281,21 @@ __device__ __forceinline__ void cvt_fp8_to_afrag_direct(
 // Kernel
 // -----------------------------------------------------------------------------
 template <int kKLocal, bool kUsePackedWeights>
-__global__ __launch_bounds__(kThreadsPerCta, 1) void mega_down_v110_kernel(
+__global__ __launch_bounds__(kThreadsPerCta, 1) void dsv3_fused_expert_down_kernel(
     __grid_constant__ const CUtensorMap routed_w_down_map, __grid_constant__ const CUtensorMap shared_w_down_map,
     __nv_fp8_e4m3 const* __restrict__ routed_w_down_packed, __nv_fp8_e4m3 const* __restrict__ shared_w_down_packed,
     // Read hidden_in via plain LDG (generic memory proxy) instead of TMA.
-    // v68 writes hidden_out through normal global stores, so same-stream
+    // dsv3_fused_expert_up writes through normal global stores, so same-stream
     // kernel ordering is sufficient for this handoff without proxy fences.
-    // [v68-fp16-hidden] Upstream v68 now writes hidden_in as fp16 (was bf16).
-    // The downstream MMA already runs in fp16 so we accept fp16 directly,
-    // skipping the bf16->fp16 narrowing pass that this kernel used to do.
+    // The upstream kernel writes fp16 and the downstream MMA consumes fp16.
     __half const* __restrict__ hidden_in_raw, int32_t const* __restrict__ indices, float const* __restrict__ scores,
     float const* __restrict__ routed_w_down_scale, // [256, 48, k_blocks]
     float const* __restrict__ shared_w_down_scale, // [48, k_blocks]
     __nv_bfloat16* __restrict__ output, int M)
 {
-    // [dv110-runtimeM] M is now a runtime kernel argument in [1, kMaxM].
-    // kMaxM still sizes all smem buffers (compile-time upper bound). M
-    // bounds only the active-token loops; trailing rows in smem may be
-    // uninitialized and must NOT be read by any consumer.
-    // [dv93] EXTENDED hard-spec — runtime args stripped:
-    //   * num_peers parameter removed; replaced with constexpr (template).
-    //   * K_local parameter removed; replaced with constexpr (template).
-    //   * kFp8Stages template parameter removed; replaced with constexpr 4.
+    // kMaxM sizes smem buffers; M bounds active-token loops.
     constexpr int kFp8Stages = kUsePackedWeights ? kPackedFp8Stages : kSpecFp8Stages;
-    constexpr int K_local = kKLocal; // 512 (TP=4) or 256 (TP=8)
-    // [dv110-tp8] Per-template derived counts. Same formulas as before;
-    // values change for TP=8.
-    //   TP=4 (kKLocal=512): kKBlocks=4
-    //   TP=8 (kKLocal=256): kKBlocks=2
+    constexpr int K_local = kKLocal;            // 512 (TP=4) or 256 (TP=8)
     constexpr int kKBlocks = kKLocal / kBlockK; // 4 or 2
 
     int const cta_id = blockIdx.x;
@@ -603,17 +309,15 @@ __global__ __launch_bounds__(kThreadsPerCta, 1) void mega_down_v110_kernel(
     int const row_hi = min(row_lo + kRowsPerCta, kHiddenSize);
     int const rows_here = row_hi - row_lo;
 
-    // [dv93/dv110-tp8] All derived loop counts fold to compile-time literals.
     constexpr int k_blocks = kKBlocks; // 4 (TP=4) or 2 (TP=8)
 
     extern __shared__ unsigned char smem_raw[];
-    // [v68-fp16-hidden] Upstream v68 writes fp16 directly; the smem destination
-    // is fp16 and we skip the bf16->fp16 narrowing pass.
+    // Hidden slots are staged as fp16 because dsv3_fused_expert_up emits fp16.
     __half* smem_hidden = reinterpret_cast<__half*>(smem_raw);
     int const hidden_elems = M * kTopKPlusShared * K_local;
     const size_t hidden_bytes = sizeof(__half) * (size_t) hidden_elems;
 
-    // Cooperatively warm L2 for the small v68->v110 handoff before the per-CTA
+    // Cooperatively warm L2 for the small up->down handoff before the per-CTA
     // shared-memory staging below. The buffer is at most 36 KiB for M <= 4.
     if (tid == 0)
     {
@@ -641,7 +345,7 @@ __global__ __launch_bounds__(kThreadsPerCta, 1) void mega_down_v110_kernel(
     int const part_elems = kTopKPlusShared * kRowTilesPerCta * kMmaM * kMaxM;
     const size_t partial_bytes = sizeof(float) * (size_t) part_elems;
 
-    // ---- Bucketing tables (same as dv7/dv8a). ----
+    // ---- Bucketing tables. ----
     size_t bucket_count_base = partial_base + partial_bytes;
     bucket_count_base = (bucket_count_base + 15) & ~size_t(15);
     int32_t* smem_bucket_count = reinterpret_cast<int32_t*>(smem_raw + bucket_count_base);
@@ -667,25 +371,16 @@ __global__ __launch_bounds__(kThreadsPerCta, 1) void mega_down_v110_kernel(
 
     // ---- fp8 TMA W-tile staging.
     //
-    // [dv53] For TMA SWIZZLE_128B, the destination smem region must be
-    // aligned to the swizzle natural period = 8 rows × 128 B = 1024 B.
-    // The dv48 lever-2 attempt aligned only to 128 B; that caused the
-    // swizzle's chunk-XOR pattern to land at a different row-modulo
-    // depending on `fp8_base % 1024`, which varies with M (since the
-    // hidden_in / per-token tables preceding fp8_base have M-dependent
-    // sizes). Aligning to 1024 B makes the consumer's
-    // `chunk_phys = chunk_logical XOR (row & 7)` formula correct for
-    // ALL M values.
+    // TMA SWIZZLE_128B requires 1024-byte alignment so the chunk-XOR pattern
+    // is independent of M-dependent preceding smem allocations.
     size_t fp8_base = mbar_base + sizeof(uint64_t) * kMbarCount;
-    fp8_base = (fp8_base + 1023) & ~size_t(1023); // [dv53] 1024 B for SWIZZLE_128B
+    fp8_base = (fp8_base + 1023) & ~size_t(1023);
     uint8_t* smem_fp8_stages = smem_raw + fp8_base;
 
-    // ---- bf16 mini-buffers (per warp). ----
-    // [dv53] bf16 mini-buffer eliminated. The lane>=16 fallback for
-    // ldmatrix.x2 B-frag uses warp_fp8_addr instead (valid smem address).
-    // We still consume fp8 stage memory in the same place.
+    // lane>=16 fallback for ldmatrix.x2 B-frag uses warp_fp8_addr as a valid
+    // smem address.
 
-    // ---- [dv22] Init mbarriers FIRST (W_down ring). ----
+    // ---- Init mbarriers for the W_down ring. ----
     if constexpr (!kUsePackedWeights)
     {
         if (tid < kMbarCount)
@@ -771,7 +466,7 @@ __global__ __launch_bounds__(kThreadsPerCta, 1) void mega_down_v110_kernel(
     // Mbarriers are already initialised before weight TMA staging.
     __syncthreads();
 
-    // ---- Bucket routed pairs by expert_id (dv7). ----
+    // ---- Bucket routed pairs by expert_id. ----
     {
         int const total_routed = M * kRoutedSlots;
         for (int i = tid; i < total_routed; i += kThreadsPerCta)
@@ -806,18 +501,14 @@ __global__ __launch_bounds__(kThreadsPerCta, 1) void mega_down_v110_kernel(
 
     int const num_unique = *smem_num_unique;
 
-    // Per-warp mbarrier base index, fp8 stage base, bf16 mini base.
+    // Per-warp mbarrier base index and fp8 stage base.
     int const warp_mbar_base = warp_id * kFp8Stages;
     uint8_t* warp_fp8_base = smem_fp8_stages + warp_id * (kFp8Stages * kFp8BytesPerStage);
-    // [dv53] warp_mini_addr was used as safe-smem-addr fallback for
-    // lane>=16 in ldmatrix.x2 B-frag — replaced by warp_fp8_addr.
     uint32_t warp_fp8_addr = cvt_smem_addr(warp_fp8_base);
-    const uint32_t warp_mini_addr = warp_fp8_addr; // [dv53] safe-smem alias
+    const uint32_t warp_mini_addr = warp_fp8_addr;
 
-    // [dv21+dv22] smem_hidden base addr for ldmatrix.x2 B-frag.
-    //
-    // dv22 smem layout = [K_chunks, M, 9, 128] row-major (innermost = 128
-    // fp16 elements). So per-(kb, m, slot) row offset in bytes is:
+    // smem_hidden layout = [K_chunks, M, 9, 128] row-major (innermost = 128
+    // fp16 elements). Per-(kb, m, slot) row offset in bytes is:
     //   kb * (M * 9 * 128 * 2)
     // + m  * (9 * 128 * 2)
     // + s  * (128 * 2)
@@ -826,8 +517,7 @@ __global__ __launch_bounds__(kThreadsPerCta, 1) void mega_down_v110_kernel(
     // (16 bytes = 8 fp16). ldmatrix.x2 only uses per-lane addresses
     // (not strides), so the wide fp16 row works fine as the row source.
     const uint32_t smem_hidden_addr = cvt_smem_addr(smem_hidden);
-    // [dv110-runtimeM] kb_stride depends on runtime M (hidden staging writes M-packed
-    // rows per K-chunk). m_stride and slot_stride remain compile-time.
+    // kb_stride depends on runtime M. m_stride and slot_stride remain compile-time.
     const uint32_t kb_stride_bytes = (uint32_t) (M * kTopKPlusShared * kHiddenKChunk * 2);  // M*9*128*2
     constexpr uint32_t m_stride_bytes_h = (uint32_t) (kTopKPlusShared * kHiddenKChunk * 2); // 9*128*2 = 2304
     constexpr uint32_t slot_stride_bytes_h = (uint32_t) (kHiddenKChunk * 2);                // 128*2 = 256
@@ -852,7 +542,7 @@ __global__ __launch_bounds__(kThreadsPerCta, 1) void mega_down_v110_kernel(
                           + (size_t) kb)
                         * (size_t) kFp8BytesPerStage;
             }
-            load_packed_w_down_tile_v110(stage_smem, packed_tile, lane);
+            load_packed_w_down_tile(stage_smem, packed_tile, lane);
             asm volatile("cp.async.commit_group;\n" :::);
         }
         else
@@ -904,7 +594,7 @@ __global__ __launch_bounds__(kThreadsPerCta, 1) void mega_down_v110_kernel(
                 continue;
 
             int const e_id = kSharedExpertIdx;
-            // [dv85] n_tiles_m = (4+7)/8 = 1 — single iteration, m_base=0.
+            // M <= 4 means a single M tile with m_base=0.
             constexpr int kNTilesM = 1;
 #pragma unroll
             for (int nt = 0; nt < kNTilesM; ++nt)
@@ -931,16 +621,8 @@ __global__ __launch_bounds__(kThreadsPerCta, 1) void mega_down_v110_kernel(
                     }
                 }
 
-                // [v110-perkb-scale] Per-K-block scale fold INSIDE the K-loop
-                // (was: one group-max scale applied AFTER the loop, with the
-                // ratio s_orig/s_max pre-folded into the FP8 weights — that
-                // pre-fold rescaled every fp8 value through a sub-unity ratio
-                // and re-quantized, leaking ~5 bits per weight). The new path
-                // packs weights bit-identical to the source and applies the
-                // per-K-block scale at MMA-fold time, matching v68's design.
-                //
-                // Per-lane row->n-block mapping is invariant over kb, so we
-                // hoist it out of the kb loop.
+                // Fold the per-K-block scale inside the K-loop. Per-lane
+                // row->n-block mapping is invariant over kb, so hoist it.
                 int const row0_lane_pkb = row_base + (lane >> 2);
                 int const row8_lane_pkb = row_base + (lane >> 2) + 8;
                 int const nb0_pkb = row0_lane_pkb / kBlockN;
@@ -981,12 +663,11 @@ __global__ __launch_bounds__(kThreadsPerCta, 1) void mega_down_v110_kernel(
 #pragma unroll
                     for (int ki = 0; ki < kKItersPerBlock; ++ki)
                     {
-                        // [dv53] Direct fp8 -> A-frag, no STS/LDSM.x4.
+                        // Direct fp8 -> A-frag, no intermediate smem mini-buffer.
                         uint32_t a_frag[4];
                         cvt_fp8_to_afrag_direct(fp8_stage_ptr, ki, lane, a_frag[0], a_frag[1], a_frag[2], a_frag[3]);
 
-                        // [dv21+dv22] B-frag via ldmatrix.x2.b16
-                        // from smem layout [K_chunks, M, 9, 128].
+                        // B-frag via ldmatrix.x2.b16 from smem layout [K_chunks, M, 9, 128].
                         // Lanes 0..7 supply mat0 rows (k=0..7 of ki);
                         // lanes 8..15 supply mat1 rows (k=8..15);
                         // lanes 16..31 use warp_mini_addr as a safe
@@ -1008,7 +689,7 @@ __global__ __launch_bounds__(kThreadsPerCta, 1) void mega_down_v110_kernel(
                         mma_m16n8k16_f16(a_frag[0], a_frag[1], a_frag[2], a_frag[3], b_frag[0], b_frag[1], c_block[0],
                             c_block[1], c_block[2], c_block[3]);
 
-                        // [dv53] no mini-buffer, so no syncwarp needed here.
+                        // No intermediate mini-buffer, so no syncwarp is needed here.
                     }
 
                     // Steady-state: pre-issue (kb + kFp8Stages) into the
@@ -1030,11 +711,8 @@ __global__ __launch_bounds__(kThreadsPerCta, 1) void mega_down_v110_kernel(
                         }
                     }
 
-                    // [v110-perkb-scale] Per-K-block FFMA fold. Each K-block
-                    // has its own scale (raw scale from the source, no rescale).
-                    // The fp32 accumulator preserves intermediate precision
-                    // across kb's, matching v68's per-K-block design and the
-                    // parent fp8_block_scale_moe runner's precision profile.
+                    // Per-K-block FFMA fold. Each K-block uses its raw source
+                    // scale; fp32 accumulation preserves intermediate precision.
                     float const s0_kb = s0_base_pkb[kb];
                     float const s8_kb = (nb8_pkb == nb0_pkb) ? s0_kb : s8_base_pkb[kb];
                     c[0] += c_block[0] * s0_kb;
@@ -1089,8 +767,8 @@ __global__ __launch_bounds__(kThreadsPerCta, 1) void mega_down_v110_kernel(
 
                 float c[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 
-                // [dv21+dv22] Pre-compute per-lane base offset (in bytes)
-                // into smem_hidden for ldmatrix.x2.b16 B-frag loads.
+                // Pre-compute per-lane base offset in smem_hidden for
+                // ldmatrix.x2.b16 B-frag loads.
                 // Lanes 0..7 address mat0 rows (one pair each); lanes 8..15
                 // address mat1 rows (same pair as lane-8); lanes 16..31
                 // are unused — fall back to warp_mini_addr.
@@ -1129,9 +807,7 @@ __global__ __launch_bounds__(kThreadsPerCta, 1) void mega_down_v110_kernel(
                     }
                 }
 
-                // [v110-perkb-scale] Per-K-block scale fold INSIDE the K-loop
-                // (see Phase A for design rationale). Routed path mirrors the
-                // shared path's per-K-block FFMA fold.
+                // Fold routed per-K-block scales inside the K-loop.
                 int const row0_lane_pkbR = row_base + (lane >> 2);
                 int const row8_lane_pkbR = row_base + (lane >> 2) + 8;
                 int const nb0_pkbR = row0_lane_pkbR / kBlockN;
@@ -1171,12 +847,11 @@ __global__ __launch_bounds__(kThreadsPerCta, 1) void mega_down_v110_kernel(
 #pragma unroll
                     for (int ki = 0; ki < kKItersPerBlock; ++ki)
                     {
-                        // [dv53] Direct fp8 -> A-frag, no STS/LDSM.x4.
+                        // Direct fp8 -> A-frag, no intermediate smem mini-buffer.
                         uint32_t a_frag[4];
                         cvt_fp8_to_afrag_direct(fp8_stage_ptr, ki, lane, a_frag[0], a_frag[1], a_frag[2], a_frag[3]);
 
-                        // [dv21+dv22] B-frag via ldmatrix.x2.b16
-                        // from smem [K_chunks, M, 9, 128].
+                        // B-frag via ldmatrix.x2.b16 from smem [K_chunks, M, 9, 128].
                         uint32_t b_frag[2];
                         {
                             int const mat_id_b = (lane >> 3) & 1;
@@ -1189,7 +864,7 @@ __global__ __launch_bounds__(kThreadsPerCta, 1) void mega_down_v110_kernel(
 
                         mma_m16n8k16_f16(a_frag[0], a_frag[1], a_frag[2], a_frag[3], b_frag[0], b_frag[1], c_block[0],
                             c_block[1], c_block[2], c_block[3]);
-                        // [dv53] no mini-buffer, so no syncwarp needed here.
+                        // No intermediate mini-buffer, so no syncwarp is needed here.
                     }
 
                     // Steady-state: pre-issue (kb + kFp8Stages) into the
@@ -1211,7 +886,7 @@ __global__ __launch_bounds__(kThreadsPerCta, 1) void mega_down_v110_kernel(
                         }
                     }
 
-                    // [v110-perkb-scale] Per-K-block FFMA fold.
+                    // Per-K-block FFMA fold.
                     float const s0_kbR = s0_base_pkbR[kb];
                     float const s8_kbR = (nb8_pkbR == nb0_pkbR) ? s0_kbR : s8_base_pkbR[kb];
                     c[0] += c_block[0] * s0_kbR;
@@ -1324,10 +999,9 @@ __global__ __launch_bounds__(kThreadsPerCta, 1) void mega_down_v110_kernel(
 //   * dim 1 (y = N rows)
 //   * dim 2 (z = E experts)
 // Box dim per tile = [kBlockK, kMmaM, 1] = [128, 16, 1].
-// [dv53] SWIZZLE_128B mode. 128-byte rows × 16 rows = 2 swizzle periods
-// of 8 rows each. For each row r, the 8 16-byte chunks are permuted by
-// chunk_phys = chunk_logical XOR (r & 7). Bank-conflict-free for the
-// consumer's LDS.128 (see cvt_fp8_to_afrag_direct).
+// SWIZZLE_128B mode uses 128-byte rows and 16 rows, giving 2 swizzle
+// periods of 8 rows each. For each row r, the 8 16-byte chunks are permuted
+// by chunk_phys = chunk_logical XOR (r & 7).
 static CUtensorMap make_w_down_tmap(void* base_ptr, int num_experts, int K_local, CUresult* out_err)
 {
     CUtensorMap map = {};
@@ -1349,8 +1023,7 @@ static CUtensorMap make_w_down_tmap(void* base_ptr, int num_experts, int K_local
 
     *out_err = cuTensorMapEncodeTiled(&map, CU_TENSOR_MAP_DATA_TYPE_UINT8,
         /*rank=*/3, base_ptr, global_dim, global_stride, box_dim, elem_stride, CU_TENSOR_MAP_INTERLEAVE_NONE,
-        CU_TENSOR_MAP_SWIZZLE_128B, // [dv53] bank-conflict-free fp8 stage reads
-        CU_TENSOR_MAP_L2_PROMOTION_L2_256B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+        CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_256B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
     return map;
 }
 
@@ -1423,7 +1096,7 @@ static CUtensorMap get_cached_w_down_tmap(
 // -----------------------------------------------------------------------------
 // Host launcher
 // -----------------------------------------------------------------------------
-torch::Tensor mega_down_project_v110(torch::Tensor hidden_in, torch::Tensor indices, torch::Tensor scores,
+torch::Tensor dsv3_fused_expert_down_cuda(torch::Tensor hidden_in, torch::Tensor indices, torch::Tensor scores,
     torch::Tensor routed_w_down,       // fp8 [256, 6144, K_local]
     torch::Tensor routed_w_down_scale, // fp32 [256, 48, k_blocks]
     torch::Tensor shared_w_down,       // fp8 [6144, K_local]
@@ -1439,8 +1112,7 @@ torch::Tensor mega_down_project_v110(torch::Tensor hidden_in, torch::Tensor indi
     TORCH_CHECK(shared_w_down_scale.is_cuda(), "shared_w_down_scale must be CUDA");
     TORCH_CHECK(output.is_cuda(), "output must be CUDA");
 
-    // [v68-fp16-hidden] hidden_in is now fp16 (was bf16).
-    TORCH_CHECK(hidden_in.dtype() == torch::kHalf, "hidden_in must be fp16 (was bf16; v68 now emits fp16)");
+    TORCH_CHECK(hidden_in.dtype() == torch::kHalf, "hidden_in must be fp16");
     TORCH_CHECK(indices.dtype() == torch::kInt32, "indices must be int32");
     TORCH_CHECK(scores.dtype() == torch::kFloat32, "scores must be fp32");
     TORCH_CHECK(routed_w_down.dtype() == torch::kFloat8_e4m3fn, "routed_w_down must be fp8 e4m3");
@@ -1460,12 +1132,10 @@ torch::Tensor mega_down_project_v110(torch::Tensor hidden_in, torch::Tensor indi
     int const M = static_cast<int>(hidden_in.size(0));
     int const K_local = static_cast<int>(hidden_in.size(2));
     bool const use_packed_weights = routed_w_down.dim() == 4 || shared_w_down.dim() == 3;
-    // [dv110-runtimeM] M is now a runtime argument in [1, kMaxM]. Smem
-    // buffers are sized for kMaxM (compile-time upper bound); only the
-    // active-token loops use the runtime M.
-    TORCH_CHECK(M >= 1 && M <= kMaxM, "v110 supports M in [1, ", kMaxM, "]; got M=", M);
+    // Smem buffers are sized for kMaxM; only active-token loops use runtime M.
+    TORCH_CHECK(M >= 1 && M <= kMaxM, "dsv3_fused_expert_down supports M in [1, ", kMaxM, "]; got M=", M);
     TORCH_CHECK(K_local == 512 || K_local == 256,
-        "v110 supports K_local=512 [TP=4] or K_local=256 [TP=8]; got K_local=", K_local);
+        "dsv3_fused_expert_down supports K_local=512 [TP=4] or K_local=256 [TP=8]; got K_local=", K_local);
     TORCH_CHECK(output.dim() == 2 && output.size(0) == M && output.size(1) == kHiddenSize, "output must be [M, 6144]");
     int const k_blocks = K_local / kBlockK; // 4 (TP=4) or 2 (TP=8)
     if (use_packed_weights)
@@ -1560,25 +1230,26 @@ torch::Tensor mega_down_project_v110(torch::Tensor hidden_in, torch::Tensor indi
     size_t max_smem_bytes = compute_smem(chosen_stages, kMaxM, use_packed_weights);
 
     const size_t kSmemCapBytes = 232448; // B200/GB300 maxSharedMemoryPerBlockOptin
-    TORCH_CHECK(
-        max_smem_bytes <= kSmemCapBytes, "dv110 smem footprint ", max_smem_bytes, " exceeds cap ", kSmemCapBytes);
+    TORCH_CHECK(max_smem_bytes <= kSmemCapBytes, "dsv3_fused_expert_down smem footprint ", max_smem_bytes,
+        " exceeds cap ", kSmemCapBytes);
 
     using KernelFn = void (*)(const CUtensorMap, const CUtensorMap, __nv_fp8_e4m3 const*, __nv_fp8_e4m3 const*,
-        __half const*, // [v68-fp16-hidden] hidden_in_raw (was bf16)
-        int32_t const*, float const*, float const*, float const*, __nv_bfloat16*, int);
+        __half const*, int32_t const*, float const*, float const*, float const*, __nv_bfloat16*, int);
 
     KernelFn kfn = nullptr;
     if (K_local == 512)
     {
-        kfn = use_packed_weights ? &mega_down_v110_kernel<512, true> : &mega_down_v110_kernel<512, false>;
+        kfn = use_packed_weights ? &dsv3_fused_expert_down_kernel<512, true>
+                                 : &dsv3_fused_expert_down_kernel<512, false>;
     }
     else if (K_local == 256)
     {
-        kfn = use_packed_weights ? &mega_down_v110_kernel<256, true> : &mega_down_v110_kernel<256, false>;
+        kfn = use_packed_weights ? &dsv3_fused_expert_down_kernel<256, true>
+                                 : &dsv3_fused_expert_down_kernel<256, false>;
     }
     else
     {
-        TORCH_CHECK(false, "v110 only supports K_local=512 or K_local=256; got K_local=", K_local);
+        TORCH_CHECK(false, "dsv3_fused_expert_down only supports K_local=512 or K_local=256; got K_local=", K_local);
     }
 
     auto set_smem_attribute_once = [&](std::once_flag& flag)
@@ -1635,7 +1306,6 @@ torch::Tensor mega_down_project_v110(torch::Tensor hidden_in, torch::Tensor indi
         ? reinterpret_cast<__nv_fp8_e4m3 const*>(shared_w_down.data_ptr<at::Float8_e4m3fn>())
         : nullptr;
     // Hidden_in is staged in the kernel with generic LDG instead of TMA.
-    // [v68-fp16-hidden] hidden_in dtype is now __half (was __nv_bfloat16).
     __half const* hidden_in_ptr = reinterpret_cast<__half const*>(hidden_in.data_ptr<at::Half>());
     int32_t const* indices_ptr = indices.data_ptr<int32_t>();
     float const* scores_ptr = scores.data_ptr<float>();
@@ -1654,7 +1324,8 @@ torch::Tensor mega_down_project_v110(torch::Tensor hidden_in, torch::Tensor indi
     args[10] = &m_arg;
 
     cudaError_t launch_err = cudaLaunchKernel((void const*) kfn, grid, block, args, smem_bytes, stream);
-    TORCH_CHECK(launch_err == cudaSuccess, "dv110 cudaLaunchKernel failed: ", cudaGetErrorString(launch_err));
+    TORCH_CHECK(
+        launch_err == cudaSuccess, "dsv3_fused_expert_down cudaLaunchKernel failed: ", cudaGetErrorString(launch_err));
 
     AT_CUDA_CHECK(cudaGetLastError());
     return output;
