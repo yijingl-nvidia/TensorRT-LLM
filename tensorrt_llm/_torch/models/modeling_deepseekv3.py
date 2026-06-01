@@ -28,7 +28,6 @@
 import copy
 import math
 import os
-import random
 import threading
 from collections import defaultdict
 from typing import Dict, List, Optional
@@ -458,8 +457,6 @@ class DeepseekV3WeightLoader:
         # Once related feature branches are merged, we can remove this indentation.
         if True:
             if True:
-                # hack for finding correct weight names for MoE modules
-                name = name.replace("._old_moe", "")
                 names: list[str] = name.split('.')
                 parent_module_name = '.'.join(names[:-1])
                 if "model.layers" in name and int(
@@ -1623,66 +1620,6 @@ class DeepseekV3Model(DecoderModel):
         self.norm = RMSNorm(hidden_size=config.hidden_size,
                             eps=config.rms_norm_eps,
                             dtype=config.torch_dtype)
-        self._mega_moe_debug_rng = random.Random(self._mega_moe_debug_seed())
-        self._mega_moe_debug_weight_dump_requested = False
-        self._mega_moe_debug_activation_decode_iter = 0
-        self._mega_moe_debug_activation_target_iter = (
-            self._mega_moe_debug_rng.randint(5, 30))
-        self._mega_moe_debug_activation_dump_requested = False
-
-    @staticmethod
-    def _mega_moe_debug_seed() -> int:
-        seed = os.environ.get("TRTLLM_DEEPSEEKV3_MEGAMOE_DUMP_SEED", "0")
-        return int(seed)
-
-    @staticmethod
-    def _is_cuda_graph_capture_active() -> bool:
-        return (torch.cuda.is_available()
-                and torch.cuda.is_current_stream_capturing())
-
-    def _select_random_mega_moe(self) -> Optional[Deepseekv3MegaMoE]:
-        mega_moe_layers = [
-            decoder_layer.mlp
-            for decoder_layer in self.layers[:self.num_hidden_layers]
-            if isinstance(decoder_layer.mlp, Deepseekv3MegaMoE)
-        ]
-        if not mega_moe_layers:
-            return None
-        return self._mega_moe_debug_rng.choice(mega_moe_layers)
-
-    def _maybe_request_mega_moe_weight_dump(self) -> None:
-        if (self._mega_moe_debug_weight_dump_requested
-                or not Deepseekv3MegaMoE.debug_tensor_dump_enabled()
-                or self._is_cuda_graph_capture_active()):
-            return
-
-        mega_moe = self._select_random_mega_moe()
-        if mega_moe is None:
-            self._mega_moe_debug_weight_dump_requested = True
-            return
-        mega_moe.request_weight_tensor_dump()
-        self._mega_moe_debug_weight_dump_requested = True
-
-    def _maybe_request_mega_moe_activation_dump(
-            self, attn_metadata: AttentionMetadata) -> None:
-        if (self._mega_moe_debug_activation_dump_requested
-                or not Deepseekv3MegaMoE.debug_tensor_dump_enabled()
-                or self._is_cuda_graph_capture_active()
-                or attn_metadata.num_contexts != 0
-                or attn_metadata.num_generations <= 0):
-            return
-
-        self._mega_moe_debug_activation_decode_iter += 1
-        if (self._mega_moe_debug_activation_decode_iter
-                != self._mega_moe_debug_activation_target_iter):
-            return
-
-        mega_moe = self._select_random_mega_moe()
-        if mega_moe is None:
-            self._mega_moe_debug_activation_dump_requested = True
-            return
-        mega_moe.request_activation_tensor_dump()
-        self._mega_moe_debug_activation_dump_requested = True
 
     def forward(
         self,
@@ -1703,9 +1640,6 @@ class DeepseekV3Model(DecoderModel):
 
         hidden_states = inputs_embeds
         residual = None
-
-        self._maybe_request_mega_moe_weight_dump()
-        self._maybe_request_mega_moe_activation_dump(attn_metadata)
 
         for idx, decoder_layer in enumerate(
                 self.layers[:self.num_hidden_layers]):
