@@ -19,8 +19,11 @@ from ..utils import AuxStreamType, Fp4QuantizedTensor
 from .modeling_deepseekv3_moe import Deepseekv3MoE
 
 _FUSED_MOE_PREPACK_FUSED_EXPERT_DOWN_ENV = "TRTLLM_DEEPSEEKV3_FUSED_MOE_PREPACK_FUSED_EXPERT_DOWN"
+_FUSED_EXPERT_DOWN_FINALIZE_MODE_ENV = "TRTLLM_DEEPSEEKV3_FUSED_EXPERT_DOWN_FINALIZE_MODE"
 FUSED_MOE_MODE_BASELINE = "baseline"
 FUSED_MOE_MODE_WIP = "wip"
+FUSED_EXPERT_DOWN_FINALIZE_MODE_LOCAL = "local"
+FUSED_EXPERT_DOWN_FINALIZE_MODE_ALLREDUCE_RESIDUAL_RMS_NORM = "allreduce_residual_rms_norm"
 _DSV3_FUSED_EXPERT_WEIGHT_LOAD_LOCK = threading.Lock()
 _FUSED_EXPERT_UP_HIDDEN_SIZE = 6144
 _FUSED_EXPERT_UP_CTA_OUT_ROWS = 64
@@ -70,6 +73,40 @@ def get_fused_moe_mode() -> str:
         allowed_modes = ", ".join((FUSED_MOE_MODE_BASELINE, FUSED_MOE_MODE_WIP))
         raise ValueError(
             f"Unsupported TRTLLM_DEEPSEEKV3_FUSED_MOE_MODE={mode!r}; "
+            f"expected one of: {allowed_modes}"
+        )
+    return mode_aliases[mode]
+
+
+def get_fused_expert_down_finalize_mode() -> str:
+    mode = (
+        os.environ.get(
+            _FUSED_EXPERT_DOWN_FINALIZE_MODE_ENV,
+            FUSED_EXPERT_DOWN_FINALIZE_MODE_LOCAL,
+        )
+        .strip()
+        .lower()
+    )
+    mode_aliases = {
+        "local": FUSED_EXPERT_DOWN_FINALIZE_MODE_LOCAL,
+        "none": FUSED_EXPERT_DOWN_FINALIZE_MODE_LOCAL,
+        "debug": FUSED_EXPERT_DOWN_FINALIZE_MODE_LOCAL,
+        "allreduce_residual_rms_norm": (
+            FUSED_EXPERT_DOWN_FINALIZE_MODE_ALLREDUCE_RESIDUAL_RMS_NORM
+        ),
+        "trtllm_allreduce_residual_rms_norm": (
+            FUSED_EXPERT_DOWN_FINALIZE_MODE_ALLREDUCE_RESIDUAL_RMS_NORM
+        ),
+    }
+    if mode not in mode_aliases:
+        allowed_modes = ", ".join(
+            (
+                FUSED_EXPERT_DOWN_FINALIZE_MODE_LOCAL,
+                FUSED_EXPERT_DOWN_FINALIZE_MODE_ALLREDUCE_RESIDUAL_RMS_NORM,
+            )
+        )
+        raise ValueError(
+            f"Unsupported {_FUSED_EXPERT_DOWN_FINALIZE_MODE_ENV}={mode!r}; "
             f"expected one of: {allowed_modes}"
         )
     return mode_aliases[mode]
@@ -785,6 +822,7 @@ class Deepseekv3FusedMoE(nn.Module):
     def _forward_dsv3_fused_expert_owned(
         self,
         hidden_states: torch.Tensor,
+        final_all_reduce_params: AllReduceParams | None,
         all_rank_num_tokens: list[int] | None,
         num_tokens: int,
         hidden_size: int,
@@ -979,7 +1017,7 @@ class Deepseekv3FusedMoE(nn.Module):
         if output_tensor is None:
             output_tensor = torch.empty_like(hidden_states)
 
-        final_hidden_states = self._run_dsv3_fused_expert_down_chunked(
+        local_hidden_states = self._run_dsv3_fused_expert_down_chunked(
             slot_swiglu_output,
             expert_indices,
             expert_weights,
@@ -990,16 +1028,31 @@ class Deepseekv3FusedMoE(nn.Module):
             output_tensor,
         )
         check_data(
-            final_hidden_states,
+            local_hidden_states,
             "dsv3_fused_expert_down.final_hidden_states",
             torch.bfloat16,
             tuple(hidden_states.shape),
         )
+
+        final_hidden_states: torch.Tensor | tuple[torch.Tensor, ...] = local_hidden_states
+        if final_all_reduce_params is not None:
+            if self.allreduce is None:
+                if final_all_reduce_params.enable_allreduce:
+                    raise RuntimeError(
+                        "Deepseekv3FusedMoE received enabled final_all_reduce_params "
+                        "without an AllReduce module"
+                    )
+            else:
+                final_hidden_states = self.allreduce(
+                    local_hidden_states,
+                    all_reduce_params=final_all_reduce_params,
+                )
         return final_hidden_states
 
     def _forward_dsv3_fused_expert(
         self,
         hidden_states: torch.Tensor,
+        final_all_reduce_params: AllReduceParams | None,
         all_rank_num_tokens: list[int] | None,
         num_tokens: int,
         hidden_size: int,
@@ -1015,6 +1068,7 @@ class Deepseekv3FusedMoE(nn.Module):
         """
         return self._forward_dsv3_fused_expert_owned(
             hidden_states=hidden_states,
+            final_all_reduce_params=final_all_reduce_params,
             all_rank_num_tokens=all_rank_num_tokens,
             num_tokens=num_tokens,
             hidden_size=hidden_size,
@@ -1035,7 +1089,7 @@ class Deepseekv3FusedMoE(nn.Module):
         do_finalize: bool | None = True,
     ) -> torch.Tensor:
         assert do_finalize is True, "Deepseekv3FusedMoE only supports do_finalize=True"
-        del hidden_states_fp4, final_all_reduce_params
+        del hidden_states_fp4
 
         num_tokens: int = hidden_states.size(0)
         selected_fused_moe_mode = get_fused_moe_mode()
@@ -1054,6 +1108,7 @@ class Deepseekv3FusedMoE(nn.Module):
             gate_up_output_size = 2 * expert_intermediate_size
             return self._forward_dsv3_fused_expert(
                 hidden_states=hidden_states,
+                final_all_reduce_params=final_all_reduce_params,
                 all_rank_num_tokens=all_rank_num_tokens,
                 num_tokens=num_tokens,
                 hidden_size=hidden_size,

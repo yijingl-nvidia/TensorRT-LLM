@@ -70,9 +70,10 @@ from ..peft.lora.layer import LoraLayer
 from ..speculative import SpecMetadata
 from ..utils import (AuxStreamType, EventType, Fp4QuantizedTensor,
                      create_lm_head_tp_mapping)
-from .modeling_deepseekv3_fused_moe import (FUSED_MOE_MODE_WIP,
-                                            Deepseekv3FusedMoE,
-                                            get_fused_moe_mode)
+from .modeling_deepseekv3_fused_moe import (
+    FUSED_EXPERT_DOWN_FINALIZE_MODE_ALLREDUCE_RESIDUAL_RMS_NORM,
+    FUSED_MOE_MODE_WIP, Deepseekv3FusedMoE, get_fused_expert_down_finalize_mode,
+    get_fused_moe_mode)
 from .modeling_deepseekv3_moe import Deepseekv3MoE
 from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import (DecoderModel, EagerFusionConfig, filter_weights,
@@ -1297,14 +1298,30 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         #         f"POST_MOE_FUSION={self.fusion_config.POST_MOE_FUSION}",
         #         flush=True)
 
+        fused_expert_down_finalizes_post_moe = (
+            isinstance(self.mlp, Deepseekv3FusedMoE)
+            and self.fusion_config.POST_MOE_FUSION
+            and get_fused_expert_down_finalize_mode()
+            == FUSED_EXPERT_DOWN_FINALIZE_MODE_ALLREDUCE_RESIDUAL_RMS_NORM)
+
         def _run_MoE(hidden_states, hidden_states_fp4, do_finalize):
+            if fused_expert_down_finalizes_post_moe:
+                final_all_reduce_params = AllReduceParams(
+                    fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
+                    residual=residual,
+                    norm_weight=self.next_layer_layernorm.weight,
+                    eps=self.next_layer_layernorm.variance_epsilon,
+                    trigger_completion_at_end=False,
+                )
+            else:
+                final_all_reduce_params = AllReduceParams(
+                    enable_allreduce=not (self.fusion_config.POST_MOE_FUSION
+                                          or self.mapping.tp_size == 1))
             return self.mlp(
                 hidden_states,
                 hidden_states_fp4,
                 all_rank_num_tokens=attn_metadata.all_rank_num_tokens,
-                final_all_reduce_params=AllReduceParams(
-                    enable_allreduce=not (self.fusion_config.POST_MOE_FUSION
-                                          or self.mapping.tp_size == 1)),
+                final_all_reduce_params=final_all_reduce_params,
                 do_finalize=do_finalize,
             )
 
@@ -1337,7 +1354,10 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                                  do_finalize=do_finalize)
 
         if self.fusion_config.POST_MOE_FUSION:
-            if do_finalize:
+            if fused_expert_down_finalizes_post_moe and do_finalize:
+                assert isinstance(hidden_states, tuple)
+                hidden_states, residual = hidden_states
+            elif do_finalize:
                 hidden_states, residual = self.allreduce(
                     hidden_states,
                     all_reduce_params=AllReduceParams(
@@ -1552,25 +1572,45 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
             hidden_states, residual = self.post_attention_layernorm(
                 hidden_states, residual)
 
+        fused_expert_down_finalizes_post_moe = (
+            isinstance(self.mlp, Deepseekv3FusedMoE)
+            and self.fusion_config.POST_MOE_FUSION
+            and get_fused_expert_down_finalize_mode()
+            == FUSED_EXPERT_DOWN_FINALIZE_MODE_ALLREDUCE_RESIDUAL_RMS_NORM)
+
+        if fused_expert_down_finalizes_post_moe:
+            final_all_reduce_params = AllReduceParams(
+                fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
+                residual=residual,
+                norm_weight=self.shared_head.norm.weight,
+                eps=self.shared_head.norm.variance_epsilon,
+            )
+        else:
+            final_all_reduce_params = AllReduceParams(
+                enable_allreduce=not (self.fusion_config.POST_MOE_FUSION
+                                      or self.mapping.tp_size == 1))
+
         # MoE
         hidden_states = self.mlp(
             hidden_states,
             all_rank_num_tokens=all_rank_num_tokens,
-            final_all_reduce_params=AllReduceParams(
-                enable_allreduce=not (self.fusion_config.POST_MOE_FUSION
-                                      or self.mapping.tp_size == 1)),
+            final_all_reduce_params=final_all_reduce_params,
         )
 
         if self.fusion_config.POST_MOE_FUSION:
-            hidden_states, residual = self.allreduce(
-                hidden_states,
-                all_reduce_params=AllReduceParams(
-                    fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
-                    residual=residual,
-                    norm_weight=self.shared_head.norm.weight,
-                    eps=self.shared_head.norm.variance_epsilon,
-                ),
-            )
+            if fused_expert_down_finalizes_post_moe:
+                assert isinstance(hidden_states, tuple)
+                hidden_states, residual = hidden_states
+            else:
+                hidden_states, residual = self.allreduce(
+                    hidden_states,
+                    all_reduce_params=AllReduceParams(
+                        fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
+                        residual=residual,
+                        norm_weight=self.shared_head.norm.weight,
+                        eps=self.shared_head.norm.variance_epsilon,
+                    ),
+                )
         else:
             hidden_states, _ = self.shared_head.norm(hidden_states, residual)
 
