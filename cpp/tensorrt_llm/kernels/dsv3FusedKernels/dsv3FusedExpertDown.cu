@@ -213,14 +213,15 @@ __device__ __forceinline__ float4 rmsNormBf16x8(float4 const& residual, float4 c
     return out;
 }
 
-__device__ __forceinline__ float4 sumBf16Ranks(float4* vals, int nranks)
+__device__ __forceinline__ float warpReduceSum(float value)
 {
-    float4 acc = vals[0];
-    for (int r = 1; r < nranks; ++r)
+    unsigned const mask = 0xffffffffu;
+#pragma unroll
+    for (int offset = kWarpSize >> 1; offset > 0; offset >>= 1)
     {
-        acc = addBf16x8(acc, vals[r]);
+        value += __shfl_down_sync(mask, value, offset);
     }
-    return acc;
+    return value;
 }
 
 // -----------------------------------------------------------------------------
@@ -1143,57 +1144,15 @@ __global__ __launch_bounds__(kThreadsPerCta, 1) void dsv3_fused_expert_down_kern
         cg::grid_group grid = cg::this_grid();
         grid.sync();
 
-        Dsv3LamportComm comm(workspace, nranks, rank);
         int const total_access = (M * kHiddenSize) / kArElemsPerAccess;
         int const linear_tid = blockIdx.x * blockDim.x + threadIdx.x;
-        int const linear_stride = gridDim.x * blockDim.x;
         float4 const clear_vec = getNegZero();
-        int const clear_access = static_cast<int>(comm.clear_size / kArElemsPerAccess);
 
         float4* output_vec = reinterpret_cast<float4*>(output);
         float4 const* residual_vec = reinterpret_cast<float4 const*>(residual);
         float4* residual_out_vec = reinterpret_cast<float4*>(residual_out);
         float4 const* norm_weight_vec = reinterpret_cast<float4 const*>(norm_weight);
         float4* hidden_out_vec = reinterpret_cast<float4*>(hidden_out);
-
-        for (int idx = linear_tid; idx < total_access; idx += linear_stride)
-        {
-            float4 val = output_vec[idx];
-            sanitizeArSentinel(val);
-            for (int r = 0; r < nranks; ++r)
-            {
-                reinterpret_cast<float4*>(comm.data_bufs[r])[rank * total_access + idx] = val;
-            }
-        }
-        for (int idx = linear_tid; idx < clear_access; idx += linear_stride)
-        {
-            reinterpret_cast<float4*>(comm.clear_buf)[idx] = clear_vec;
-        }
-
-        for (int idx = linear_tid; idx < total_access; idx += linear_stride)
-        {
-            float4 vals[kMaxArRanks];
-            bool done = false;
-            while (!done)
-            {
-                done = true;
-                for (int r = 0; r < nranks; ++r)
-                {
-                    vals[r] = ldGlobalVolatileFloat4(
-                        &reinterpret_cast<float4*>(comm.data_bufs[rank])[r * total_access + idx]);
-                    done &= !isNegZero(vals[r]);
-                }
-            }
-            float4 sum_val = sumBf16Ranks(vals, nranks);
-            float4 residual_val = residual_vec[idx];
-            residual_out_vec[idx] = addBf16x8(sum_val, residual_val);
-        }
-
-        if constexpr (kEnableRmsNorm)
-        {
-            grid.sync();
-        }
-        comm.update(static_cast<int64_t>(M) * static_cast<int64_t>(kHiddenSize) * static_cast<int64_t>(nranks));
 
         if constexpr (kEnableRmsNorm)
         {
@@ -1202,23 +1161,73 @@ __global__ __launch_bounds__(kThreadsPerCta, 1) void dsv3_fused_expert_down_kern
                 rms_sums[linear_tid] = 0.0f;
             }
             grid.sync();
+        }
 
-            float token_sums[kMaxM] = {0.0f, 0.0f, 0.0f, 0.0f};
-            for (int idx = linear_tid; idx < total_access; idx += linear_stride)
+        Dsv3LamportComm comm(workspace, nranks, rank);
+        int const clear_access = static_cast<int>(comm.clear_size / kArElemsPerAccess);
+        bool const has_ar_idx = linear_tid < total_access;
+        float4 residual_sum = {};
+
+        if (has_ar_idx)
+        {
+            float4 val = output_vec[linear_tid];
+            sanitizeArSentinel(val);
+            for (int r = 0; r < nranks; ++r)
             {
-                int const token = (idx * kArElemsPerAccess) / kHiddenSize;
-                token_sums[token] += sumSquaresBf16x8(residual_out_vec[idx]);
+                reinterpret_cast<float4*>(comm.data_bufs[r])[rank * total_access + linear_tid] = val;
             }
-#pragma unroll
-            for (int token = 0; token < kMaxM; ++token)
+        }
+        if (linear_tid < clear_access)
+        {
+            reinterpret_cast<float4*>(comm.clear_buf)[linear_tid] = clear_vec;
+        }
+
+        if (has_ar_idx)
+        {
+            bool done = false;
+            float4 sum_val = {};
+            while (!done)
             {
-                if (token < M && token_sums[token] != 0.0f)
+                done = true;
+                sum_val = {};
+                for (int r = 0; r < nranks; ++r)
                 {
-                    atomicAdd(&rms_sums[token], token_sums[token]);
+                    float4 const peer_val = ldGlobalVolatileFloat4(
+                        &reinterpret_cast<float4*>(comm.data_bufs[rank])[r * total_access + linear_tid]);
+                    done &= !isNegZero(peer_val);
+                    sum_val = (r == 0) ? peer_val : addBf16x8(sum_val, peer_val);
+                }
+            }
+            residual_sum = addBf16x8(sum_val, residual_vec[linear_tid]);
+            residual_out_vec[linear_tid] = residual_sum;
+        }
+
+        if constexpr (kEnableRmsNorm)
+        {
+            float local_square_sum = has_ar_idx ? sumSquaresBf16x8(residual_sum) : 0.0f;
+            local_square_sum = warpReduceSum(local_square_sum);
+            float* smem_warp_sums = reinterpret_cast<float*>(smem_raw);
+            if (lane == 0)
+            {
+                smem_warp_sums[warp_id] = local_square_sum;
+            }
+            __syncthreads();
+            if (warp_id == 0)
+            {
+                float block_square_sum = (lane < kNumWarps) ? smem_warp_sums[lane] : 0.0f;
+                block_square_sum = warpReduceSum(block_square_sum);
+                if (lane == 0 && blockIdx.x * blockDim.x < total_access)
+                {
+                    int const token = (blockIdx.x * blockDim.x * kArElemsPerAccess) / kHiddenSize;
+                    atomicAdd(&rms_sums[token], block_square_sum);
                 }
             }
             grid.sync();
+        }
+        comm.update(static_cast<int64_t>(M) * static_cast<int64_t>(kHiddenSize) * static_cast<int64_t>(nranks));
 
+        if constexpr (kEnableRmsNorm)
+        {
             if (linear_tid < M)
             {
                 rms_sums[linear_tid] = rsqrtf(rms_sums[linear_tid] / static_cast<float>(kHiddenSize) + rms_norm_eps);
@@ -1226,12 +1235,12 @@ __global__ __launch_bounds__(kThreadsPerCta, 1) void dsv3_fused_expert_down_kern
             grid.sync();
 
             int const hidden_access_per_token = kHiddenSize / kArElemsPerAccess;
-            for (int idx = linear_tid; idx < total_access; idx += linear_stride)
+            if (has_ar_idx)
             {
-                int const token = idx / hidden_access_per_token;
-                int const hidden_access = idx - token * hidden_access_per_token;
+                int const token = linear_tid / hidden_access_per_token;
+                int const hidden_access = linear_tid - token * hidden_access_per_token;
                 float const inv_rms = rms_sums[token];
-                hidden_out_vec[idx] = rmsNormBf16x8(residual_out_vec[idx], norm_weight_vec[hidden_access], inv_rms);
+                hidden_out_vec[linear_tid] = rmsNormBf16x8(residual_sum, norm_weight_vec[hidden_access], inv_rms);
             }
         }
 #else

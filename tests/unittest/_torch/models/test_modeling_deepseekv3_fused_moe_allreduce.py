@@ -490,6 +490,8 @@ def _write_wip_summary(rank_results: list[dict[str, float]]) -> None:
                     f"wip_ar_vs_trtllm_ar_residual_abs {result['local_ar_residual_abs']:.6e}",
                     f"wip_ar_vs_trtllm_ar_hidden_rel {result['local_ar_hidden_rel']:.6e}",
                     f"wip_ar_vs_trtllm_ar_hidden_abs {result['local_ar_hidden_abs']:.6e}",
+                    f"stage1_ar_vs_trtllm_ar_residual_rel {result['stage1_ar_residual_rel']:.6e}",
+                    f"stage1_ar_vs_trtllm_ar_residual_abs {result['stage1_ar_residual_abs']:.6e}",
                     f"wip_rms_vs_python_rms_hidden_rel {result['rms_hidden_rel']:.6e}",
                     f"wip_rms_vs_python_rms_hidden_abs {result['rms_hidden_abs']:.6e}",
                 ]
@@ -499,6 +501,7 @@ def _write_wip_summary(rank_results: list[dict[str, float]]) -> None:
     max_hidden_abs = max(result["hidden_abs"] for result in rank_results)
     max_local_ar_residual_abs = max(result["local_ar_residual_abs"] for result in rank_results)
     max_local_ar_hidden_abs = max(result["local_ar_hidden_abs"] for result in rank_results)
+    max_stage1_ar_residual_abs = max(result["stage1_ar_residual_abs"] for result in rank_results)
     max_rms_hidden_abs = max(result["rms_hidden_abs"] for result in rank_results)
     lines.append(
         " ".join(
@@ -508,6 +511,7 @@ def _write_wip_summary(rank_results: list[dict[str, float]]) -> None:
                 f"max_wip_vs_baseline_hidden_abs {max_hidden_abs:.6e}",
                 f"max_wip_ar_vs_trtllm_ar_residual_abs {max_local_ar_residual_abs:.6e}",
                 f"max_wip_ar_vs_trtllm_ar_hidden_abs {max_local_ar_hidden_abs:.6e}",
+                f"max_stage1_ar_vs_trtllm_ar_residual_abs {max_stage1_ar_residual_abs:.6e}",
                 f"max_wip_rms_vs_python_rms_hidden_abs {max_rms_hidden_abs:.6e}",
             ]
         )
@@ -731,6 +735,7 @@ def test_deepseekv3_fused_moe_post_moe_allreduce_wip_path() -> None:
     rank, world_size, comm = _init_mpi_for_trtllm_allreduce()
     helpers = _helpers()
     helpers._require_cuda_and_ops(require_baseline_ops=True, require_fused_ops=True)
+    _require_fused_expert_down_ar_residual_op()
     _require_fused_expert_down_ar_residual_rms_norm_op()
 
     with torch.inference_mode():
@@ -767,6 +772,13 @@ def test_deepseekv3_fused_moe_post_moe_allreduce_wip_path() -> None:
                 world_size,
             )
         )
+        stage1_local_output, stage1_residual = _run_fused_expert_down_ar_residual(
+            tensors,
+            residual,
+            workspace,
+            rank,
+            world_size,
+        )
         baseline_hidden_states, baseline_residual = _run_trtllm_allreduce_residual_rms_norm(
             allreduce,
             baseline_local_output,
@@ -782,6 +794,12 @@ def test_deepseekv3_fused_moe_post_moe_allreduce_wip_path() -> None:
                 norm_weight,
             )
         )
+        _, stage1_local_allreduce_residual = _run_trtllm_allreduce_residual_rms_norm(
+            allreduce,
+            stage1_local_output,
+            residual,
+            norm_weight,
+        )
         torch.cuda.synchronize()
 
     local_ar_residual_rel, local_ar_residual_abs = _max_errors(
@@ -791,6 +809,10 @@ def test_deepseekv3_fused_moe_post_moe_allreduce_wip_path() -> None:
     local_ar_hidden_rel, local_ar_hidden_abs = _max_errors(
         wip_hidden_states,
         wip_local_allreduce_hidden_states,
+    )
+    stage1_ar_residual_rel, stage1_ar_residual_abs = _max_errors(
+        stage1_residual,
+        stage1_local_allreduce_residual,
     )
     rms_hidden_rel, rms_hidden_abs = _max_errors(wip_hidden_states, wip_python_rms_hidden_states)
     residual_rel, residual_abs = _max_errors(wip_residual, baseline_residual)
@@ -805,6 +827,8 @@ def test_deepseekv3_fused_moe_post_moe_allreduce_wip_path() -> None:
         "local_ar_residual_abs": local_ar_residual_abs,
         "local_ar_hidden_rel": local_ar_hidden_rel,
         "local_ar_hidden_abs": local_ar_hidden_abs,
+        "stage1_ar_residual_rel": stage1_ar_residual_rel,
+        "stage1_ar_residual_abs": stage1_ar_residual_abs,
         "rms_hidden_rel": rms_hidden_rel,
         "rms_hidden_abs": rms_hidden_abs,
     }
@@ -832,4 +856,5 @@ def test_deepseekv3_fused_moe_post_moe_allreduce_wip_path() -> None:
     )
     assert residual_abs <= residual_abs_threshold
     assert hidden_abs <= hidden_abs_threshold
+    assert stage1_ar_residual_abs <= residual_abs_threshold
     assert rms_hidden_abs <= hidden_abs_threshold
