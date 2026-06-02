@@ -282,38 +282,88 @@ def _save_profile_summary(
     rank: int,
     multi_stream_baseline_stats: dict[str, float],
     fused_kernel_stats: dict[str, float],
+    fused_kernel_eager_stats: dict[str, float],
+    router_gemm_stats: dict[str, float],
+    fused_expert_up_stats: dict[str, float],
+    fused_expert_down_stats: dict[str, float],
     pytorch_reference_stats: dict[str, float] | None,
-) -> None:
+) -> str | None:
     path = _debug_output_dir() / "fused_moe_profile_times.txt"
     path.parent.mkdir(parents=True, exist_ok=True)
-    speedup = multi_stream_baseline_stats["mean_ms"] / fused_kernel_stats["mean_ms"]
+    speedup = multi_stream_baseline_stats["mean_us"] / fused_kernel_stats["mean_us"]
     fields = [
         f"Test {rank}: cuda_graph 1",
-        f"multi_stream_baseline_mean_ms {multi_stream_baseline_stats['mean_ms']:.6f}",
-        f"multi_stream_baseline_median_ms {multi_stream_baseline_stats['median_ms']:.6f}",
-        f"fused_kernel_mean_ms {fused_kernel_stats['mean_ms']:.6f}",
-        f"fused_kernel_median_ms {fused_kernel_stats['median_ms']:.6f}",
+        f"multi_stream_baseline_mean_us {multi_stream_baseline_stats['mean_us']:.3f}",
+        f"multi_stream_baseline_median_us {multi_stream_baseline_stats['median_us']:.3f}",
+        f"fused_kernel_mean_us {fused_kernel_stats['mean_us']:.3f}",
+        f"fused_kernel_median_us {fused_kernel_stats['median_us']:.3f}",
+        f"fused_kernel_eager_mean_us {fused_kernel_eager_stats['mean_us']:.3f}",
+        f"fused_kernel_eager_median_us {fused_kernel_eager_stats['median_us']:.3f}",
+        f"dsv3_router_gemm_mean_us {router_gemm_stats['mean_us']:.3f}",
+        f"dsv3_router_gemm_median_us {router_gemm_stats['median_us']:.3f}",
+        f"dsv3_fused_expert_up_mean_us {fused_expert_up_stats['mean_us']:.3f}",
+        f"dsv3_fused_expert_up_median_us {fused_expert_up_stats['median_us']:.3f}",
+        f"dsv3_fused_expert_down_mean_us {fused_expert_down_stats['mean_us']:.3f}",
+        f"dsv3_fused_expert_down_median_us {fused_expert_down_stats['median_us']:.3f}",
         f"fused_kernel_vs_multi_stream_baseline_speedup {speedup:.3f}x",
         f"prepack_fused_expert_down {int(_prepack_fused_expert_down_enabled())}",
     ]
     if pytorch_reference_stats is not None:
         fields.extend(
             [
-                f"pytorch_reference_mean_ms {pytorch_reference_stats['mean_ms']:.6f}",
-                f"pytorch_reference_median_ms {pytorch_reference_stats['median_ms']:.6f}",
+                f"pytorch_reference_mean_us {pytorch_reference_stats['mean_us']:.3f}",
+                f"pytorch_reference_median_us {pytorch_reference_stats['median_us']:.3f}",
             ]
         )
     new_line = " ".join(fields)
 
     lines_by_rank: dict[int, str] = {}
-    if path.exists():
+    if path.exists() and rank != 0:
         for line in path.read_text().splitlines():
             if not line.startswith("Test "):
                 continue
             test_idx = int(line.split(":", 1)[0].split()[1])
             lines_by_rank[test_idx] = line
     lines_by_rank[rank] = new_line
-    path.write_text("\n".join(lines_by_rank[idx] for idx in sorted(lines_by_rank)) + "\n")
+    lines = [lines_by_rank[idx] for idx in sorted(lines_by_rank)]
+    average_line = None
+    if len(lines_by_rank) == _NUM_RANKS:
+        average_line = _profile_average_summary_line(lines)
+        lines.append(average_line)
+    path.write_text("\n".join(lines) + "\n")
+    return average_line
+
+
+def _profile_average_summary_line(profile_lines: list[str]) -> str:
+    average_fields = (
+        "multi_stream_baseline_mean_us",
+        "fused_kernel_mean_us",
+        "fused_kernel_eager_mean_us",
+        "dsv3_router_gemm_mean_us",
+        "dsv3_fused_expert_up_mean_us",
+        "dsv3_fused_expert_down_mean_us",
+        "fused_kernel_vs_multi_stream_baseline_speedup",
+    )
+    values_by_field: dict[str, list[float]] = {field: [] for field in average_fields}
+    for line in profile_lines:
+        parts = line.split()
+        for idx in range(2, len(parts), 2):
+            field = parts[idx]
+            if field not in values_by_field:
+                continue
+            value = parts[idx + 1]
+            if value.endswith("x"):
+                value = value[:-1]
+            values_by_field[field].append(float(value))
+
+    fields = ["Average over 8 ranks:"]
+    for field in average_fields:
+        values = values_by_field[field]
+        if field.endswith("speedup"):
+            fields.append(f"{field} {statistics.mean(values):.3f}x")
+        else:
+            fields.append(f"{field} {statistics.mean(values):.3f}")
+    return " ".join(fields)
 
 
 def _single_match(pattern: str) -> Path:
@@ -865,7 +915,26 @@ def _run_multi_stream_baseline(
         return old_moe(tensors["hidden_states"])
 
 
-def _run_fused_kernel(tensors: dict[str, torch.Tensor]) -> torch.Tensor:
+_FusedKernelProfileEvents = dict[str, list[tuple[torch.cuda.Event, torch.cuda.Event]]]
+
+
+def _record_fused_kernel_profile_start(
+    profile_events: _FusedKernelProfileEvents | None,
+    event_name: str,
+) -> torch.cuda.Event | None:
+    if profile_events is None:
+        return None
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+    profile_events[event_name].append((start_event, end_event))
+    start_event.record()
+    return end_event
+
+
+def _run_fused_kernel(
+    tensors: dict[str, torch.Tensor],
+    profile_events: _FusedKernelProfileEvents | None = None,
+) -> torch.Tensor:
     _ensure_fused_expert_up_prepacked_tensors(tensors)
     if _prepack_fused_expert_down_enabled():
         _ensure_fused_expert_down_prepacked_tensors(tensors)
@@ -879,28 +948,73 @@ def _run_fused_kernel(tensors: dict[str, torch.Tensor]) -> torch.Tensor:
         # shared_down_weight: torch.float8_e4m3fn, [H, I].
         shared_down_weight = tensors["shared_down_weight_org"]
 
-    # expert_indices: torch.int32, [T, K].
+    num_tokens = tensors["hidden_states"].shape[0]
+    num_router_experts = tensors["router_weight"].shape[0]
+    router_gemm_end_event = _record_fused_kernel_profile_start(profile_events, "dsv3_router_gemm")
+    # router_logits: torch.float32, [T, E].
+    router_logits = torch.ops.trtllm.dsv3_router_gemm_op(
+        tensors["hidden_states"],
+        tensors["router_weight"].t(),
+        bias=None,
+        out_dtype=torch.float32,
+    )
+    if router_gemm_end_event is not None:
+        router_gemm_end_event.record()
+    check_data(
+        router_logits,
+        "dsv3_fused_expert_up.router_logits",
+        torch.float32,
+        (num_tokens, num_router_experts),
+    )
+    assert _top_k() == 8, f"dsv3_fused_expert_up only supports top_k=8, got {_top_k()}"
+    assert _n_group() == 1, f"dsv3_fused_expert_up only supports n_group=1, got {_n_group()}"
+    assert _topk_group() == 1, (
+        f"dsv3_fused_expert_up only supports topk_group=1, got {_topk_group()}"
+    )
+
+    fused_expert_up_end_event = _record_fused_kernel_profile_start(
+        profile_events, "dsv3_fused_expert_up"
+    )
     # expert_weights: torch.float32, [T, K].
-    # slot_swiglu_output: torch.bfloat16, [T, K + 1, I].
-    expert_indices, expert_weights, slot_swiglu_output = (
-        Deepseekv3FusedMoE._run_dsv3_fused_expert_up(
-            tensors["hidden_states"],
-            tensors["router_weight"],
-            tensors["routing_bias"],
-            tensors["shared_gate_up_weight_packed_fused_expert_up"],
-            tensors["shared_gate_up_weight_scale_org"],
-            tensors["routed_w3_w1_weight_packed_fused_expert_up"],
-            tensors["routed_w3_w1_weight_scale"],
-            _top_k(),
-            _n_group(),
-            _topk_group(),
-            _routed_scaling_factor(),
-        )
+    # expert_indices: torch.int32, [T, K].
+    # slot_swiglu_output: torch.float16, [T, K + 1, I].
+    expert_weights, expert_indices, slot_swiglu_output = torch.ops.trtllm.dsv3_fused_expert_up(
+        router_logits.contiguous(),
+        tensors["hidden_states"].contiguous(),
+        tensors["routing_bias"].contiguous(),
+        tensors["shared_gate_up_weight_packed_fused_expert_up"],
+        tensors["shared_gate_up_weight_scale_org"],
+        tensors["routed_w3_w1_weight_packed_fused_expert_up"],
+        tensors["routed_w3_w1_weight_scale"],
+        _routed_scaling_factor(),
+    )
+    if fused_expert_up_end_event is not None:
+        fused_expert_up_end_event.record()
+    check_data(
+        expert_indices,
+        "dsv3_fused_expert_up.expert_indices",
+        torch.int32,
+        (num_tokens, _top_k()),
+    )
+    check_data(
+        expert_weights,
+        "dsv3_fused_expert_up.expert_weights",
+        torch.float32,
+        (num_tokens, _top_k()),
+    )
+    check_data(
+        slot_swiglu_output,
+        "dsv3_fused_expert_up.slot_swiglu_output",
+        torch.float16,
+        (num_tokens, _top_k() + 1, -1),
     )
 
     # output: torch.bfloat16, [T, H].
     output = torch.empty_like(tensors["hidden_states"])
-    return Deepseekv3FusedMoE._run_dsv3_fused_expert_down_chunked(
+    fused_expert_down_end_event = _record_fused_kernel_profile_start(
+        profile_events, "dsv3_fused_expert_down"
+    )
+    final_hidden_states = Deepseekv3FusedMoE._run_dsv3_fused_expert_down_chunked(
         slot_swiglu_output,
         expert_indices,
         expert_weights,
@@ -910,6 +1024,9 @@ def _run_fused_kernel(tensors: dict[str, torch.Tensor]) -> torch.Tensor:
         tensors["shared_down_weight_scale_org"],
         output,
     )
+    if fused_expert_down_end_event is not None:
+        fused_expert_down_end_event.record()
+    return final_hidden_states
 
 
 def _profile_cuda_events(
@@ -932,19 +1049,101 @@ def _profile_cuda_events(
         ends[idx].record()
 
     torch.cuda.synchronize()
-    times_ms = torch.tensor(
-        [starts[idx].elapsed_time(ends[idx]) for idx in range(profile_iters)],
+    times_us = torch.tensor(
+        [starts[idx].elapsed_time(ends[idx]) * 1000.0 for idx in range(profile_iters)],
         dtype=torch.float32,
     )
-    times = [float(time_ms) for time_ms in times_ms.tolist()]
+    times = [float(time_us) for time_us in times_us.tolist()]
     stats = {
-        "mean_ms": statistics.mean(times),
-        "median_ms": statistics.median(times),
-        "std_ms": statistics.stdev(times) if len(times) > 1 else 0.0,
-        "min_ms": min(times),
-        "max_ms": max(times),
+        "mean_us": statistics.mean(times),
+        "median_us": statistics.median(times),
+        "std_us": statistics.stdev(times) if len(times) > 1 else 0.0,
+        "min_us": min(times),
+        "max_us": max(times),
     }
-    return times_ms, stats
+    return times_us, stats
+
+
+def _profile_event_pairs(
+    event_pairs: list[tuple[torch.cuda.Event, torch.cuda.Event]],
+) -> tuple[torch.Tensor, dict[str, float]]:
+    times_us = torch.tensor(
+        [start.elapsed_time(end) * 1000.0 for start, end in event_pairs],
+        dtype=torch.float32,
+    )
+    times = [float(time_us) for time_us in times_us.tolist()]
+    stats = {
+        "mean_us": statistics.mean(times),
+        "median_us": statistics.median(times),
+        "std_us": statistics.stdev(times) if len(times) > 1 else 0.0,
+        "min_us": min(times),
+        "max_us": max(times),
+    }
+    return times_us, stats
+
+
+def _profile_fused_kernel_with_subkernel_events(
+    tensors: dict[str, torch.Tensor],
+    warmup_iters: int,
+    profile_iters: int,
+) -> tuple[
+    torch.Tensor,
+    dict[str, float],
+    torch.Tensor,
+    dict[str, float],
+    torch.Tensor,
+    dict[str, float],
+    torch.Tensor,
+    dict[str, float],
+]:
+    if warmup_iters < 0:
+        raise ValueError(f"warmup_iters must be non-negative, got {warmup_iters}")
+    if profile_iters <= 0:
+        raise ValueError(f"profile_iters must be positive, got {profile_iters}")
+
+    for _ in range(warmup_iters):
+        _run_fused_kernel(tensors)
+    torch.cuda.synchronize()
+
+    profile_events: _FusedKernelProfileEvents = {
+        "dsv3_router_gemm": [],
+        "dsv3_fused_expert_up": [],
+        "dsv3_fused_expert_down": [],
+    }
+    fused_kernel_events = [
+        (
+            torch.cuda.Event(enable_timing=True),
+            torch.cuda.Event(enable_timing=True),
+        )
+        for _ in range(profile_iters)
+    ]
+    for idx in range(profile_iters):
+        start_event, end_event = fused_kernel_events[idx]
+        start_event.record()
+        _run_fused_kernel(tensors, profile_events=profile_events)
+        end_event.record()
+
+    torch.cuda.synchronize()
+    fused_kernel_times_us, fused_kernel_stats = _profile_event_pairs(fused_kernel_events)
+    router_gemm_times_us, router_gemm_stats = _profile_event_pairs(
+        profile_events["dsv3_router_gemm"]
+    )
+    fused_expert_up_times_us, fused_expert_up_stats = _profile_event_pairs(
+        profile_events["dsv3_fused_expert_up"]
+    )
+    fused_expert_down_times_us, fused_expert_down_stats = _profile_event_pairs(
+        profile_events["dsv3_fused_expert_down"]
+    )
+    return (
+        fused_kernel_times_us,
+        fused_kernel_stats,
+        router_gemm_times_us,
+        router_gemm_stats,
+        fused_expert_up_times_us,
+        fused_expert_up_stats,
+        fused_expert_down_times_us,
+        fused_expert_down_stats,
+    )
 
 
 @dataclass
@@ -1117,44 +1316,72 @@ def test_deepseekv3_fused_moe_profile_phase(rank: int) -> None:
         )
         torch.cuda.synchronize()
 
-        # *_times_ms: torch.float32, [profile_iters].
-        multi_stream_baseline_times_ms, multi_stream_baseline_stats = _profile_cuda_events(
+        # *_times_us: torch.float32, [profile_iters].
+        multi_stream_baseline_times_us, multi_stream_baseline_stats = _profile_cuda_events(
             multi_stream_baseline_runner,
             warmup_iters,
             profile_iters,
         )
-        fused_kernel_times_ms, fused_kernel_stats = _profile_cuda_events(
+        fused_kernel_times_us, fused_kernel_stats = _profile_cuda_events(
             fused_kernel_runner,
             warmup_iters,
             profile_iters,
         )
+        (
+            fused_kernel_eager_times_us,
+            fused_kernel_eager_stats,
+            router_gemm_times_us,
+            router_gemm_stats,
+            fused_expert_up_times_us,
+            fused_expert_up_stats,
+            fused_expert_down_times_us,
+            fused_expert_down_stats,
+        ) = _profile_fused_kernel_with_subkernel_events(
+            tensors,
+            warmup_iters,
+            profile_iters,
+        )
 
-        pytorch_reference_times_ms = None
+        pytorch_reference_times_us = None
         pytorch_reference_stats = None
         if _profile_pytorch_reference_enabled():
-            pytorch_reference_times_ms, pytorch_reference_stats = _profile_cuda_events(
+            pytorch_reference_times_us, pytorch_reference_stats = _profile_cuda_events(
                 lambda: _run_pytorch_reference(tensors),
                 warmup_iters,
                 profile_iters,
             )
 
-    _save_tensor(group, "multi_stream_baseline_profile_times_ms", multi_stream_baseline_times_ms)
-    _save_tensor(group, "fused_kernel_profile_times_ms", fused_kernel_times_ms)
-    if pytorch_reference_times_ms is not None:
-        _save_tensor(group, "pytorch_reference_profile_times_ms", pytorch_reference_times_ms)
-    _save_profile_summary(
+    _save_tensor(group, "multi_stream_baseline_profile_times_us", multi_stream_baseline_times_us)
+    _save_tensor(group, "fused_kernel_profile_times_us", fused_kernel_times_us)
+    _save_tensor(group, "fused_kernel_eager_profile_times_us", fused_kernel_eager_times_us)
+    _save_tensor(group, "dsv3_router_gemm_profile_times_us", router_gemm_times_us)
+    _save_tensor(group, "dsv3_fused_expert_up_profile_times_us", fused_expert_up_times_us)
+    _save_tensor(group, "dsv3_fused_expert_down_profile_times_us", fused_expert_down_times_us)
+    if pytorch_reference_times_us is not None:
+        _save_tensor(group, "pytorch_reference_profile_times_us", pytorch_reference_times_us)
+    average_profile_summary = _save_profile_summary(
         rank,
         multi_stream_baseline_stats,
         fused_kernel_stats,
+        fused_kernel_eager_stats,
+        router_gemm_stats,
+        fused_expert_up_stats,
+        fused_expert_down_stats,
         pytorch_reference_stats,
     )
 
-    speedup = multi_stream_baseline_stats["mean_ms"] / fused_kernel_stats["mean_ms"]
+    speedup = multi_stream_baseline_stats["mean_us"] / fused_kernel_stats["mean_us"]
     print(
         f"rank {rank} cuda_graph: "
-        f"multi_stream_baseline {multi_stream_baseline_stats['mean_ms']:.6f} ms, "
-        f"fused_kernel {fused_kernel_stats['mean_ms']:.6f} ms, "
+        f"multi_stream_baseline {multi_stream_baseline_stats['mean_us']:.3f} us, "
+        f"fused_kernel {fused_kernel_stats['mean_us']:.3f} us, "
+        f"fused_kernel_eager {fused_kernel_eager_stats['mean_us']:.3f} us, "
+        f"dsv3_router_gemm {router_gemm_stats['mean_us']:.3f} us, "
+        f"dsv3_fused_expert_up {fused_expert_up_stats['mean_us']:.3f} us, "
+        f"dsv3_fused_expert_down {fused_expert_down_stats['mean_us']:.3f} us, "
         f"fused_kernel_vs_multi_stream_baseline_speedup {speedup:.3f}x, "
         f"prepack_fused_expert_down {int(_prepack_fused_expert_down_enabled())}, "
         f"fused_vs_baseline_rel {rel_error:.6e}, fused_vs_baseline_abs {abs_error:.6e}"
     )
+    if average_profile_summary is not None:
+        print(average_profile_summary)
