@@ -27,6 +27,7 @@
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <cooperative_groups.h>
 #include <cstdint>
 #include <cuda.h>
 #include <cuda_bf16.h>
@@ -83,6 +84,144 @@ constexpr int kMaxRoutedPairs = kMaxM * kRoutedSlots; // 32
 constexpr int kMaxBuckets = kMaxRoutedPairs;          // 32
 
 constexpr int kHiddenKChunk = kBlockK;                // = 128
+constexpr int kArElemsPerAccess = 8;
+constexpr int kMaxArRanks = 16;
+
+struct Dsv3LamportComm
+{
+    __device__ __forceinline__ Dsv3LamportComm(void** workspace, int nranks, int rank)
+    {
+        counter_ptr = &reinterpret_cast<int*>(workspace[nranks * 3])[0];
+        flag_ptr = &reinterpret_cast<int*>(workspace[nranks * 3])[2];
+        clear_ptr = &reinterpret_cast<int64_t*>(workspace[nranks * 3 + 1])[0];
+        flag_value = *flag_ptr;
+        int64_t const comm_size = reinterpret_cast<int64_t*>(workspace[nranks * 3 + 1])[1];
+        clear_size = *clear_ptr;
+        int const data_offset = flag_value % 3;
+        int const clear_offset = (flag_value + 2) % 3;
+        for (int r = 0; r < nranks && r < kMaxArRanks; ++r)
+        {
+            data_bufs[r] = reinterpret_cast<uint8_t*>(workspace[2 * nranks + r]) + data_offset * comm_size;
+        }
+        clear_buf = reinterpret_cast<uint8_t*>(workspace[2 * nranks + rank]) + clear_offset * comm_size;
+        __syncthreads();
+        if (threadIdx.x == 0)
+        {
+            atomicAdd(counter_ptr, 1);
+        }
+    }
+
+    __device__ __forceinline__ void update(int64_t new_clear_size)
+    {
+        if (blockIdx.x == 0 && threadIdx.x == 0)
+        {
+            while (*reinterpret_cast<int volatile*>(counter_ptr) != gridDim.x)
+            {
+            }
+            *flag_ptr = (flag_value + 1) % 3;
+            *clear_ptr = new_clear_size;
+            *counter_ptr = 0;
+        }
+    }
+
+    int* counter_ptr;
+    int* flag_ptr;
+    int64_t* clear_ptr;
+    uint8_t* data_bufs[kMaxArRanks];
+    uint8_t* clear_buf;
+    int64_t clear_size;
+    int flag_value;
+};
+
+__device__ __forceinline__ bool isNegZero(float v)
+{
+    return *reinterpret_cast<uint32_t*>(&v) == 0x80000000;
+}
+
+__device__ __forceinline__ bool isNegZero(float4 v)
+{
+    return isNegZero(v.x) || isNegZero(v.y) || isNegZero(v.z) || isNegZero(v.w);
+}
+
+__device__ __forceinline__ float4 getNegZero()
+{
+    float4 vec;
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+    {
+        reinterpret_cast<uint32_t*>(&vec)[i] = 0x80000000;
+    }
+    return vec;
+}
+
+__device__ __forceinline__ float4 ldGlobalVolatileFloat4(float4* addr)
+{
+    float4 val;
+    asm volatile("ld.volatile.global.v4.f32 {%0, %1, %2, %3}, [%4];"
+                 : "=f"(val.x), "=f"(val.y), "=f"(val.z), "=f"(val.w)
+                 : "l"(addr));
+    return val;
+}
+
+__device__ __forceinline__ void sanitizeArSentinel(float4& val)
+{
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+    {
+        if (isNegZero(reinterpret_cast<float*>(&val)[i]))
+        {
+            reinterpret_cast<float*>(&val)[i] = 0.0f;
+        }
+    }
+}
+
+__device__ __forceinline__ float4 addBf16x8(float4 const& a, float4 const& b)
+{
+    float4 c;
+#pragma unroll
+    for (int i = 0; i < kArElemsPerAccess; ++i)
+    {
+        reinterpret_cast<__nv_bfloat16*>(&c)[i]
+            = __float2bfloat16(__bfloat162float(reinterpret_cast<__nv_bfloat16 const*>(&a)[i])
+                + __bfloat162float(reinterpret_cast<__nv_bfloat16 const*>(&b)[i]));
+    }
+    return c;
+}
+
+__device__ __forceinline__ float sumSquaresBf16x8(float4 const& v)
+{
+    float sum = 0.0f;
+#pragma unroll
+    for (int i = 0; i < kArElemsPerAccess; ++i)
+    {
+        float const x = __bfloat162float(reinterpret_cast<__nv_bfloat16 const*>(&v)[i]);
+        sum += x * x;
+    }
+    return sum;
+}
+
+__device__ __forceinline__ float4 rmsNormBf16x8(float4 const& residual, float4 const& weight, float inv_rms)
+{
+    float4 out;
+#pragma unroll
+    for (int i = 0; i < kArElemsPerAccess; ++i)
+    {
+        float const x = __bfloat162float(reinterpret_cast<__nv_bfloat16 const*>(&residual)[i]);
+        float const w = __bfloat162float(reinterpret_cast<__nv_bfloat16 const*>(&weight)[i]);
+        reinterpret_cast<__nv_bfloat16*>(&out)[i] = __float2bfloat16(x * inv_rms * w);
+    }
+    return out;
+}
+
+__device__ __forceinline__ float4 sumBf16Ranks(float4* vals, int nranks)
+{
+    float4 acc = vals[0];
+    for (int r = 1; r < nranks; ++r)
+    {
+        acc = addBf16x8(acc, vals[r]);
+    }
+    return acc;
+}
 
 // -----------------------------------------------------------------------------
 // fp8 (e4m3) -> fp16 conversion (single instr — was the lever-killer
@@ -280,7 +419,7 @@ __device__ __forceinline__ void cvt_fp8_to_afrag_direct(
 // -----------------------------------------------------------------------------
 // Kernel
 // -----------------------------------------------------------------------------
-template <int kKLocal, bool kUsePackedWeights>
+template <int kKLocal, bool kUsePackedWeights, bool kEnableArResidual, bool kEnableRmsNorm>
 __global__ __launch_bounds__(kThreadsPerCta, 1) void dsv3_fused_expert_down_kernel(
     __grid_constant__ const CUtensorMap routed_w_down_map, __grid_constant__ const CUtensorMap shared_w_down_map,
     __nv_fp8_e4m3 const* __restrict__ routed_w_down_packed, __nv_fp8_e4m3 const* __restrict__ shared_w_down_packed,
@@ -291,7 +430,10 @@ __global__ __launch_bounds__(kThreadsPerCta, 1) void dsv3_fused_expert_down_kern
     __half const* __restrict__ hidden_in_raw, int32_t const* __restrict__ indices, float const* __restrict__ scores,
     float const* __restrict__ routed_w_down_scale, // [256, 48, k_blocks]
     float const* __restrict__ shared_w_down_scale, // [48, k_blocks]
-    __nv_bfloat16* __restrict__ output, int M)
+    __nv_bfloat16* __restrict__ output, __nv_bfloat16 const* __restrict__ residual,
+    __nv_bfloat16* __restrict__ residual_out, __nv_bfloat16 const* __restrict__ norm_weight,
+    __nv_bfloat16* __restrict__ hidden_out, float* __restrict__ rms_sums, void** workspace, int rank, int nranks, int M,
+    float rms_norm_eps)
 {
     // kMaxM sizes smem buffers; M bounds active-token loops.
     constexpr int kFp8Stages = kUsePackedWeights ? kPackedFp8Stages : kSpecFp8Stages;
@@ -304,10 +446,13 @@ __global__ __launch_bounds__(kThreadsPerCta, 1) void dsv3_fused_expert_down_kern
     int const lane = tid & 31;
 
     int const row_lo = cta_id * kRowsPerCta;
-    if (row_lo >= kHiddenSize)
+    bool const has_output_rows = row_lo < kHiddenSize;
+    if (!has_output_rows && !kEnableArResidual)
+    {
         return;
+    }
     int const row_hi = min(row_lo + kRowsPerCta, kHiddenSize);
-    int const rows_here = row_hi - row_lo;
+    int const rows_here = has_output_rows ? row_hi - row_lo : 0;
 
     constexpr int k_blocks = kKBlocks; // 4 (TP=4) or 2 (TP=8)
 
@@ -989,6 +1134,113 @@ __global__ __launch_bounds__(kThreadsPerCta, 1) void dsv3_fused_expert_down_kern
         }
         output[(size_t) m * kHiddenSize + row] = __float2bfloat16(acc);
     }
+
+    if constexpr (kEnableArResidual)
+    {
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+        namespace cg = cooperative_groups;
+        __syncthreads();
+        cg::grid_group grid = cg::this_grid();
+        grid.sync();
+
+        Dsv3LamportComm comm(workspace, nranks, rank);
+        int const total_access = (M * kHiddenSize) / kArElemsPerAccess;
+        int const linear_tid = blockIdx.x * blockDim.x + threadIdx.x;
+        int const linear_stride = gridDim.x * blockDim.x;
+        float4 const clear_vec = getNegZero();
+        int const clear_access = static_cast<int>(comm.clear_size / kArElemsPerAccess);
+
+        float4* output_vec = reinterpret_cast<float4*>(output);
+        float4 const* residual_vec = reinterpret_cast<float4 const*>(residual);
+        float4* residual_out_vec = reinterpret_cast<float4*>(residual_out);
+        float4 const* norm_weight_vec = reinterpret_cast<float4 const*>(norm_weight);
+        float4* hidden_out_vec = reinterpret_cast<float4*>(hidden_out);
+
+        for (int idx = linear_tid; idx < total_access; idx += linear_stride)
+        {
+            float4 val = output_vec[idx];
+            sanitizeArSentinel(val);
+            for (int r = 0; r < nranks; ++r)
+            {
+                reinterpret_cast<float4*>(comm.data_bufs[r])[rank * total_access + idx] = val;
+            }
+        }
+        for (int idx = linear_tid; idx < clear_access; idx += linear_stride)
+        {
+            reinterpret_cast<float4*>(comm.clear_buf)[idx] = clear_vec;
+        }
+
+        for (int idx = linear_tid; idx < total_access; idx += linear_stride)
+        {
+            float4 vals[kMaxArRanks];
+            bool done = false;
+            while (!done)
+            {
+                done = true;
+                for (int r = 0; r < nranks; ++r)
+                {
+                    vals[r] = ldGlobalVolatileFloat4(
+                        &reinterpret_cast<float4*>(comm.data_bufs[rank])[r * total_access + idx]);
+                    done &= !isNegZero(vals[r]);
+                }
+            }
+            float4 sum_val = sumBf16Ranks(vals, nranks);
+            float4 residual_val = residual_vec[idx];
+            residual_out_vec[idx] = addBf16x8(sum_val, residual_val);
+        }
+
+        if constexpr (kEnableRmsNorm)
+        {
+            grid.sync();
+        }
+        comm.update(static_cast<int64_t>(M) * static_cast<int64_t>(kHiddenSize) * static_cast<int64_t>(nranks));
+
+        if constexpr (kEnableRmsNorm)
+        {
+            if (linear_tid < M)
+            {
+                rms_sums[linear_tid] = 0.0f;
+            }
+            grid.sync();
+
+            float token_sums[kMaxM] = {0.0f, 0.0f, 0.0f, 0.0f};
+            for (int idx = linear_tid; idx < total_access; idx += linear_stride)
+            {
+                int const token = (idx * kArElemsPerAccess) / kHiddenSize;
+                token_sums[token] += sumSquaresBf16x8(residual_out_vec[idx]);
+            }
+#pragma unroll
+            for (int token = 0; token < kMaxM; ++token)
+            {
+                if (token < M && token_sums[token] != 0.0f)
+                {
+                    atomicAdd(&rms_sums[token], token_sums[token]);
+                }
+            }
+            grid.sync();
+
+            if (linear_tid < M)
+            {
+                rms_sums[linear_tid] = rsqrtf(rms_sums[linear_tid] / static_cast<float>(kHiddenSize) + rms_norm_eps);
+            }
+            grid.sync();
+
+            int const hidden_access_per_token = kHiddenSize / kArElemsPerAccess;
+            for (int idx = linear_tid; idx < total_access; idx += linear_stride)
+            {
+                int const token = idx / hidden_access_per_token;
+                int const hidden_access = idx - token * hidden_access_per_token;
+                float const inv_rms = rms_sums[token];
+                hidden_out_vec[idx] = rmsNormBf16x8(residual_out_vec[idx], norm_weight_vec[hidden_access], inv_rms);
+            }
+        }
+#else
+        if (threadIdx.x == 0 && blockIdx.x == 0)
+        {
+            asm("trap;");
+        }
+#endif
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -1093,15 +1345,31 @@ static CUtensorMap get_cached_w_down_tmap(
 // -----------------------------------------------------------------------------
 } // anonymous namespace
 
+#ifndef DSV3_FUSED_EXPERT_DOWN_CUDA_NAME
+#define DSV3_FUSED_EXPERT_DOWN_CUDA_NAME dsv3_fused_expert_down_cuda
+#endif
+
+#ifndef DSV3_FUSED_EXPERT_DOWN_AR_RESIDUAL_CUDA_NAME
+#define DSV3_FUSED_EXPERT_DOWN_AR_RESIDUAL_CUDA_NAME dsv3_fused_expert_down_ar_residual_cuda
+#endif
+
+#ifndef DSV3_FUSED_EXPERT_DOWN_AR_RESIDUAL_RMS_NORM_CUDA_NAME
+#define DSV3_FUSED_EXPERT_DOWN_AR_RESIDUAL_RMS_NORM_CUDA_NAME dsv3_fused_expert_down_ar_residual_rms_norm_cuda
+#endif
+
 // -----------------------------------------------------------------------------
 // Host launcher
 // -----------------------------------------------------------------------------
-torch::Tensor dsv3_fused_expert_down_cuda(torch::Tensor hidden_in, torch::Tensor indices, torch::Tensor scores,
+static torch::Tensor dsv3_fused_expert_down_cuda_impl(torch::Tensor hidden_in, torch::Tensor indices,
+    torch::Tensor scores,
     torch::Tensor routed_w_down,       // fp8 [256, 6144, K_local]
     torch::Tensor routed_w_down_scale, // fp32 [256, 48, k_blocks]
     torch::Tensor shared_w_down,       // fp8 [6144, K_local]
     torch::Tensor shared_w_down_scale, // fp32 [48, k_blocks]
-    torch::Tensor output)
+    torch::Tensor output, torch::optional<torch::Tensor> residual, torch::optional<torch::Tensor> residual_out,
+    torch::optional<torch::Tensor> norm_weight, torch::optional<torch::Tensor> hidden_out,
+    torch::optional<torch::Tensor> rms_sums, torch::optional<torch::Tensor> workspace, int64_t rank, int64_t nranks,
+    bool enable_ar_residual, bool enable_rms_norm, double rms_norm_eps)
 {
     TORCH_CHECK(hidden_in.is_cuda(), "hidden_in must be CUDA");
     TORCH_CHECK(indices.is_cuda(), "indices must be CUDA");
@@ -1111,6 +1379,25 @@ torch::Tensor dsv3_fused_expert_down_cuda(torch::Tensor hidden_in, torch::Tensor
     TORCH_CHECK(shared_w_down.is_cuda(), "shared_w_down must be CUDA");
     TORCH_CHECK(shared_w_down_scale.is_cuda(), "shared_w_down_scale must be CUDA");
     TORCH_CHECK(output.is_cuda(), "output must be CUDA");
+    if (enable_ar_residual)
+    {
+        TORCH_CHECK(residual.has_value(), "residual is required for dsv3_fused_expert_down_ar_residual");
+        TORCH_CHECK(residual_out.has_value(), "residual_out is required for dsv3_fused_expert_down_ar_residual");
+        TORCH_CHECK(workspace.has_value(), "workspace is required for dsv3_fused_expert_down_ar_residual");
+        TORCH_CHECK(residual.value().is_cuda(), "residual must be CUDA");
+        TORCH_CHECK(residual_out.value().is_cuda(), "residual_out must be CUDA");
+        TORCH_CHECK(workspace.value().is_cuda(), "workspace must be CUDA");
+    }
+    if (enable_rms_norm)
+    {
+        TORCH_CHECK(enable_ar_residual, "RMSNorm mode requires AR residual mode");
+        TORCH_CHECK(norm_weight.has_value(), "norm_weight is required for dsv3_fused_expert_down_ar_residual_rms_norm");
+        TORCH_CHECK(hidden_out.has_value(), "hidden_out is required for dsv3_fused_expert_down_ar_residual_rms_norm");
+        TORCH_CHECK(rms_sums.has_value(), "rms_sums is required for dsv3_fused_expert_down_ar_residual_rms_norm");
+        TORCH_CHECK(norm_weight.value().is_cuda(), "norm_weight must be CUDA");
+        TORCH_CHECK(hidden_out.value().is_cuda(), "hidden_out must be CUDA");
+        TORCH_CHECK(rms_sums.value().is_cuda(), "rms_sums must be CUDA");
+    }
 
     TORCH_CHECK(hidden_in.dtype() == torch::kHalf, "hidden_in must be fp16");
     TORCH_CHECK(indices.dtype() == torch::kInt32, "indices must be int32");
@@ -1120,6 +1407,17 @@ torch::Tensor dsv3_fused_expert_down_cuda(torch::Tensor hidden_in, torch::Tensor
     TORCH_CHECK(shared_w_down.dtype() == torch::kFloat8_e4m3fn, "shared_w_down must be fp8 e4m3");
     TORCH_CHECK(shared_w_down_scale.dtype() == torch::kFloat32, "shared_w_down_scale must be fp32");
     TORCH_CHECK(output.dtype() == torch::kBFloat16, "output must be bf16");
+    if (enable_ar_residual)
+    {
+        TORCH_CHECK(residual.value().dtype() == torch::kBFloat16, "residual must be bf16");
+        TORCH_CHECK(residual_out.value().dtype() == torch::kBFloat16, "residual_out must be bf16");
+    }
+    if (enable_rms_norm)
+    {
+        TORCH_CHECK(norm_weight.value().dtype() == torch::kBFloat16, "norm_weight must be bf16");
+        TORCH_CHECK(hidden_out.value().dtype() == torch::kBFloat16, "hidden_out must be bf16");
+        TORCH_CHECK(rms_sums.value().dtype() == torch::kFloat32, "rms_sums must be fp32");
+    }
 
     TORCH_CHECK(hidden_in.dim() == 3, "hidden_in must be [M, 9, K_local]");
     TORCH_CHECK(hidden_in.size(1) == kTopKPlusShared, "hidden_in dim1 must = 9");
@@ -1137,6 +1435,27 @@ torch::Tensor dsv3_fused_expert_down_cuda(torch::Tensor hidden_in, torch::Tensor
     TORCH_CHECK(K_local == 512 || K_local == 256,
         "dsv3_fused_expert_down supports K_local=512 [TP=4] or K_local=256 [TP=8]; got K_local=", K_local);
     TORCH_CHECK(output.dim() == 2 && output.size(0) == M && output.size(1) == kHiddenSize, "output must be [M, 6144]");
+    if (enable_ar_residual)
+    {
+        TORCH_CHECK(
+            residual.value().dim() == 2 && residual.value().size(0) == M && residual.value().size(1) == kHiddenSize,
+            "residual must be [M, 6144]");
+        TORCH_CHECK(residual_out.value().dim() == 2 && residual_out.value().size(0) == M
+                && residual_out.value().size(1) == kHiddenSize,
+            "residual_out must be [M, 6144]");
+        TORCH_CHECK(nranks >= 1 && nranks <= kMaxArRanks, "nranks must be in [1, ", kMaxArRanks, "], got ", nranks);
+        TORCH_CHECK(rank >= 0 && rank < nranks, "rank must be in [0, nranks), got rank=", rank, " nranks=", nranks);
+        TORCH_CHECK(M * kHiddenSize % kArElemsPerAccess == 0, "M * hidden size must be divisible by 8");
+    }
+    if (enable_rms_norm)
+    {
+        TORCH_CHECK(
+            norm_weight.value().dim() == 1 && norm_weight.value().size(0) == kHiddenSize, "norm_weight must be [6144]");
+        TORCH_CHECK(hidden_out.value().dim() == 2 && hidden_out.value().size(0) == M
+                && hidden_out.value().size(1) == kHiddenSize,
+            "hidden_out must be [M, 6144]");
+        TORCH_CHECK(rms_sums.value().numel() >= M, "rms_sums must have at least M elements");
+    }
     int const k_blocks = K_local / kBlockK; // 4 (TP=4) or 2 (TP=8)
     if (use_packed_weights)
     {
@@ -1172,6 +1491,18 @@ torch::Tensor dsv3_fused_expert_down_cuda(torch::Tensor hidden_in, torch::Tensor
     TORCH_CHECK(shared_w_down.is_contiguous(), "shared_w_down must be contiguous");
     TORCH_CHECK(shared_w_down_scale.is_contiguous(), "shared_w_down_scale must be contiguous");
     TORCH_CHECK(output.is_contiguous(), "output must be contiguous");
+    if (enable_ar_residual)
+    {
+        TORCH_CHECK(residual.value().is_contiguous(), "residual must be contiguous");
+        TORCH_CHECK(residual_out.value().is_contiguous(), "residual_out must be contiguous");
+        TORCH_CHECK(workspace.value().is_contiguous(), "workspace must be contiguous");
+    }
+    if (enable_rms_norm)
+    {
+        TORCH_CHECK(norm_weight.value().is_contiguous(), "norm_weight must be contiguous");
+        TORCH_CHECK(hidden_out.value().is_contiguous(), "hidden_out must be contiguous");
+        TORCH_CHECK(rms_sums.value().is_contiguous(), "rms_sums must be contiguous");
+    }
 
     at::cuda::OptionalCUDAGuard const device_guard(hidden_in.device());
     auto stream = at::cuda::getCurrentCUDAStream();
@@ -1234,18 +1565,51 @@ torch::Tensor dsv3_fused_expert_down_cuda(torch::Tensor hidden_in, torch::Tensor
         " exceeds cap ", kSmemCapBytes);
 
     using KernelFn = void (*)(const CUtensorMap, const CUtensorMap, __nv_fp8_e4m3 const*, __nv_fp8_e4m3 const*,
-        __half const*, int32_t const*, float const*, float const*, float const*, __nv_bfloat16*, int);
+        __half const*, int32_t const*, float const*, float const*, float const*, __nv_bfloat16*, __nv_bfloat16 const*,
+        __nv_bfloat16*, __nv_bfloat16 const*, __nv_bfloat16*, float*, void**, int, int, int, float);
 
     KernelFn kfn = nullptr;
     if (K_local == 512)
     {
-        kfn = use_packed_weights ? &dsv3_fused_expert_down_kernel<512, true>
-                                 : &dsv3_fused_expert_down_kernel<512, false>;
+        if (enable_ar_residual)
+        {
+            if (enable_rms_norm)
+            {
+                kfn = use_packed_weights ? &dsv3_fused_expert_down_kernel<512, true, true, true>
+                                         : &dsv3_fused_expert_down_kernel<512, false, true, true>;
+            }
+            else
+            {
+                kfn = use_packed_weights ? &dsv3_fused_expert_down_kernel<512, true, true, false>
+                                         : &dsv3_fused_expert_down_kernel<512, false, true, false>;
+            }
+        }
+        else
+        {
+            kfn = use_packed_weights ? &dsv3_fused_expert_down_kernel<512, true, false, false>
+                                     : &dsv3_fused_expert_down_kernel<512, false, false, false>;
+        }
     }
     else if (K_local == 256)
     {
-        kfn = use_packed_weights ? &dsv3_fused_expert_down_kernel<256, true>
-                                 : &dsv3_fused_expert_down_kernel<256, false>;
+        if (enable_ar_residual)
+        {
+            if (enable_rms_norm)
+            {
+                kfn = use_packed_weights ? &dsv3_fused_expert_down_kernel<256, true, true, true>
+                                         : &dsv3_fused_expert_down_kernel<256, false, true, true>;
+            }
+            else
+            {
+                kfn = use_packed_weights ? &dsv3_fused_expert_down_kernel<256, true, true, false>
+                                         : &dsv3_fused_expert_down_kernel<256, false, true, false>;
+            }
+        }
+        else
+        {
+            kfn = use_packed_weights ? &dsv3_fused_expert_down_kernel<256, true, false, false>
+                                     : &dsv3_fused_expert_down_kernel<256, false, false, false>;
+        }
     }
     else
     {
@@ -1272,15 +1636,55 @@ torch::Tensor dsv3_fused_expert_down_cuda(torch::Tensor hidden_in, torch::Tensor
     static std::once_flag s_smem_attr_256_per_device[kMaxCudaDevicesForSmemAttr];
     static std::once_flag s_smem_attr_512_packed_per_device[kMaxCudaDevicesForSmemAttr];
     static std::once_flag s_smem_attr_256_packed_per_device[kMaxCudaDevicesForSmemAttr];
+    static std::once_flag s_smem_attr_512_ar_per_device[kMaxCudaDevicesForSmemAttr];
+    static std::once_flag s_smem_attr_256_ar_per_device[kMaxCudaDevicesForSmemAttr];
+    static std::once_flag s_smem_attr_512_packed_ar_per_device[kMaxCudaDevicesForSmemAttr];
+    static std::once_flag s_smem_attr_256_packed_ar_per_device[kMaxCudaDevicesForSmemAttr];
+    static std::once_flag s_smem_attr_512_rms_per_device[kMaxCudaDevicesForSmemAttr];
+    static std::once_flag s_smem_attr_256_rms_per_device[kMaxCudaDevicesForSmemAttr];
+    static std::once_flag s_smem_attr_512_packed_rms_per_device[kMaxCudaDevicesForSmemAttr];
+    static std::once_flag s_smem_attr_256_packed_rms_per_device[kMaxCudaDevicesForSmemAttr];
     if (K_local == 512)
     {
-        set_smem_attribute_once(
-            use_packed_weights ? s_smem_attr_512_packed_per_device[device_id] : s_smem_attr_512_per_device[device_id]);
+        if (enable_ar_residual)
+        {
+            if (enable_rms_norm)
+            {
+                set_smem_attribute_once(use_packed_weights ? s_smem_attr_512_packed_rms_per_device[device_id]
+                                                           : s_smem_attr_512_rms_per_device[device_id]);
+            }
+            else
+            {
+                set_smem_attribute_once(use_packed_weights ? s_smem_attr_512_packed_ar_per_device[device_id]
+                                                           : s_smem_attr_512_ar_per_device[device_id]);
+            }
+        }
+        else
+        {
+            set_smem_attribute_once(use_packed_weights ? s_smem_attr_512_packed_per_device[device_id]
+                                                       : s_smem_attr_512_per_device[device_id]);
+        }
     }
     else
     {
-        set_smem_attribute_once(
-            use_packed_weights ? s_smem_attr_256_packed_per_device[device_id] : s_smem_attr_256_per_device[device_id]);
+        if (enable_ar_residual)
+        {
+            if (enable_rms_norm)
+            {
+                set_smem_attribute_once(use_packed_weights ? s_smem_attr_256_packed_rms_per_device[device_id]
+                                                           : s_smem_attr_256_rms_per_device[device_id]);
+            }
+            else
+            {
+                set_smem_attribute_once(use_packed_weights ? s_smem_attr_256_packed_ar_per_device[device_id]
+                                                           : s_smem_attr_256_ar_per_device[device_id]);
+            }
+        }
+        else
+        {
+            set_smem_attribute_once(use_packed_weights ? s_smem_attr_256_packed_per_device[device_id]
+                                                       : s_smem_attr_256_per_device[device_id]);
+        }
     }
 
     dim3 grid(kNumCtas, 1, 1);
@@ -1289,6 +1693,15 @@ torch::Tensor dsv3_fused_expert_down_cuda(torch::Tensor hidden_in, torch::Tensor
     void* args[] = {
         (void*) &routed_w_down_map,
         (void*) &shared_w_down_map,
+        nullptr,
+        nullptr,
+        nullptr,
+        nullptr,
+        nullptr,
+        nullptr,
+        nullptr,
+        nullptr,
+        nullptr,
         nullptr,
         nullptr,
         nullptr,
@@ -1312,7 +1725,24 @@ torch::Tensor dsv3_fused_expert_down_cuda(torch::Tensor hidden_in, torch::Tensor
     float const* routed_wscale_ptr = routed_w_down_scale.data_ptr<float>();
     float const* shared_wscale_ptr = shared_w_down_scale.data_ptr<float>();
     __nv_bfloat16* output_ptr = reinterpret_cast<__nv_bfloat16*>(output.data_ptr<at::BFloat16>());
+    __nv_bfloat16 const* residual_ptr = enable_ar_residual
+        ? reinterpret_cast<__nv_bfloat16 const*>(residual.value().data_ptr<at::BFloat16>())
+        : nullptr;
+    __nv_bfloat16* residual_out_ptr = enable_ar_residual
+        ? reinterpret_cast<__nv_bfloat16*>(residual_out.value().data_ptr<at::BFloat16>())
+        : nullptr;
+    __nv_bfloat16 const* norm_weight_ptr = enable_rms_norm
+        ? reinterpret_cast<__nv_bfloat16 const*>(norm_weight.value().data_ptr<at::BFloat16>())
+        : nullptr;
+    __nv_bfloat16* hidden_out_ptr
+        = enable_rms_norm ? reinterpret_cast<__nv_bfloat16*>(hidden_out.value().data_ptr<at::BFloat16>()) : nullptr;
+    float* rms_sums_ptr = enable_rms_norm ? rms_sums.value().data_ptr<float>() : nullptr;
+    void** workspace_ptr
+        = enable_ar_residual ? reinterpret_cast<void**>(workspace.value().data_ptr<int64_t>()) : nullptr;
+    int rank_arg = static_cast<int>(rank);
+    int nranks_arg = static_cast<int>(nranks);
     int m_arg = M;
+    float rms_norm_eps_arg = static_cast<float>(rms_norm_eps);
     args[2] = &routed_w_down_packed_ptr;
     args[3] = &shared_w_down_packed_ptr;
     args[4] = &hidden_in_ptr;
@@ -1321,12 +1751,63 @@ torch::Tensor dsv3_fused_expert_down_cuda(torch::Tensor hidden_in, torch::Tensor
     args[7] = &routed_wscale_ptr;
     args[8] = &shared_wscale_ptr;
     args[9] = &output_ptr;
-    args[10] = &m_arg;
+    args[10] = &residual_ptr;
+    args[11] = &residual_out_ptr;
+    args[12] = &norm_weight_ptr;
+    args[13] = &hidden_out_ptr;
+    args[14] = &rms_sums_ptr;
+    args[15] = &workspace_ptr;
+    args[16] = &rank_arg;
+    args[17] = &nranks_arg;
+    args[18] = &m_arg;
+    args[19] = &rms_norm_eps_arg;
 
-    cudaError_t launch_err = cudaLaunchKernel((void const*) kfn, grid, block, args, smem_bytes, stream);
+    cudaError_t launch_err = cudaSuccess;
+    if (enable_ar_residual)
+    {
+        launch_err = cudaLaunchCooperativeKernel((void*) kfn, grid, block, args, smem_bytes, stream);
+    }
+    else
+    {
+        launch_err = cudaLaunchKernel((void const*) kfn, grid, block, args, smem_bytes, stream);
+    }
     TORCH_CHECK(
         launch_err == cudaSuccess, "dsv3_fused_expert_down cudaLaunchKernel failed: ", cudaGetErrorString(launch_err));
 
     AT_CUDA_CHECK(cudaGetLastError());
-    return output;
+    return enable_rms_norm ? hidden_out.value() : (enable_ar_residual ? residual_out.value() : output);
+}
+
+torch::Tensor DSV3_FUSED_EXPERT_DOWN_CUDA_NAME(torch::Tensor hidden_in, torch::Tensor indices, torch::Tensor scores,
+    torch::Tensor routed_w_down, torch::Tensor routed_w_down_scale, torch::Tensor shared_w_down,
+    torch::Tensor shared_w_down_scale, torch::Tensor output)
+{
+    return dsv3_fused_expert_down_cuda_impl(std::move(hidden_in), std::move(indices), std::move(scores),
+        std::move(routed_w_down), std::move(routed_w_down_scale), std::move(shared_w_down),
+        std::move(shared_w_down_scale), std::move(output), torch::nullopt, torch::nullopt, torch::nullopt,
+        torch::nullopt, torch::nullopt, torch::nullopt, 0, 1, false, false, 0.0);
+}
+
+torch::Tensor DSV3_FUSED_EXPERT_DOWN_AR_RESIDUAL_CUDA_NAME(torch::Tensor hidden_in, torch::Tensor indices,
+    torch::Tensor scores, torch::Tensor routed_w_down, torch::Tensor routed_w_down_scale, torch::Tensor shared_w_down,
+    torch::Tensor shared_w_down_scale, torch::Tensor residual, torch::Tensor workspace, int64_t rank, int64_t nranks,
+    torch::Tensor local_output, torch::Tensor residual_out)
+{
+    return dsv3_fused_expert_down_cuda_impl(std::move(hidden_in), std::move(indices), std::move(scores),
+        std::move(routed_w_down), std::move(routed_w_down_scale), std::move(shared_w_down),
+        std::move(shared_w_down_scale), std::move(local_output), std::move(residual), std::move(residual_out),
+        torch::nullopt, torch::nullopt, torch::nullopt, std::move(workspace), rank, nranks, true, false, 0.0);
+}
+
+torch::Tensor DSV3_FUSED_EXPERT_DOWN_AR_RESIDUAL_RMS_NORM_CUDA_NAME(torch::Tensor hidden_in, torch::Tensor indices,
+    torch::Tensor scores, torch::Tensor routed_w_down, torch::Tensor routed_w_down_scale, torch::Tensor shared_w_down,
+    torch::Tensor shared_w_down_scale, torch::Tensor residual, torch::Tensor norm_weight, torch::Tensor workspace,
+    int64_t rank, int64_t nranks, double rms_norm_eps, torch::Tensor local_output, torch::Tensor residual_out,
+    torch::Tensor hidden_out, torch::Tensor rms_sums)
+{
+    return dsv3_fused_expert_down_cuda_impl(std::move(hidden_in), std::move(indices), std::move(scores),
+        std::move(routed_w_down), std::move(routed_w_down_scale), std::move(shared_w_down),
+        std::move(shared_w_down_scale), std::move(local_output), std::move(residual), std::move(residual_out),
+        std::move(norm_weight), std::move(hidden_out), std::move(rms_sums), std::move(workspace), rank, nranks, true,
+        true, rms_norm_eps);
 }

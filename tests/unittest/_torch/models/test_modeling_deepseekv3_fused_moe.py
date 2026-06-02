@@ -45,6 +45,8 @@ _RUNTIME_DEBUG_OUTPUT_DIR_ENV = "TRTLLM_DEEPSEEKV3_FUSED_MOE_DEBUG_OUTPUT_DIR"
 _DEFAULT_DEBUG_OUTPUT_DIR = "~/dev/debug_output"
 _PHASE_ENV = "TRTLLM_DEEPSEEKV3_FUSED_MOE_TEST_PHASE"
 _PREPACK_FUSED_EXPERT_DOWN_ENV = "TRTLLM_DEEPSEEKV3_FUSED_MOE_TEST_PREPACK_FUSED_EXPERT_DOWN"
+_EXTRA_OP_LIBRARY_ENV = "TRTLLM_DEEPSEEKV3_FUSED_MOE_TEST_EXTRA_OP_LIBRARY"
+_FUSED_EXPERT_DOWN_OP_ENV = "TRTLLM_DEEPSEEKV3_FUSED_MOE_TEST_FUSED_EXPERT_DOWN_OP"
 
 _NUM_RANKS = 8
 _DEFAULT_TOP_K = 8
@@ -67,6 +69,7 @@ _CURRENT_FUSED_KERNEL_ABS_ERROR_THRESHOLDS_BY_RANK = (
     7.10e-05,
     4.14e-04,
 )
+_EXTRA_OP_LIBRARIES_LOADED = False
 
 # Ideal target is zero fused-kernel slack: abs_error <= reference_abs_threshold.
 # Historical dumped GLM-5 multi-stream-baseline-vs-PyTorch max abs thresholds
@@ -226,6 +229,10 @@ def _prepack_fused_expert_down_enabled() -> bool:
     )
 
 
+def _fused_expert_down_op_name() -> str:
+    return _env(_FUSED_EXPERT_DOWN_OP_ENV, "dsv3_fused_expert_down")
+
+
 def _fused_kernel_abs_error_threshold_slack() -> float:
     return _float_env(
         "TRTLLM_DEEPSEEKV3_FUSED_MOE_TEST_ABS_ERROR_THRESHOLD_SLACK",
@@ -240,6 +247,22 @@ def _current_fused_kernel_abs_error_threshold(rank: int) -> float:
 def _register_trtllm_custom_ops() -> None:
     importlib.import_module("tensorrt_llm._torch.custom_ops.torch_custom_ops")
     importlib.import_module("tensorrt_llm._torch.custom_ops.trtllm_gen_custom_ops")
+
+
+def _load_extra_op_libraries() -> None:
+    global _EXTRA_OP_LIBRARIES_LOADED
+
+    if _EXTRA_OP_LIBRARIES_LOADED:
+        return
+    _EXTRA_OP_LIBRARIES_LOADED = True
+
+    raw_paths = _env(_EXTRA_OP_LIBRARY_ENV, "")
+    if not raw_paths:
+        return
+    for raw_path in raw_paths.replace(",", os.pathsep).split(os.pathsep):
+        raw_path = raw_path.strip()
+        if raw_path:
+            torch.ops.load_library(str(Path(raw_path).expanduser()))
 
 
 def _load_tensor(group: FusedMoeDumpGroup, layer_idx: int, tensor_name: str) -> torch.Tensor:
@@ -391,6 +414,7 @@ def _require_cuda_and_ops(
     if not torch.cuda.is_available():
         pytest.skip("Deepseekv3FusedMoE dump tests require CUDA")
     _register_trtllm_custom_ops()
+    _load_extra_op_libraries()
 
     from tensorrt_llm._utils import is_sm_100f
 
@@ -409,7 +433,7 @@ def _require_cuda_and_ops(
             ]
         )
     if require_fused_ops:
-        required_ops.extend(["dsv3_fused_expert_up", "dsv3_fused_expert_down"])
+        required_ops.extend(["dsv3_fused_expert_up", _fused_expert_down_op_name()])
 
     missing_ops = [name for name in required_ops if not hasattr(torch.ops.trtllm, name)]
     if missing_ops:
@@ -516,6 +540,35 @@ def _ensure_fused_expert_down_prepacked_tensors(tensors: dict[str, torch.Tensor]
         prepack_fused_expert_down_routed_w2_weight(tensors["routed_w2_weight"])
     )
     torch.cuda.synchronize()
+
+
+def _run_fused_expert_down_chunked(
+    slot_swiglu_output: torch.Tensor,
+    expert_indices: torch.Tensor,
+    expert_weights: torch.Tensor,
+    routed_w2_weight: torch.Tensor,
+    routed_w2_weight_scale: torch.Tensor,
+    shared_down_weight: torch.Tensor,
+    shared_down_weight_scale_org: torch.Tensor,
+    output_tensor: torch.Tensor,
+) -> torch.Tensor:
+    num_tokens = slot_swiglu_output.size(0)
+    fused_expert_down_op = getattr(torch.ops.trtllm, _fused_expert_down_op_name())
+    for token_start in range(0, num_tokens, Deepseekv3FusedMoE._WIP_DOWN_PROJECT_MAX_NUM_TOKENS):
+        token_end = min(
+            token_start + Deepseekv3FusedMoE._WIP_DOWN_PROJECT_MAX_NUM_TOKENS, num_tokens
+        )
+        fused_expert_down_op(
+            slot_swiglu_output[token_start:token_end].contiguous(),
+            expert_indices[token_start:token_end].contiguous(),
+            expert_weights[token_start:token_end].contiguous(),
+            routed_w2_weight,
+            routed_w2_weight_scale,
+            shared_down_weight,
+            shared_down_weight_scale_org,
+            output_tensor[token_start:token_end],
+        )
+    return output_tensor
 
 
 def _pytorch_ref_chunk_size() -> int:
@@ -1014,7 +1067,7 @@ def _run_fused_kernel(
     fused_expert_down_end_event = _record_fused_kernel_profile_start(
         profile_events, "dsv3_fused_expert_down"
     )
-    final_hidden_states = Deepseekv3FusedMoE._run_dsv3_fused_expert_down_chunked(
+    final_hidden_states = _run_fused_expert_down_chunked(
         slot_swiglu_output,
         expert_indices,
         expert_weights,

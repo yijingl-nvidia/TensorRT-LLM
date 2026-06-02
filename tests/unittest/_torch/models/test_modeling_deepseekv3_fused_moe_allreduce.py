@@ -24,6 +24,7 @@ import torch
 from mpi4py import MPI
 
 from tensorrt_llm._torch.distributed import AllReduce, AllReduceParams
+from tensorrt_llm._torch.distributed.ops import get_allreduce_workspace
 from tensorrt_llm._torch.models.modeling_deepseekv3_fused_moe import Deepseekv3FusedMoE
 from tensorrt_llm.functional import AllReduceFusionOp, AllReduceStrategy
 from tensorrt_llm.mapping import Mapping
@@ -39,14 +40,25 @@ _WIP_VS_BASELINE_RESIDUAL_ABS_THRESHOLD_ENV = (
 _WIP_VS_BASELINE_HIDDEN_ABS_THRESHOLD_ENV = (
     "TRTLLM_DEEPSEEKV3_FUSED_MOE_AR_TEST_WIP_VS_BASELINE_HIDDEN_ABS_THRESHOLD"
 )
+_FUSED_EXPERT_DOWN_AR_RESIDUAL_OP_ENV = (
+    "TRTLLM_DEEPSEEKV3_FUSED_MOE_TEST_FUSED_EXPERT_DOWN_AR_RESIDUAL_OP"
+)
+_FUSED_EXPERT_DOWN_AR_RESIDUAL_RMS_NORM_OP_ENV = (
+    "TRTLLM_DEEPSEEKV3_FUSED_MOE_TEST_FUSED_EXPERT_DOWN_AR_RESIDUAL_RMS_NORM_OP"
+)
 _RESIDUAL_SEED_ENV = "TRTLLM_DEEPSEEKV3_FUSED_MOE_AR_TEST_RESIDUAL_SEED"
 _RMS_NORM_EPS_ENV = "TRTLLM_DEEPSEEKV3_FUSED_MOE_AR_TEST_RMS_NORM_EPS"
+_PROFILE_ENV = "TRTLLM_DEEPSEEKV3_FUSED_MOE_AR_TEST_PROFILE"
+_PROFILE_WARMUP_ITERS_ENV = "TRTLLM_DEEPSEEKV3_FUSED_MOE_AR_TEST_PROFILE_WARMUP_ITERS"
+_PROFILE_ITERS_ENV = "TRTLLM_DEEPSEEKV3_FUSED_MOE_AR_TEST_PROFILE_ITERS"
 _DEFAULT_BASELINE_ABS_THRESHOLD = 0.02
 _DEFAULT_FUSED_ABS_THRESHOLD = 0.02
 _DEFAULT_WIP_VS_BASELINE_RESIDUAL_ABS_THRESHOLD = 3.90625e-03
 _DEFAULT_WIP_VS_BASELINE_HIDDEN_ABS_THRESHOLD = 1.5625e-02
 _DEFAULT_RESIDUAL_SEED = 20260602
 _DEFAULT_RMS_NORM_EPS = 1e-6
+_DEFAULT_PROFILE_WARMUP_ITERS = 20
+_DEFAULT_PROFILE_ITERS = 100
 
 
 def _helpers() -> ModuleType:
@@ -71,8 +83,39 @@ def _int_env(name: str, default: int) -> int:
     return int(os.environ.get(name, str(default)))
 
 
+def _bool_env(name: str, default: bool) -> bool:
+    value = os.environ.get(name, "1" if default else "0")
+    return value.strip().lower() in ("1", "true", "yes", "on")
+
+
 def _rms_norm_eps() -> float:
     return _float_env(_RMS_NORM_EPS_ENV, _DEFAULT_RMS_NORM_EPS)
+
+
+def _profile_enabled() -> bool:
+    return _bool_env(_PROFILE_ENV, False)
+
+
+def _profile_warmup_iters() -> int:
+    return _int_env(_PROFILE_WARMUP_ITERS_ENV, _DEFAULT_PROFILE_WARMUP_ITERS)
+
+
+def _profile_iters() -> int:
+    return _int_env(_PROFILE_ITERS_ENV, _DEFAULT_PROFILE_ITERS)
+
+
+def _fused_expert_down_ar_residual_op_name() -> str:
+    return os.environ.get(
+        _FUSED_EXPERT_DOWN_AR_RESIDUAL_OP_ENV,
+        "dsv3_fused_expert_down_ar_residual",
+    )
+
+
+def _fused_expert_down_ar_residual_rms_norm_op_name() -> str:
+    return os.environ.get(
+        _FUSED_EXPERT_DOWN_AR_RESIDUAL_RMS_NORM_OP_ENV,
+        "dsv3_fused_expert_down_ar_residual_rms_norm",
+    )
 
 
 def _distributed_world_size() -> int:
@@ -122,7 +165,35 @@ def _post_moe_allreduce_residual_rms_norm_reference(
     return hidden_states, residual_out
 
 
-def _run_fused_expert_down_local(tensors: dict[str, torch.Tensor]) -> torch.Tensor:
+def _require_fused_expert_down_ar_residual_op() -> None:
+    op_name = _fused_expert_down_ar_residual_op_name()
+    if not hasattr(torch.ops.trtllm, op_name):
+        pytest.skip(f"missing torch.ops.trtllm.{op_name}")
+
+
+def _require_fused_expert_down_ar_residual_rms_norm_op() -> None:
+    op_name = _fused_expert_down_ar_residual_rms_norm_op_name()
+    if not hasattr(torch.ops.trtllm, op_name):
+        pytest.skip(f"missing torch.ops.trtllm.{op_name}")
+
+
+def _select_fused_expert_down_weights(
+    tensors: dict[str, torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    helpers = _helpers()
+    helpers._ensure_fused_expert_up_prepacked_tensors(tensors)
+    if helpers._prepack_fused_expert_down_enabled():
+        helpers._ensure_fused_expert_down_prepacked_tensors(tensors)
+        return (
+            tensors["routed_w2_weight_packed_fused_expert_down"],
+            tensors["shared_down_weight_packed_fused_expert_down"],
+        )
+    return tensors["routed_w2_weight"], tensors["shared_down_weight_org"]
+
+
+def _run_fused_expert_up_outputs(
+    tensors: dict[str, torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     helpers = _helpers()
     helpers._ensure_fused_expert_up_prepacked_tensors(tensors)
     expert_indices, expert_weights, slot_swiglu_output = (
@@ -140,17 +211,96 @@ def _run_fused_expert_down_local(tensors: dict[str, torch.Tensor]) -> torch.Tens
             helpers._routed_scaling_factor(),
         )
     )
+    return expert_indices, expert_weights, slot_swiglu_output
+
+
+def _run_fused_expert_down_local(tensors: dict[str, torch.Tensor]) -> torch.Tensor:
+    helpers = _helpers()
+    expert_indices, expert_weights, slot_swiglu_output = _run_fused_expert_up_outputs(tensors)
+    routed_w2_weight, shared_down_weight = _select_fused_expert_down_weights(tensors)
     output = torch.empty_like(tensors["hidden_states"])
-    return Deepseekv3FusedMoE._run_dsv3_fused_expert_down_chunked(
+    return helpers._run_fused_expert_down_chunked(
         slot_swiglu_output,
         expert_indices,
         expert_weights,
-        tensors["routed_w2_weight"],
+        routed_w2_weight,
         tensors["routed_w2_weight_scale"],
-        tensors["shared_down_weight_org"],
+        shared_down_weight,
         tensors["shared_down_weight_scale_org"],
         output,
     )
+
+
+def _run_fused_expert_down_ar_residual(
+    tensors: dict[str, torch.Tensor],
+    residual: torch.Tensor,
+    workspace: torch.Tensor,
+    rank: int,
+    nranks: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    expert_indices, expert_weights, slot_swiglu_output = _run_fused_expert_up_outputs(tensors)
+    routed_w2_weight, shared_down_weight = _select_fused_expert_down_weights(tensors)
+    local_output = torch.empty_like(tensors["hidden_states"])
+    residual_out = torch.empty_like(tensors["hidden_states"])
+    fused_expert_down_ar_residual_op = getattr(
+        torch.ops.trtllm, _fused_expert_down_ar_residual_op_name()
+    )
+    residual_out = fused_expert_down_ar_residual_op(
+        slot_swiglu_output,
+        expert_indices,
+        expert_weights,
+        routed_w2_weight,
+        tensors["routed_w2_weight_scale"],
+        shared_down_weight,
+        tensors["shared_down_weight_scale_org"],
+        residual,
+        workspace,
+        rank,
+        nranks,
+        local_output,
+        residual_out,
+    )
+    return local_output, residual_out
+
+
+def _run_fused_expert_down_ar_residual_rms_norm(
+    tensors: dict[str, torch.Tensor],
+    residual: torch.Tensor,
+    norm_weight: torch.Tensor,
+    workspace: torch.Tensor,
+    rank: int,
+    nranks: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    expert_indices, expert_weights, slot_swiglu_output = _run_fused_expert_up_outputs(tensors)
+    routed_w2_weight, shared_down_weight = _select_fused_expert_down_weights(tensors)
+    local_output = torch.empty_like(tensors["hidden_states"])
+    residual_out = torch.empty_like(tensors["hidden_states"])
+    hidden_out = torch.empty_like(tensors["hidden_states"])
+    rms_sums = torch.empty((tensors["hidden_states"].shape[0],), device="cuda", dtype=torch.float32)
+    fused_expert_down_ar_residual_rms_norm_op = getattr(
+        torch.ops.trtllm,
+        _fused_expert_down_ar_residual_rms_norm_op_name(),
+    )
+    hidden_out = fused_expert_down_ar_residual_rms_norm_op(
+        slot_swiglu_output,
+        expert_indices,
+        expert_weights,
+        routed_w2_weight,
+        tensors["routed_w2_weight_scale"],
+        shared_down_weight,
+        tensors["shared_down_weight_scale_org"],
+        residual,
+        norm_weight,
+        workspace,
+        rank,
+        nranks,
+        _rms_norm_eps(),
+        local_output,
+        residual_out,
+        hidden_out,
+        rms_sums,
+    )
+    return local_output, residual_out, hidden_out
 
 
 def _max_errors(actual: torch.Tensor, expected: torch.Tensor) -> tuple[float, float]:
@@ -336,27 +486,91 @@ def _write_wip_summary(rank_results: list[dict[str, float]]) -> None:
                     f"wip_vs_baseline_residual_abs {result['residual_abs']:.6e}",
                     f"wip_vs_baseline_hidden_rel {result['hidden_rel']:.6e}",
                     f"wip_vs_baseline_hidden_abs {result['hidden_abs']:.6e}",
+                    f"wip_ar_vs_trtllm_ar_residual_rel {result['local_ar_residual_rel']:.6e}",
+                    f"wip_ar_vs_trtllm_ar_residual_abs {result['local_ar_residual_abs']:.6e}",
+                    f"wip_ar_vs_trtllm_ar_hidden_rel {result['local_ar_hidden_rel']:.6e}",
+                    f"wip_ar_vs_trtllm_ar_hidden_abs {result['local_ar_hidden_abs']:.6e}",
+                    f"wip_rms_vs_python_rms_hidden_rel {result['rms_hidden_rel']:.6e}",
+                    f"wip_rms_vs_python_rms_hidden_abs {result['rms_hidden_abs']:.6e}",
                 ]
             )
         )
     max_residual_abs = max(result["residual_abs"] for result in rank_results)
     max_hidden_abs = max(result["hidden_abs"] for result in rank_results)
+    max_local_ar_residual_abs = max(result["local_ar_residual_abs"] for result in rank_results)
+    max_local_ar_hidden_abs = max(result["local_ar_hidden_abs"] for result in rank_results)
+    max_rms_hidden_abs = max(result["rms_hidden_abs"] for result in rank_results)
     lines.append(
         " ".join(
             [
                 "Average over 8 ranks:",
                 f"max_wip_vs_baseline_residual_abs {max_residual_abs:.6e}",
                 f"max_wip_vs_baseline_hidden_abs {max_hidden_abs:.6e}",
+                f"max_wip_ar_vs_trtllm_ar_residual_abs {max_local_ar_residual_abs:.6e}",
+                f"max_wip_ar_vs_trtllm_ar_hidden_abs {max_local_ar_hidden_abs:.6e}",
+                f"max_wip_rms_vs_python_rms_hidden_abs {max_rms_hidden_abs:.6e}",
             ]
         )
     )
     path.write_text("\n".join(lines) + "\n")
 
 
-def test_deepseekv3_fused_moe_post_moe_allreduce_wip_path() -> None:
+def _profile_cuda_events(fn, warmup_iters: int, profile_iters: int) -> dict[str, float]:
+    if warmup_iters < 0:
+        raise ValueError(f"warmup_iters must be non-negative, got {warmup_iters}")
+    if profile_iters <= 0:
+        raise ValueError(f"profile_iters must be positive, got {profile_iters}")
+
+    for _ in range(warmup_iters):
+        fn()
+    torch.cuda.synchronize()
+
+    starts = [torch.cuda.Event(enable_timing=True) for _ in range(profile_iters)]
+    ends = [torch.cuda.Event(enable_timing=True) for _ in range(profile_iters)]
+    for idx in range(profile_iters):
+        starts[idx].record()
+        fn()
+        ends[idx].record()
+    torch.cuda.synchronize()
+
+    times_us = torch.tensor(
+        [starts[idx].elapsed_time(ends[idx]) * 1000.0 for idx in range(profile_iters)],
+        dtype=torch.float32,
+    )
+    return {
+        "mean_us": float(times_us.mean().item()),
+        "median_us": float(times_us.median().item()),
+        "min_us": float(times_us.min().item()),
+        "max_us": float(times_us.max().item()),
+    }
+
+
+def _format_profile_average_line(rank_results: list[dict[str, float]]) -> str:
+    metric_names = [
+        "old_baseline_full_mean_us",
+        "fused_local_trtllm_ar_rms_mean_us",
+        "stage1_down_ar_residual_mean_us",
+        "stage2_down_ar_residual_rms_mean_us",
+        "stage1_speedup_vs_fused_local_trtllm_ar_rms",
+        "stage2_speedup_vs_fused_local_trtllm_ar_rms",
+    ]
+    fields = ["Average over 8 ranks:"]
+    for name in metric_names:
+        value = sum(result[name] for result in rank_results) / len(rank_results)
+        suffix = "x" if name.endswith("speedup_vs_fused_local_trtllm_ar_rms") else " us"
+        fields.append(f"{name} {value:.3f}{suffix}")
+    return " ".join(fields)
+
+
+def test_deepseekv3_fused_moe_post_moe_allreduce_profile() -> None:
+    if not _profile_enabled():
+        pytest.skip(f"set {_PROFILE_ENV}=1 to enable profiling")
+
     rank, world_size, comm = _init_mpi_for_trtllm_allreduce()
     helpers = _helpers()
     helpers._require_cuda_and_ops(require_baseline_ops=True, require_fused_ops=True)
+    _require_fused_expert_down_ar_residual_op()
+    _require_fused_expert_down_ar_residual_rms_norm_op()
 
     with torch.inference_mode():
         group = helpers._dump_group(rank)
@@ -379,23 +593,206 @@ def test_deepseekv3_fused_moe_post_moe_allreduce_wip_path() -> None:
             strategy=AllReduceStrategy.NCCL,
             dtype=torch.bfloat16,
         )
+        workspace = get_allreduce_workspace(mapping)
+
+        expert_indices, expert_weights, slot_swiglu_output = _run_fused_expert_up_outputs(tensors)
+        routed_w2_weight, shared_down_weight = _select_fused_expert_down_weights(tensors)
+        local_output = torch.empty_like(tensors["hidden_states"])
+        residual_out = torch.empty_like(tensors["hidden_states"])
+        hidden_out = torch.empty_like(tensors["hidden_states"])
+        rms_sums = torch.empty(
+            (tensors["hidden_states"].shape[0],), device="cuda", dtype=torch.float32
+        )
+        fused_expert_down_op = getattr(torch.ops.trtllm, helpers._fused_expert_down_op_name())
+        fused_expert_down_ar_residual_op = getattr(
+            torch.ops.trtllm,
+            _fused_expert_down_ar_residual_op_name(),
+        )
+        fused_expert_down_ar_residual_rms_norm_op = getattr(
+            torch.ops.trtllm,
+            _fused_expert_down_ar_residual_rms_norm_op_name(),
+        )
+
+        def run_local_down() -> torch.Tensor:
+            return fused_expert_down_op(
+                slot_swiglu_output,
+                expert_indices,
+                expert_weights,
+                routed_w2_weight,
+                tensors["routed_w2_weight_scale"],
+                shared_down_weight,
+                tensors["shared_down_weight_scale_org"],
+                local_output,
+            )
+
+        def run_fused_local_trtllm_ar_rms() -> tuple[torch.Tensor, torch.Tensor]:
+            run_local_down()
+            return _run_trtllm_allreduce_residual_rms_norm(
+                allreduce,
+                local_output,
+                residual,
+                norm_weight,
+            )
+
+        def run_stage1_down_ar_residual() -> torch.Tensor:
+            return fused_expert_down_ar_residual_op(
+                slot_swiglu_output,
+                expert_indices,
+                expert_weights,
+                routed_w2_weight,
+                tensors["routed_w2_weight_scale"],
+                shared_down_weight,
+                tensors["shared_down_weight_scale_org"],
+                residual,
+                workspace,
+                rank,
+                world_size,
+                local_output,
+                residual_out,
+            )
+
+        def run_stage2_down_ar_residual_rms() -> torch.Tensor:
+            return fused_expert_down_ar_residual_rms_norm_op(
+                slot_swiglu_output,
+                expert_indices,
+                expert_weights,
+                routed_w2_weight,
+                tensors["routed_w2_weight_scale"],
+                shared_down_weight,
+                tensors["shared_down_weight_scale_org"],
+                residual,
+                norm_weight,
+                workspace,
+                rank,
+                world_size,
+                _rms_norm_eps(),
+                local_output,
+                residual_out,
+                hidden_out,
+                rms_sums,
+            )
+
+        def run_old_baseline_full() -> tuple[torch.Tensor, torch.Tensor]:
+            baseline_local_output = helpers._run_multi_stream_baseline(old_moe, tensors)
+            return _run_trtllm_allreduce_residual_rms_norm(
+                allreduce,
+                baseline_local_output,
+                residual,
+                norm_weight,
+            )
+
+        warmup_iters = _profile_warmup_iters()
+        profile_iters = _profile_iters()
+        torch.cuda.synchronize()
+        comm.Barrier()
+        old_baseline_full_stats = _profile_cuda_events(
+            run_old_baseline_full,
+            warmup_iters,
+            profile_iters,
+        )
+        comm.Barrier()
+        fused_local_trtllm_ar_rms_stats = _profile_cuda_events(
+            run_fused_local_trtllm_ar_rms,
+            warmup_iters,
+            profile_iters,
+        )
+        comm.Barrier()
+        stage1_stats = _profile_cuda_events(
+            run_stage1_down_ar_residual,
+            warmup_iters,
+            profile_iters,
+        )
+        comm.Barrier()
+        stage2_stats = _profile_cuda_events(
+            run_stage2_down_ar_residual_rms,
+            warmup_iters,
+            profile_iters,
+        )
+        torch.cuda.synchronize()
+
+    result = {
+        "rank": float(rank),
+        "old_baseline_full_mean_us": old_baseline_full_stats["mean_us"],
+        "fused_local_trtllm_ar_rms_mean_us": fused_local_trtllm_ar_rms_stats["mean_us"],
+        "stage1_down_ar_residual_mean_us": stage1_stats["mean_us"],
+        "stage2_down_ar_residual_rms_mean_us": stage2_stats["mean_us"],
+        "stage1_speedup_vs_fused_local_trtllm_ar_rms": fused_local_trtllm_ar_rms_stats["mean_us"]
+        / stage1_stats["mean_us"],
+        "stage2_speedup_vs_fused_local_trtllm_ar_rms": fused_local_trtllm_ar_rms_stats["mean_us"]
+        / stage2_stats["mean_us"],
+    }
+    gathered_results = [item for item in comm.allgather(result) if item is not None]
+    if rank == 0:
+        print(_format_profile_average_line(gathered_results))
+    comm.Barrier()
+
+
+def test_deepseekv3_fused_moe_post_moe_allreduce_wip_path() -> None:
+    rank, world_size, comm = _init_mpi_for_trtllm_allreduce()
+    helpers = _helpers()
+    helpers._require_cuda_and_ops(require_baseline_ops=True, require_fused_ops=True)
+    _require_fused_expert_down_ar_residual_rms_norm_op()
+
+    with torch.inference_mode():
+        group = helpers._dump_group(rank)
+        tensors = helpers._load_inputs(
+            group,
+            max_num_tokens=helpers._max_fused_kernel_num_tokens(),
+            include_fused_kernel_tensors=True,
+        )
+        residual, norm_weight = _make_residual_and_norm_weight(tensors["hidden_states"].shape)
+        old_moe = helpers._build_old_moe_baseline(tensors, group)
+        mapping = Mapping(
+            world_size=world_size,
+            rank=rank,
+            gpus_per_node=world_size,
+            tp_size=world_size,
+            pp_size=1,
+        )
+        allreduce = AllReduce(
+            mapping=mapping,
+            strategy=AllReduceStrategy.NCCL,
+            dtype=torch.bfloat16,
+        )
+        workspace = get_allreduce_workspace(mapping)
 
         baseline_local_output = helpers._run_multi_stream_baseline(old_moe, tensors)
-        wip_local_output = _run_fused_expert_down_local(tensors)
+        wip_local_output, wip_residual, wip_hidden_states = (
+            _run_fused_expert_down_ar_residual_rms_norm(
+                tensors,
+                residual,
+                norm_weight,
+                workspace,
+                rank,
+                world_size,
+            )
+        )
         baseline_hidden_states, baseline_residual = _run_trtllm_allreduce_residual_rms_norm(
             allreduce,
             baseline_local_output,
             residual,
             norm_weight,
         )
-        wip_hidden_states, wip_residual = _run_trtllm_allreduce_residual_rms_norm(
-            allreduce,
-            wip_local_output,
-            residual,
-            norm_weight,
+        wip_python_rms_hidden_states = _rms_norm(wip_residual, norm_weight, _rms_norm_eps())
+        wip_local_allreduce_hidden_states, wip_local_allreduce_residual = (
+            _run_trtllm_allreduce_residual_rms_norm(
+                allreduce,
+                wip_local_output,
+                residual,
+                norm_weight,
+            )
         )
         torch.cuda.synchronize()
 
+    local_ar_residual_rel, local_ar_residual_abs = _max_errors(
+        wip_residual,
+        wip_local_allreduce_residual,
+    )
+    local_ar_hidden_rel, local_ar_hidden_abs = _max_errors(
+        wip_hidden_states,
+        wip_local_allreduce_hidden_states,
+    )
+    rms_hidden_rel, rms_hidden_abs = _max_errors(wip_hidden_states, wip_python_rms_hidden_states)
     residual_rel, residual_abs = _max_errors(wip_residual, baseline_residual)
     hidden_rel, hidden_abs = _max_errors(wip_hidden_states, baseline_hidden_states)
     result = {
@@ -404,16 +801,24 @@ def test_deepseekv3_fused_moe_post_moe_allreduce_wip_path() -> None:
         "residual_abs": residual_abs,
         "hidden_rel": hidden_rel,
         "hidden_abs": hidden_abs,
+        "local_ar_residual_rel": local_ar_residual_rel,
+        "local_ar_residual_abs": local_ar_residual_abs,
+        "local_ar_hidden_rel": local_ar_hidden_rel,
+        "local_ar_hidden_abs": local_ar_hidden_abs,
+        "rms_hidden_rel": rms_hidden_rel,
+        "rms_hidden_abs": rms_hidden_abs,
     }
     gathered_results = [item for item in comm.allgather(result) if item is not None]
     if rank == 0:
         _write_wip_summary(gathered_results)
         max_residual_abs = max(item["residual_abs"] for item in gathered_results)
         max_hidden_abs = max(item["hidden_abs"] for item in gathered_results)
+        max_rms_hidden_abs = max(item["rms_hidden_abs"] for item in gathered_results)
         print(
             "DeepSeekV3 fused MoE post-MoE AllReduce WIP path: "
             f"max_wip_vs_baseline_residual_abs {max_residual_abs:.6e}, "
-            f"max_wip_vs_baseline_hidden_abs {max_hidden_abs:.6e}"
+            f"max_wip_vs_baseline_hidden_abs {max_hidden_abs:.6e}, "
+            f"max_wip_rms_vs_python_rms_hidden_abs {max_rms_hidden_abs:.6e}"
         )
     comm.Barrier()
 
@@ -427,3 +832,4 @@ def test_deepseekv3_fused_moe_post_moe_allreduce_wip_path() -> None:
     )
     assert residual_abs <= residual_abs_threshold
     assert hidden_abs <= hidden_abs_threshold
+    assert rms_hidden_abs <= hidden_abs_threshold

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 1993-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,24 +15,24 @@
  * limitations under the License.
  */
 
-// DeepSeek-V3 fused expert-down op wrapper.
-
-#include "tensorrt_llm/common/opUtils.h"
-#include "tensorrt_llm/runtime/torchUtils.h"
+// Dev-only DeepSeek-V3 fused expert-down op wrapper for standalone builds.
+//
+// This file intentionally registers unique op names so the in-development
+// shared object can be loaded beside libth_common.so without duplicate schema
+// registration.
 
 #include <torch/torch.h>
 
-// Forward declaration of the host launcher defined in the .cu file.
-torch::Tensor dsv3_fused_expert_down_cuda(torch::Tensor hidden_in, torch::Tensor indices, torch::Tensor scores,
+torch::Tensor dsv3_fused_expert_down_cuda_dev(torch::Tensor hidden_in, torch::Tensor indices, torch::Tensor scores,
     torch::Tensor routed_w_down, torch::Tensor routed_w_down_scale, torch::Tensor shared_w_down,
     torch::Tensor shared_w_down_scale, torch::Tensor output);
 
-torch::Tensor dsv3_fused_expert_down_ar_residual_cuda(torch::Tensor hidden_in, torch::Tensor indices,
+torch::Tensor dsv3_fused_expert_down_ar_residual_cuda_dev(torch::Tensor hidden_in, torch::Tensor indices,
     torch::Tensor scores, torch::Tensor routed_w_down, torch::Tensor routed_w_down_scale, torch::Tensor shared_w_down,
     torch::Tensor shared_w_down_scale, torch::Tensor residual, torch::Tensor workspace, int64_t rank, int64_t nranks,
     torch::Tensor local_output, torch::Tensor residual_out);
 
-torch::Tensor dsv3_fused_expert_down_ar_residual_rms_norm_cuda(torch::Tensor hidden_in, torch::Tensor indices,
+torch::Tensor dsv3_fused_expert_down_ar_residual_rms_norm_cuda_dev(torch::Tensor hidden_in, torch::Tensor indices,
     torch::Tensor scores, torch::Tensor routed_w_down, torch::Tensor routed_w_down_scale, torch::Tensor shared_w_down,
     torch::Tensor shared_w_down_scale, torch::Tensor residual, torch::Tensor norm_weight, torch::Tensor workspace,
     int64_t rank, int64_t nranks, double rms_norm_eps, torch::Tensor local_output, torch::Tensor residual_out,
@@ -40,72 +40,67 @@ torch::Tensor dsv3_fused_expert_down_ar_residual_rms_norm_cuda(torch::Tensor hid
 
 namespace th = torch;
 
-TRTLLM_NAMESPACE_BEGIN
+namespace tensorrt_llm
+{
 
 namespace torch_ext
 {
 
-// Returns hidden_out_bf16 [M, kHiddenSize] in the caller-provided output tensor.
-th::Tensor dsv3_fused_expert_down(th::Tensor hidden_in, th::Tensor indices, th::Tensor scores, th::Tensor routed_w_down,
-    th::Tensor routed_w_down_scale, th::Tensor shared_w_down, th::Tensor shared_w_down_scale, th::Tensor output)
+th::Tensor dsv3_fused_expert_down_dev(th::Tensor hidden_in, th::Tensor indices, th::Tensor scores,
+    th::Tensor routed_w_down, th::Tensor routed_w_down_scale, th::Tensor shared_w_down, th::Tensor shared_w_down_scale,
+    th::Tensor output)
 {
-    return dsv3_fused_expert_down_cuda(std::move(hidden_in), std::move(indices), std::move(scores),
+    return dsv3_fused_expert_down_cuda_dev(std::move(hidden_in), std::move(indices), std::move(scores),
         std::move(routed_w_down), std::move(routed_w_down_scale), std::move(shared_w_down),
         std::move(shared_w_down_scale), std::move(output));
 }
 
-// Returns residual_out_bf16 [M, kHiddenSize] after local fused expert down,
-// TP allreduce, and residual add. The local fused expert output is also written
-// to local_output for diagnostics.
-th::Tensor dsv3_fused_expert_down_ar_residual(th::Tensor hidden_in, th::Tensor indices, th::Tensor scores,
+th::Tensor dsv3_fused_expert_down_ar_residual_dev(th::Tensor hidden_in, th::Tensor indices, th::Tensor scores,
     th::Tensor routed_w_down, th::Tensor routed_w_down_scale, th::Tensor shared_w_down, th::Tensor shared_w_down_scale,
     th::Tensor residual, th::Tensor workspace, int64_t rank, int64_t nranks, th::Tensor local_output,
     th::Tensor residual_out)
 {
-    return dsv3_fused_expert_down_ar_residual_cuda(std::move(hidden_in), std::move(indices), std::move(scores),
+    return dsv3_fused_expert_down_ar_residual_cuda_dev(std::move(hidden_in), std::move(indices), std::move(scores),
         std::move(routed_w_down), std::move(routed_w_down_scale), std::move(shared_w_down),
         std::move(shared_w_down_scale), std::move(residual), std::move(workspace), rank, nranks,
         std::move(local_output), std::move(residual_out));
 }
 
-// Returns hidden_out_bf16 [M, kHiddenSize] after local fused expert down,
-// TP allreduce, residual add, and RMSNorm. local_output and residual_out are
-// written for diagnostics.
-th::Tensor dsv3_fused_expert_down_ar_residual_rms_norm(th::Tensor hidden_in, th::Tensor indices, th::Tensor scores,
+th::Tensor dsv3_fused_expert_down_ar_residual_rms_norm_dev(th::Tensor hidden_in, th::Tensor indices, th::Tensor scores,
     th::Tensor routed_w_down, th::Tensor routed_w_down_scale, th::Tensor shared_w_down, th::Tensor shared_w_down_scale,
     th::Tensor residual, th::Tensor norm_weight, th::Tensor workspace, int64_t rank, int64_t nranks,
     double rms_norm_eps, th::Tensor local_output, th::Tensor residual_out, th::Tensor hidden_out, th::Tensor rms_sums)
 {
-    return dsv3_fused_expert_down_ar_residual_rms_norm_cuda(std::move(hidden_in), std::move(indices), std::move(scores),
-        std::move(routed_w_down), std::move(routed_w_down_scale), std::move(shared_w_down),
+    return dsv3_fused_expert_down_ar_residual_rms_norm_cuda_dev(std::move(hidden_in), std::move(indices),
+        std::move(scores), std::move(routed_w_down), std::move(routed_w_down_scale), std::move(shared_w_down),
         std::move(shared_w_down_scale), std::move(residual), std::move(norm_weight), std::move(workspace), rank, nranks,
         rms_norm_eps, std::move(local_output), std::move(residual_out), std::move(hidden_out), std::move(rms_sums));
 }
 
 } // namespace torch_ext
 
-TRTLLM_NAMESPACE_END
+} // namespace tensorrt_llm
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
-        "dsv3_fused_expert_down(Tensor hidden_in, Tensor indices, Tensor scores, Tensor routed_w_down, Tensor "
-        "routed_w_down_scale, Tensor shared_w_down, Tensor shared_w_down_scale, Tensor output) -> Tensor");
+        "dsv3_fused_expert_down_dev(Tensor hidden_in, Tensor indices, Tensor scores, Tensor routed_w_down, Tensor "
+        "routed_w_down_scale, Tensor shared_down_weight, Tensor shared_down_weight_scale, Tensor output) -> Tensor");
     m.def(
-        "dsv3_fused_expert_down_ar_residual(Tensor hidden_in, Tensor indices, Tensor scores, Tensor routed_w_down, "
-        "Tensor routed_w_down_scale, Tensor shared_w_down, Tensor shared_w_down_scale, Tensor residual, "
+        "dsv3_fused_expert_down_ar_residual_dev(Tensor hidden_in, Tensor indices, Tensor scores, Tensor routed_w_down, "
+        "Tensor routed_w_down_scale, Tensor shared_down_weight, Tensor shared_down_weight_scale, Tensor residual, "
         "Tensor workspace, int rank, int nranks, Tensor local_output, Tensor residual_out) -> Tensor");
     m.def(
-        "dsv3_fused_expert_down_ar_residual_rms_norm(Tensor hidden_in, Tensor indices, Tensor scores, "
-        "Tensor routed_w_down, Tensor routed_w_down_scale, Tensor shared_w_down, Tensor shared_w_down_scale, "
+        "dsv3_fused_expert_down_ar_residual_rms_norm_dev(Tensor hidden_in, Tensor indices, Tensor scores, "
+        "Tensor routed_w_down, Tensor routed_w_down_scale, Tensor shared_down_weight, Tensor shared_down_weight_scale, "
         "Tensor residual, Tensor norm_weight, Tensor workspace, int rank, int nranks, float rms_norm_eps, "
         "Tensor local_output, Tensor residual_out, Tensor hidden_out, Tensor rms_sums) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
-    m.impl("dsv3_fused_expert_down", &tensorrt_llm::torch_ext::dsv3_fused_expert_down);
-    m.impl("dsv3_fused_expert_down_ar_residual", &tensorrt_llm::torch_ext::dsv3_fused_expert_down_ar_residual);
-    m.impl("dsv3_fused_expert_down_ar_residual_rms_norm",
-        &tensorrt_llm::torch_ext::dsv3_fused_expert_down_ar_residual_rms_norm);
+    m.impl("dsv3_fused_expert_down_dev", &tensorrt_llm::torch_ext::dsv3_fused_expert_down_dev);
+    m.impl("dsv3_fused_expert_down_ar_residual_dev", &tensorrt_llm::torch_ext::dsv3_fused_expert_down_ar_residual_dev);
+    m.impl("dsv3_fused_expert_down_ar_residual_rms_norm_dev",
+        &tensorrt_llm::torch_ext::dsv3_fused_expert_down_ar_residual_rms_norm_dev);
 }
