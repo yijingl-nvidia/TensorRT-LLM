@@ -322,7 +322,21 @@ class Deepseekv3FusedMoE(nn.Module):
         self.model_config = model_config
         self.mapping = model_config.mapping
         self.use_dp = model_config.mapping.enable_attention_dp
-        self.use_cute_dsl_blockscaling_mm = model_config.use_cute_dsl_blockscaling_mm
+        if (
+            self.use_dp
+            or self.mapping.cp_size > 1
+            or self.mapping.pp_size > 1
+            or self.mapping.moe_ep_size > 1
+            or self.mapping.attn_cp_size > 1
+            or self.mapping.moe_cluster_size > 1
+            or self.mapping.moe_tp_size != self.mapping.tp_size
+            or self.mapping.attn_tp_size != self.mapping.tp_size
+        ):
+            raise RuntimeError(
+                "Deepseekv3FusedMoE currently supports single-node TP-only "
+                "execution with matching TP, attention TP, and MoE TP sizes, got "
+                f"{self.mapping.to_dict()}"
+            )
         self.layer_idx = layer_idx
         self._wip_weights_loaded = False
 
