@@ -198,6 +198,13 @@ class DeepseekV3WeightLoader:
             "False") in ["True", "true", "1", "yes", "y"]
 
         cur_device = torch.cuda.current_device()
+        fused_expert_module = next((module for module_group in module_group_list
+                                    for _, module in module_group
+                                    if isinstance(module, Deepseekv3FusedMoE)),
+                                   None)
+        if fused_expert_module is not None:
+            fused_expert_module.precompile_dsv3_fused_expert_weight_pack()
+
         # each weight loading stream uses its own stream to improve parallelism
         weight_loading_stream_local = threading.local()
         # a list to collect all streams to synchronize at the end

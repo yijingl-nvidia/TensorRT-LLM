@@ -1,5 +1,4 @@
 import os
-import threading
 from types import SimpleNamespace
 from typing import Dict, Optional
 
@@ -25,7 +24,6 @@ FUSED_MOE_MODE_BASELINE = "baseline"
 FUSED_MOE_MODE_WIP = "wip"
 FUSED_EXPERT_DOWN_FINALIZE_MODE_LOCAL = "local"
 FUSED_EXPERT_DOWN_FINALIZE_MODE_ALLREDUCE_RESIDUAL_RMS_NORM = "allreduce_residual_rms_norm"
-_DSV3_FUSED_EXPERT_WEIGHT_LOAD_LOCK = threading.Lock()
 _FUSED_EXPERT_UP_HIDDEN_SIZE = 6144
 _FUSED_EXPERT_UP_CTA_OUT_ROWS = 64
 _FUSED_EXPERT_UP_M_TILES_PER_CTA = 4
@@ -758,13 +756,24 @@ class Deepseekv3FusedMoE(nn.Module):
             routed_w2_weight_scale,
         )
 
-    def load_dsv3_fused_expert_weights(self, prefix: str, weights) -> None:
-        # Weight loading is parallelized by layer; serialize packing to avoid
-        # duplicate first-use CuTe DSL compilation and lower peak temporary memory.
-        with _DSV3_FUSED_EXPERT_WEIGHT_LOAD_LOCK:
-            self._load_dsv3_fused_expert_weights_locked(prefix, weights)
+    def precompile_dsv3_fused_expert_weight_pack(self) -> None:
+        if not torch.cuda.is_available():
+            return
+        try:
+            from tensorrt_llm._torch.cute_dsl_kernels.blackwell import (
+                deepseekv3_fused_moe_weight_pack,
+            )
 
-    def _load_dsv3_fused_expert_weights_locked(self, prefix: str, weights) -> None:
+            deepseekv3_fused_moe_weight_pack.precompile_fused_expert_up_weight_pack_kernels(
+                self.shared_intermediate_size_per_partition,
+                self.num_experts,
+                self.routed_intermediate_size_per_partition,
+                torch.device("cuda", torch.cuda.current_device()),
+            )
+        except ImportError:
+            pass
+
+    def load_dsv3_fused_expert_weights(self, prefix: str, weights) -> None:
         router_weight = self._checkpoint_tensor(weights, f"{prefix}.gate.weight").to(
             device="cuda", dtype=torch.bfloat16
         )
