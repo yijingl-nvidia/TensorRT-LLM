@@ -1146,10 +1146,6 @@ __global__ __launch_bounds__(kThreadsPerCta, 1) void dsv3_fused_expert_down_kern
     {
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
         namespace cg = cooperative_groups;
-        __syncthreads();
-        cg::grid_group grid = cg::this_grid();
-        grid.sync();
-
         int const total_access = (M * kHiddenSize) / kArElemsPerAccess;
         int const linear_tid = blockIdx.x * blockDim.x + threadIdx.x;
         float4 const clear_vec = getNegZero();
@@ -1166,8 +1162,10 @@ __global__ __launch_bounds__(kThreadsPerCta, 1) void dsv3_fused_expert_down_kern
             {
                 rms_sums[linear_tid] = 0.0f;
             }
-            grid.sync();
         }
+
+        cg::grid_group grid = cg::this_grid();
+        grid.sync();
 
         Dsv3LamportComm comm(workspace, nranks, rank);
         int const clear_access = static_cast<int>(comm.clear_size / kArElemsPerAccess);
@@ -1237,18 +1235,12 @@ __global__ __launch_bounds__(kThreadsPerCta, 1) void dsv3_fused_expert_down_kern
 
         if constexpr (kEnableRmsNorm)
         {
-            if (linear_tid < M)
-            {
-                rms_sums[linear_tid] = rsqrtf(rms_sums[linear_tid] / static_cast<float>(kHiddenSize) + rms_norm_eps);
-            }
-            grid.sync();
-
             int const hidden_access_per_token = kHiddenSize / kArElemsPerAccess;
             if (has_ar_idx)
             {
                 int const token = linear_tid / hidden_access_per_token;
                 int const hidden_access = linear_tid - token * hidden_access_per_token;
-                float const inv_rms = rms_sums[token];
+                float const inv_rms = rsqrtf(rms_sums[token] / static_cast<float>(kHiddenSize) + rms_norm_eps);
                 hidden_out_vec[linear_tid] = rmsNormBf16x8(residual_sum, norm_weight_vec[hidden_access], inv_rms);
             }
         }
