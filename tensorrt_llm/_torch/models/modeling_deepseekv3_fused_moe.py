@@ -913,21 +913,17 @@ class Deepseekv3FusedMoE(nn.Module):
             )
         return output_tensor
 
-    def _forward_dsv3_fused_expert_owned(
+    def _forward_dsv3_fused_expert(
         self,
         hidden_states: torch.Tensor,
         final_all_reduce_params: AllReduceParams | None,
-        all_rank_num_tokens: list[int] | None,
         num_tokens: int,
         hidden_size: int,
         num_router_experts: int,
         expert_intermediate_size: int,
         block_scale_fp32_hidden_size: int,
-        block_scale_int32_hidden_size: int,
         block_scale_fp32_expert_intermediate_size: int,
-        gate_up_output_size: int,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        del all_rank_num_tokens, block_scale_int32_hidden_size, gate_up_output_size
         if not self._wip_weights_loaded:
             raise RuntimeError(
                 "TRTLLM_DEEPSEEKV3_FUSED_MOE_MODE=wip requires "
@@ -1168,37 +1164,6 @@ class Deepseekv3FusedMoE(nn.Module):
                 )
         return final_hidden_states
 
-    def _forward_dsv3_fused_expert(
-        self,
-        hidden_states: torch.Tensor,
-        final_all_reduce_params: AllReduceParams | None,
-        all_rank_num_tokens: list[int] | None,
-        num_tokens: int,
-        hidden_size: int,
-        num_router_experts: int,
-        expert_intermediate_size: int,
-        block_scale_fp32_hidden_size: int,
-        block_scale_int32_hidden_size: int,
-        block_scale_fp32_expert_intermediate_size: int,
-        gate_up_output_size: int,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        """
-        DeepSeek-V3 fused expert kernel implementation of forward().
-        """
-        return self._forward_dsv3_fused_expert_owned(
-            hidden_states=hidden_states,
-            final_all_reduce_params=final_all_reduce_params,
-            all_rank_num_tokens=all_rank_num_tokens,
-            num_tokens=num_tokens,
-            hidden_size=hidden_size,
-            num_router_experts=num_router_experts,
-            expert_intermediate_size=expert_intermediate_size,
-            block_scale_fp32_hidden_size=block_scale_fp32_hidden_size,
-            block_scale_int32_hidden_size=block_scale_int32_hidden_size,
-            block_scale_fp32_expert_intermediate_size=(block_scale_fp32_expert_intermediate_size),
-            gate_up_output_size=gate_up_output_size,
-        )
-
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -1214,34 +1179,25 @@ class Deepseekv3FusedMoE(nn.Module):
         selected_fused_moe_mode = get_fused_moe_mode()
         hidden_size: int = hidden_states.size(1)
         block_scale_fp32_hidden_Size: int = int(triton.cdiv(hidden_size, 128))
-        block_scale_int32_hidden_size: int = int(triton.cdiv(hidden_size, 128 * 4))
 
-        if selected_fused_moe_mode == FUSED_MOE_MODE_WIP:
-            check_data(hidden_states, "hidden_states", torch.bfloat16, (-1, 6144))
-            assert is_sm_100f(), "fp8_quantize_1x128_packed_ue8m0 requires SM100-family Blackwell"
-            num_router_experts = self.num_experts
-            expert_intermediate_size = self.shared_intermediate_size_per_partition
-            block_scale_fp32_expert_intermediate_size = int(
-                triton.cdiv(expert_intermediate_size, 128)
-            )
-            gate_up_output_size = 2 * expert_intermediate_size
-            return self._forward_dsv3_fused_expert(
-                hidden_states=hidden_states,
-                final_all_reduce_params=final_all_reduce_params,
-                all_rank_num_tokens=all_rank_num_tokens,
-                num_tokens=num_tokens,
-                hidden_size=hidden_size,
-                num_router_experts=num_router_experts,
-                expert_intermediate_size=expert_intermediate_size,
-                block_scale_fp32_hidden_size=block_scale_fp32_hidden_Size,
-                block_scale_int32_hidden_size=block_scale_int32_hidden_size,
-                block_scale_fp32_expert_intermediate_size=(
-                    block_scale_fp32_expert_intermediate_size
-                ),
-                gate_up_output_size=gate_up_output_size,
+        if selected_fused_moe_mode != FUSED_MOE_MODE_WIP:
+            raise RuntimeError(
+                f"Deepseekv3FusedMoE does not implement mode {selected_fused_moe_mode!r}; "
+                "baseline mode is handled by Deepseekv3MoE."
             )
 
-        raise RuntimeError(
-            f"Deepseekv3FusedMoE does not implement mode {selected_fused_moe_mode!r}; "
-            "baseline mode is handled by Deepseekv3MoE."
+        check_data(hidden_states, "hidden_states", torch.bfloat16, (-1, 6144))
+        assert is_sm_100f(), "fp8_quantize_1x128_packed_ue8m0 requires SM100-family Blackwell"
+        num_router_experts = self.num_experts
+        expert_intermediate_size = self.shared_intermediate_size_per_partition
+        block_scale_fp32_expert_intermediate_size = int(triton.cdiv(expert_intermediate_size, 128))
+        return self._forward_dsv3_fused_expert(
+            hidden_states=hidden_states,
+            final_all_reduce_params=final_all_reduce_params,
+            num_tokens=num_tokens,
+            hidden_size=hidden_size,
+            num_router_experts=num_router_experts,
+            expert_intermediate_size=expert_intermediate_size,
+            block_scale_fp32_hidden_size=block_scale_fp32_hidden_Size,
+            block_scale_fp32_expert_intermediate_size=(block_scale_fp32_expert_intermediate_size),
         )

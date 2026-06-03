@@ -1291,13 +1291,6 @@ class DeepseekV3DecoderLayer(DecoderLayer):
             bigger post-MoE fused kernel to combine with rest of the operations, by calling self.moe_allreduce().
         """
 
-        # if self.mapping.rank == 0 and self.layer_idx == 10:
-        #     print(
-        #         f"[DeepseekV3DecoderLayer] layer_idx={self.layer_idx} "
-        #         f"PRE_MOE_FUSION={self.fusion_config.PRE_MOE_FUSION} "
-        #         f"POST_MOE_FUSION={self.fusion_config.POST_MOE_FUSION}",
-        #         flush=True)
-
         fused_expert_down_finalizes_post_moe = (
             isinstance(self.mlp, Deepseekv3FusedMoE)
             and self.fusion_config.POST_MOE_FUSION and hidden_states.shape[0]
