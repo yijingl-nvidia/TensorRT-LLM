@@ -83,7 +83,7 @@ def get_fused_expert_down_finalize_mode() -> str:
     mode = (
         os.environ.get(
             _FUSED_EXPERT_DOWN_FINALIZE_MODE_ENV,
-            FUSED_EXPERT_DOWN_FINALIZE_MODE_LOCAL,
+            FUSED_EXPERT_DOWN_FINALIZE_MODE_ALLREDUCE_RESIDUAL_RMS_NORM,
         )
         .strip()
         .lower()
