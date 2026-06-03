@@ -734,6 +734,51 @@ def _profile_cuda_events(fn, warmup_iters: int, profile_iters: int) -> dict[str,
     }
 
 
+def _profile_cuda_graph_events(fn, warmup_iters: int, profile_iters: int) -> dict[str, float]:
+    if warmup_iters < 0:
+        raise ValueError(f"warmup_iters must be non-negative, got {warmup_iters}")
+    if profile_iters <= 0:
+        raise ValueError(f"profile_iters must be positive, got {profile_iters}")
+
+    warmup_stream = torch.cuda.Stream()
+    warmup_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(warmup_stream):
+        for _ in range(max(warmup_iters, 1)):
+            fn()
+    torch.cuda.current_stream().wait_stream(warmup_stream)
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured_outputs = fn()
+    torch.cuda.synchronize()
+
+    for _ in range(warmup_iters):
+        graph.replay()
+    torch.cuda.synchronize()
+
+    starts = [torch.cuda.Event(enable_timing=True) for _ in range(profile_iters)]
+    ends = [torch.cuda.Event(enable_timing=True) for _ in range(profile_iters)]
+    for idx in range(profile_iters):
+        starts[idx].record()
+        graph.replay()
+        ends[idx].record()
+    torch.cuda.synchronize()
+
+    times_us = torch.tensor(
+        [starts[idx].elapsed_time(ends[idx]) * 1000.0 for idx in range(profile_iters)],
+        dtype=torch.float32,
+    )
+    # Keep tensors allocated during capture alive until all graph replays finish.
+    del captured_outputs
+    return {
+        "mean_us": float(times_us.mean().item()),
+        "median_us": float(times_us.median().item()),
+        "min_us": float(times_us.min().item()),
+        "max_us": float(times_us.max().item()),
+    }
+
+
 def _format_profile_average_line(rank_results: list[dict[str, float]]) -> str:
     metric_names = [
         "old_baseline_full_mean_us",
@@ -742,6 +787,9 @@ def _format_profile_average_line(rank_results: list[dict[str, float]]) -> str:
         "fused_finalize_mean_us",
         "fused_ar_residual_speedup_vs_trtllm_finalize",
         "fused_finalize_speedup_vs_trtllm_finalize",
+        "trtllm_finalize_cuda_graph_mean_us",
+        "fused_finalize_cuda_graph_mean_us",
+        "fused_finalize_cuda_graph_speedup_vs_trtllm_finalize_cuda_graph",
     ]
     fields = ["Average over 8 ranks:"]
     for name in metric_names:
@@ -897,6 +945,18 @@ def test_deepseekv3_fused_moe_post_moe_allreduce_profile() -> None:
             warmup_iters,
             profile_iters,
         )
+        comm.Barrier()
+        trtllm_finalize_cuda_graph_stats = _profile_cuda_graph_events(
+            run_trtllm_finalize,
+            warmup_iters,
+            profile_iters,
+        )
+        comm.Barrier()
+        fused_finalize_cuda_graph_stats = _profile_cuda_graph_events(
+            run_fused_finalize,
+            warmup_iters,
+            profile_iters,
+        )
         torch.cuda.synchronize()
 
     result = {
@@ -909,6 +969,12 @@ def test_deepseekv3_fused_moe_post_moe_allreduce_profile() -> None:
         / fused_ar_residual_stats["mean_us"],
         "fused_finalize_speedup_vs_trtllm_finalize": trtllm_finalize_stats["mean_us"]
         / fused_finalize_stats["mean_us"],
+        "trtllm_finalize_cuda_graph_mean_us": trtllm_finalize_cuda_graph_stats["mean_us"],
+        "fused_finalize_cuda_graph_mean_us": fused_finalize_cuda_graph_stats["mean_us"],
+        "fused_finalize_cuda_graph_speedup_vs_trtllm_finalize_cuda_graph": trtllm_finalize_cuda_graph_stats[
+            "mean_us"
+        ]
+        / fused_finalize_cuda_graph_stats["mean_us"],
     }
     gathered_results = [item for item in comm.allgather(result) if item is not None]
     if rank == 0:
