@@ -177,15 +177,21 @@ __device__ __forceinline__ void sanitizeArSentinel(float4& val)
 
 __device__ __forceinline__ float4 addBf16x8(float4 const& a, float4 const& b)
 {
-    float4 c;
-#pragma unroll
-    for (int i = 0; i < kArElemsPerAccess; ++i)
+    union PackedBf16x8
     {
-        reinterpret_cast<__nv_bfloat16*>(&c)[i]
-            = __float2bfloat16(__bfloat162float(reinterpret_cast<__nv_bfloat16 const*>(&a)[i])
-                + __bfloat162float(reinterpret_cast<__nv_bfloat16 const*>(&b)[i]));
+        float4 packed;
+        __nv_bfloat162 unpacked[4];
+    };
+
+    PackedBf16x8 a_vec{a};
+    PackedBf16x8 b_vec{b};
+    PackedBf16x8 c_vec;
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+    {
+        c_vec.unpacked[i] = a_vec.unpacked[i] + b_vec.unpacked[i];
     }
-    return c;
+    return c_vec.packed;
 }
 
 __device__ __forceinline__ float sumSquaresBf16x8(float4 const& v)
@@ -1186,16 +1192,19 @@ __global__ __launch_bounds__(kThreadsPerCta, 1) void dsv3_fused_expert_down_kern
         {
             bool done = false;
             float4 sum_val = {};
+            int const chunk_access = (total_access + nranks - 1) / nranks;
+            int const chunk_owner = min(linear_tid / chunk_access, nranks - 1);
             while (!done)
             {
                 done = true;
                 sum_val = {};
-                for (int r = 0; r < nranks; ++r)
+                for (int step = 0; step < nranks; ++step)
                 {
+                    int const r = (chunk_owner + 1 + step) % nranks;
                     float4 const peer_val = ldGlobalVolatileFloat4(
                         &reinterpret_cast<float4*>(comm.data_bufs[rank])[r * total_access + linear_tid]);
                     done &= !isNegZero(peer_val);
-                    sum_val = (r == 0) ? peer_val : addBf16x8(sum_val, peer_val);
+                    sum_val = (step == 0) ? peer_val : addBf16x8(sum_val, peer_val);
                 }
             }
             residual_sum = addBf16x8(sum_val, residual_vec[linear_tid]);

@@ -659,8 +659,8 @@ def _write_wip_summary(rank_results: list[dict[str, float]]) -> None:
             f"wip_ar_vs_trtllm_ar_residual_abs {result['local_ar_residual_abs']:.6e}",
             f"wip_ar_vs_trtllm_ar_hidden_rel {result['local_ar_hidden_rel']:.6e}",
             f"wip_ar_vs_trtllm_ar_hidden_abs {result['local_ar_hidden_abs']:.6e}",
-            f"stage1_ar_vs_trtllm_ar_residual_rel {result['stage1_ar_residual_rel']:.6e}",
-            f"stage1_ar_vs_trtllm_ar_residual_abs {result['stage1_ar_residual_abs']:.6e}",
+            f"fused_finalize_vs_trtllm_ar_residual_rel {result['fused_finalize_residual_rel']:.6e}",
+            f"fused_finalize_vs_trtllm_ar_residual_abs {result['fused_finalize_residual_abs']:.6e}",
             f"wip_rms_vs_python_rms_hidden_rel {result['rms_hidden_rel']:.6e}",
             f"wip_rms_vs_python_rms_hidden_abs {result['rms_hidden_abs']:.6e}",
         ]
@@ -678,7 +678,9 @@ def _write_wip_summary(rank_results: list[dict[str, float]]) -> None:
     max_hidden_abs = max(result["hidden_abs"] for result in rank_results)
     max_local_ar_residual_abs = max(result["local_ar_residual_abs"] for result in rank_results)
     max_local_ar_hidden_abs = max(result["local_ar_hidden_abs"] for result in rank_results)
-    max_stage1_ar_residual_abs = max(result["stage1_ar_residual_abs"] for result in rank_results)
+    max_fused_finalize_residual_abs = max(
+        result["fused_finalize_residual_abs"] for result in rank_results
+    )
     max_rms_hidden_abs = max(result["rms_hidden_abs"] for result in rank_results)
     fields = [
         "Average over 8 ranks:",
@@ -686,7 +688,7 @@ def _write_wip_summary(rank_results: list[dict[str, float]]) -> None:
         f"max_wip_vs_baseline_hidden_abs {max_hidden_abs:.6e}",
         f"max_wip_ar_vs_trtllm_ar_residual_abs {max_local_ar_residual_abs:.6e}",
         f"max_wip_ar_vs_trtllm_ar_hidden_abs {max_local_ar_hidden_abs:.6e}",
-        f"max_stage1_ar_vs_trtllm_ar_residual_abs {max_stage1_ar_residual_abs:.6e}",
+        f"max_fused_finalize_vs_trtllm_ar_residual_abs {max_fused_finalize_residual_abs:.6e}",
         f"max_wip_rms_vs_python_rms_hidden_abs {max_rms_hidden_abs:.6e}",
     ]
     if module_path_checked:
@@ -735,16 +737,16 @@ def _profile_cuda_events(fn, warmup_iters: int, profile_iters: int) -> dict[str,
 def _format_profile_average_line(rank_results: list[dict[str, float]]) -> str:
     metric_names = [
         "old_baseline_full_mean_us",
-        "fused_local_trtllm_ar_rms_mean_us",
-        "stage1_down_ar_residual_mean_us",
-        "stage2_down_ar_residual_rms_mean_us",
-        "stage1_speedup_vs_fused_local_trtllm_ar_rms",
-        "stage2_speedup_vs_fused_local_trtllm_ar_rms",
+        "trtllm_finalize_mean_us",
+        "fused_ar_residual_mean_us",
+        "fused_finalize_mean_us",
+        "fused_ar_residual_speedup_vs_trtllm_finalize",
+        "fused_finalize_speedup_vs_trtllm_finalize",
     ]
     fields = ["Average over 8 ranks:"]
     for name in metric_names:
         value = sum(result[name] for result in rank_results) / len(rank_results)
-        suffix = "x" if name.endswith("speedup_vs_fused_local_trtllm_ar_rms") else " us"
+        suffix = "x" if "speedup_vs" in name else " us"
         fields.append(f"{name} {value:.3f}{suffix}")
     return " ".join(fields)
 
@@ -812,7 +814,7 @@ def test_deepseekv3_fused_moe_post_moe_allreduce_profile() -> None:
                 local_output,
             )
 
-        def run_fused_local_trtllm_ar_rms() -> tuple[torch.Tensor, torch.Tensor]:
+        def run_trtllm_finalize() -> tuple[torch.Tensor, torch.Tensor]:
             run_local_down()
             return _run_trtllm_allreduce_residual_rms_norm(
                 allreduce,
@@ -821,7 +823,7 @@ def test_deepseekv3_fused_moe_post_moe_allreduce_profile() -> None:
                 norm_weight,
             )
 
-        def run_stage1_down_ar_residual() -> torch.Tensor:
+        def run_fused_ar_residual() -> torch.Tensor:
             return fused_expert_down_ar_residual_op(
                 slot_swiglu_output,
                 expert_indices,
@@ -838,7 +840,7 @@ def test_deepseekv3_fused_moe_post_moe_allreduce_profile() -> None:
                 residual_out,
             )
 
-        def run_stage2_down_ar_residual_rms() -> torch.Tensor:
+        def run_fused_finalize() -> torch.Tensor:
             return fused_expert_down_ar_residual_rms_norm_op(
                 slot_swiglu_output,
                 expert_indices,
@@ -878,20 +880,20 @@ def test_deepseekv3_fused_moe_post_moe_allreduce_profile() -> None:
             profile_iters,
         )
         comm.Barrier()
-        fused_local_trtllm_ar_rms_stats = _profile_cuda_events(
-            run_fused_local_trtllm_ar_rms,
+        trtllm_finalize_stats = _profile_cuda_events(
+            run_trtllm_finalize,
             warmup_iters,
             profile_iters,
         )
         comm.Barrier()
-        stage1_stats = _profile_cuda_events(
-            run_stage1_down_ar_residual,
+        fused_ar_residual_stats = _profile_cuda_events(
+            run_fused_ar_residual,
             warmup_iters,
             profile_iters,
         )
         comm.Barrier()
-        stage2_stats = _profile_cuda_events(
-            run_stage2_down_ar_residual_rms,
+        fused_finalize_stats = _profile_cuda_events(
+            run_fused_finalize,
             warmup_iters,
             profile_iters,
         )
@@ -900,13 +902,13 @@ def test_deepseekv3_fused_moe_post_moe_allreduce_profile() -> None:
     result = {
         "rank": float(rank),
         "old_baseline_full_mean_us": old_baseline_full_stats["mean_us"],
-        "fused_local_trtllm_ar_rms_mean_us": fused_local_trtllm_ar_rms_stats["mean_us"],
-        "stage1_down_ar_residual_mean_us": stage1_stats["mean_us"],
-        "stage2_down_ar_residual_rms_mean_us": stage2_stats["mean_us"],
-        "stage1_speedup_vs_fused_local_trtllm_ar_rms": fused_local_trtllm_ar_rms_stats["mean_us"]
-        / stage1_stats["mean_us"],
-        "stage2_speedup_vs_fused_local_trtllm_ar_rms": fused_local_trtllm_ar_rms_stats["mean_us"]
-        / stage2_stats["mean_us"],
+        "trtllm_finalize_mean_us": trtllm_finalize_stats["mean_us"],
+        "fused_ar_residual_mean_us": fused_ar_residual_stats["mean_us"],
+        "fused_finalize_mean_us": fused_finalize_stats["mean_us"],
+        "fused_ar_residual_speedup_vs_trtllm_finalize": trtllm_finalize_stats["mean_us"]
+        / fused_ar_residual_stats["mean_us"],
+        "fused_finalize_speedup_vs_trtllm_finalize": trtllm_finalize_stats["mean_us"]
+        / fused_finalize_stats["mean_us"],
     }
     gathered_results = [item for item in comm.allgather(result) if item is not None]
     if rank == 0:
@@ -1004,7 +1006,7 @@ def test_deepseekv3_fused_moe_post_moe_allreduce_wip_path() -> None:
         wip_hidden_states,
         wip_local_allreduce_hidden_states,
     )
-    stage1_ar_residual_rel, stage1_ar_residual_abs = _max_errors(
+    fused_finalize_residual_rel, fused_finalize_residual_abs = _max_errors(
         stage1_residual,
         stage1_local_allreduce_residual,
     )
@@ -1034,8 +1036,8 @@ def test_deepseekv3_fused_moe_post_moe_allreduce_wip_path() -> None:
         "local_ar_residual_abs": local_ar_residual_abs,
         "local_ar_hidden_rel": local_ar_hidden_rel,
         "local_ar_hidden_abs": local_ar_hidden_abs,
-        "stage1_ar_residual_rel": stage1_ar_residual_rel,
-        "stage1_ar_residual_abs": stage1_ar_residual_abs,
+        "fused_finalize_residual_rel": fused_finalize_residual_rel,
+        "fused_finalize_residual_abs": fused_finalize_residual_abs,
         "rms_hidden_rel": rms_hidden_rel,
         "rms_hidden_abs": rms_hidden_abs,
         "module_path_checked": 1.0 if module_path_checked else 0.0,
@@ -1076,7 +1078,7 @@ def test_deepseekv3_fused_moe_post_moe_allreduce_wip_path() -> None:
     )
     assert residual_abs <= residual_abs_threshold
     assert hidden_abs <= hidden_abs_threshold
-    assert stage1_ar_residual_abs <= residual_abs_threshold
+    assert fused_finalize_residual_abs <= residual_abs_threshold
     assert rms_hidden_abs <= hidden_abs_threshold
     assert module_residual_abs <= residual_abs_threshold
     assert module_hidden_abs <= hidden_abs_threshold
