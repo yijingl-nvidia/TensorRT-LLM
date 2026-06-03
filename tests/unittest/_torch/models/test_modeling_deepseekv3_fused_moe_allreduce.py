@@ -17,7 +17,7 @@ import importlib.util
 import os
 import sys
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
@@ -25,9 +25,12 @@ from mpi4py import MPI
 
 from tensorrt_llm._torch.distributed import AllReduce, AllReduceParams
 from tensorrt_llm._torch.distributed.ops import get_allreduce_workspace
+from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_deepseekv3_fused_moe import Deepseekv3FusedMoE
 from tensorrt_llm.functional import AllReduceFusionOp, AllReduceStrategy
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.quantization.mode import QuantAlgo
 
 _NUM_RANKS = 8
 _HELPER_MODULE_NAME = "_deepseekv3_fused_moe_test_helpers"
@@ -46,6 +49,7 @@ _FUSED_EXPERT_DOWN_AR_RESIDUAL_OP_ENV = (
 _FUSED_EXPERT_DOWN_AR_RESIDUAL_RMS_NORM_OP_ENV = (
     "TRTLLM_DEEPSEEKV3_FUSED_MOE_TEST_FUSED_EXPERT_DOWN_AR_RESIDUAL_RMS_NORM_OP"
 )
+_FUSED_EXPERT_DOWN_FINALIZE_MODE_ENV = "TRTLLM_DEEPSEEKV3_FUSED_EXPERT_DOWN_FINALIZE_MODE"
 _RESIDUAL_SEED_ENV = "TRTLLM_DEEPSEEKV3_FUSED_MOE_AR_TEST_RESIDUAL_SEED"
 _RMS_NORM_EPS_ENV = "TRTLLM_DEEPSEEKV3_FUSED_MOE_AR_TEST_RMS_NORM_EPS"
 _PROFILE_ENV = "TRTLLM_DEEPSEEKV3_FUSED_MOE_AR_TEST_PROFILE"
@@ -59,6 +63,9 @@ _DEFAULT_RESIDUAL_SEED = 20260602
 _DEFAULT_RMS_NORM_EPS = 1e-6
 _DEFAULT_PROFILE_WARMUP_ITERS = 20
 _DEFAULT_PROFILE_ITERS = 100
+_PRODUCTION_FUSED_EXPERT_DOWN_AR_RESIDUAL_RMS_NORM_OP = (
+    "dsv3_fused_expert_down_ar_residual_rms_norm"
+)
 
 
 def _helpers() -> ModuleType:
@@ -114,7 +121,14 @@ def _fused_expert_down_ar_residual_op_name() -> str:
 def _fused_expert_down_ar_residual_rms_norm_op_name() -> str:
     return os.environ.get(
         _FUSED_EXPERT_DOWN_AR_RESIDUAL_RMS_NORM_OP_ENV,
-        "dsv3_fused_expert_down_ar_residual_rms_norm",
+        _PRODUCTION_FUSED_EXPERT_DOWN_AR_RESIDUAL_RMS_NORM_OP,
+    )
+
+
+def _has_production_fused_expert_down_ar_residual_rms_norm_op() -> bool:
+    return hasattr(
+        torch.ops.trtllm,
+        _PRODUCTION_FUSED_EXPERT_DOWN_AR_RESIDUAL_RMS_NORM_OP,
     )
 
 
@@ -303,6 +317,160 @@ def _run_fused_expert_down_ar_residual_rms_norm(
     return local_output, residual_out, hidden_out
 
 
+def _build_fused_moe_module(
+    tensors: dict[str, torch.Tensor],
+    rank: int,
+    world_size: int,
+) -> Deepseekv3FusedMoE:
+    helpers = _helpers()
+    helpers._ensure_fused_expert_up_prepacked_tensors(tensors)
+
+    hidden_size = tensors["hidden_states"].shape[-1]
+    local_intermediate_size = tensors["routed_w2_weight"].shape[-1]
+    full_intermediate_size = local_intermediate_size * world_size
+    num_experts = tensors["router_weight"].shape[0]
+    pretrained_config = SimpleNamespace(
+        hidden_size=hidden_size,
+        intermediate_size=full_intermediate_size,
+        moe_intermediate_size=full_intermediate_size,
+        n_group=helpers._n_group(),
+        num_experts=num_experts,
+        routed_scaling_factor=helpers._routed_scaling_factor(),
+        swiglu_limit=helpers._routed_swiglu_limit(),
+        topk_group=helpers._topk_group(),
+        torch_dtype=torch.bfloat16,
+    )
+    quant_config = QuantConfig(quant_algo=QuantAlgo.FP8_BLOCK_SCALES)
+    model_config = ModelConfig(
+        pretrained_config=pretrained_config,
+        mapping=Mapping(
+            world_size=world_size,
+            rank=rank,
+            gpus_per_node=world_size,
+            tp_size=world_size,
+            pp_size=1,
+        ),
+        quant_config=quant_config,
+        max_num_tokens=helpers._max_fused_kernel_num_tokens(),
+        moe_backend="TRTLLM",
+        allreduce_strategy=AllReduceStrategy.NCCL,
+    )
+
+    old_mode = os.environ.get("TRTLLM_DEEPSEEKV3_FUSED_MOE_MODE")
+    os.environ["TRTLLM_DEEPSEEKV3_FUSED_MOE_MODE"] = "wip"
+    try:
+        fused_moe = Deepseekv3FusedMoE(
+            num_experts=num_experts,
+            top_k=helpers._top_k(),
+            hidden_size=hidden_size,
+            intermediate_size=full_intermediate_size,
+            shared_expert_intermediate_size=full_intermediate_size,
+            aux_stream_dict={},
+            layer_idx=0,
+            dtype=torch.bfloat16,
+            model_config=model_config,
+            override_quant_config=quant_config,
+        )
+    finally:
+        if old_mode is None:
+            os.environ.pop("TRTLLM_DEEPSEEKV3_FUSED_MOE_MODE", None)
+        else:
+            os.environ["TRTLLM_DEEPSEEKV3_FUSED_MOE_MODE"] = old_mode
+
+    fused_moe._set_nonpersistent_buffer(fused_moe, "router_weight", tensors["router_weight"])
+    fused_moe._set_nonpersistent_buffer(fused_moe, "routing_bias", tensors["routing_bias"])
+    fused_moe._set_nonpersistent_buffer(
+        fused_moe,
+        "shared_gate_up_weight_scale_org",
+        tensors["shared_gate_up_weight_scale_org"],
+    )
+    fused_moe._set_nonpersistent_buffer(
+        fused_moe,
+        "shared_gate_up_weight_packed_fused_expert_up",
+        tensors["shared_gate_up_weight_packed_fused_expert_up"],
+    )
+    fused_moe._set_nonpersistent_buffer(
+        fused_moe,
+        "routed_w3_w1_weight_scaling_factor",
+        tensors["routed_w3_w1_weight_scale"],
+    )
+    fused_moe._set_nonpersistent_buffer(
+        fused_moe,
+        "routed_w3_w1_weight_packed_fused_expert_up",
+        tensors["routed_w3_w1_weight_packed_fused_expert_up"],
+    )
+    fused_moe._set_nonpersistent_buffer(
+        fused_moe,
+        "routed_w2_weight_scaling_factor",
+        tensors["routed_w2_weight_scale"],
+    )
+    fused_moe._set_nonpersistent_buffer(
+        fused_moe,
+        "shared_down_weight_scale_org",
+        tensors["shared_down_weight_scale_org"],
+    )
+    if helpers._prepack_fused_expert_down_enabled():
+        helpers._ensure_fused_expert_down_prepacked_tensors(tensors)
+        fused_moe._set_nonpersistent_buffer(
+            fused_moe,
+            "shared_down_weight_packed_fused_expert_down",
+            tensors["shared_down_weight_packed_fused_expert_down"],
+        )
+        fused_moe._set_nonpersistent_buffer(
+            fused_moe,
+            "routed_w2_weight_packed_fused_expert_down",
+            tensors["routed_w2_weight_packed_fused_expert_down"],
+        )
+    else:
+        fused_moe._set_nonpersistent_buffer(
+            fused_moe,
+            "shared_down_weight",
+            tensors["shared_down_weight_org"],
+        )
+        fused_moe._set_nonpersistent_buffer(
+            fused_moe,
+            "routed_w2_weight",
+            tensors["routed_w2_weight"],
+        )
+    fused_moe._wip_weights_loaded = True
+    fused_moe.eval()
+    return fused_moe
+
+
+def _run_fused_moe_module_wip(
+    fused_moe: Deepseekv3FusedMoE,
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor,
+    norm_weight: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    old_mode = os.environ.get("TRTLLM_DEEPSEEKV3_FUSED_MOE_MODE")
+    old_finalize_mode = os.environ.get(_FUSED_EXPERT_DOWN_FINALIZE_MODE_ENV)
+    os.environ["TRTLLM_DEEPSEEKV3_FUSED_MOE_MODE"] = "wip"
+    os.environ[_FUSED_EXPERT_DOWN_FINALIZE_MODE_ENV] = "allreduce_residual_rms_norm"
+    try:
+        output = fused_moe(
+            hidden_states,
+            all_rank_num_tokens=None,
+            final_all_reduce_params=AllReduceParams(
+                fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
+                residual=residual,
+                norm_weight=norm_weight,
+                eps=_rms_norm_eps(),
+            ),
+        )
+    finally:
+        if old_mode is None:
+            os.environ.pop("TRTLLM_DEEPSEEKV3_FUSED_MOE_MODE", None)
+        else:
+            os.environ["TRTLLM_DEEPSEEKV3_FUSED_MOE_MODE"] = old_mode
+        if old_finalize_mode is None:
+            os.environ.pop(_FUSED_EXPERT_DOWN_FINALIZE_MODE_ENV, None)
+        else:
+            os.environ[_FUSED_EXPERT_DOWN_FINALIZE_MODE_ENV] = old_finalize_mode
+    assert isinstance(output, tuple)
+    return output
+
+
 def _max_errors(actual: torch.Tensor, expected: torch.Tensor) -> tuple[float, float]:
     helpers = _helpers()
     rel_error, abs_error, _, _ = helpers._max_errors(actual, expected)
@@ -476,46 +644,61 @@ def _write_wip_summary(rank_results: list[dict[str, float]]) -> None:
     helpers = _helpers()
     path = helpers._debug_output_dir() / "fused_moe_allreduce_wip_vs_baseline_errors.txt"
     path.parent.mkdir(parents=True, exist_ok=True)
+    module_path_checked = any(
+        result.get("module_path_checked", 0.0) > 0.5 for result in rank_results
+    )
     lines = []
     for result in sorted(rank_results, key=lambda item: item["rank"]):
-        lines.append(
-            " ".join(
+        fields = [
+            f"Test {int(result['rank'])}:",
+            f"wip_vs_baseline_residual_rel {result['residual_rel']:.6e}",
+            f"wip_vs_baseline_residual_abs {result['residual_abs']:.6e}",
+            f"wip_vs_baseline_hidden_rel {result['hidden_rel']:.6e}",
+            f"wip_vs_baseline_hidden_abs {result['hidden_abs']:.6e}",
+            f"wip_ar_vs_trtllm_ar_residual_rel {result['local_ar_residual_rel']:.6e}",
+            f"wip_ar_vs_trtllm_ar_residual_abs {result['local_ar_residual_abs']:.6e}",
+            f"wip_ar_vs_trtllm_ar_hidden_rel {result['local_ar_hidden_rel']:.6e}",
+            f"wip_ar_vs_trtllm_ar_hidden_abs {result['local_ar_hidden_abs']:.6e}",
+            f"stage1_ar_vs_trtllm_ar_residual_rel {result['stage1_ar_residual_rel']:.6e}",
+            f"stage1_ar_vs_trtllm_ar_residual_abs {result['stage1_ar_residual_abs']:.6e}",
+            f"wip_rms_vs_python_rms_hidden_rel {result['rms_hidden_rel']:.6e}",
+            f"wip_rms_vs_python_rms_hidden_abs {result['rms_hidden_abs']:.6e}",
+        ]
+        if module_path_checked:
+            fields.extend(
                 [
-                    f"Test {int(result['rank'])}:",
-                    f"wip_vs_baseline_residual_rel {result['residual_rel']:.6e}",
-                    f"wip_vs_baseline_residual_abs {result['residual_abs']:.6e}",
-                    f"wip_vs_baseline_hidden_rel {result['hidden_rel']:.6e}",
-                    f"wip_vs_baseline_hidden_abs {result['hidden_abs']:.6e}",
-                    f"wip_ar_vs_trtllm_ar_residual_rel {result['local_ar_residual_rel']:.6e}",
-                    f"wip_ar_vs_trtllm_ar_residual_abs {result['local_ar_residual_abs']:.6e}",
-                    f"wip_ar_vs_trtllm_ar_hidden_rel {result['local_ar_hidden_rel']:.6e}",
-                    f"wip_ar_vs_trtllm_ar_hidden_abs {result['local_ar_hidden_abs']:.6e}",
-                    f"stage1_ar_vs_trtllm_ar_residual_rel {result['stage1_ar_residual_rel']:.6e}",
-                    f"stage1_ar_vs_trtllm_ar_residual_abs {result['stage1_ar_residual_abs']:.6e}",
-                    f"wip_rms_vs_python_rms_hidden_rel {result['rms_hidden_rel']:.6e}",
-                    f"wip_rms_vs_python_rms_hidden_abs {result['rms_hidden_abs']:.6e}",
+                    f"module_vs_direct_residual_rel {result['module_residual_rel']:.6e}",
+                    f"module_vs_direct_residual_abs {result['module_residual_abs']:.6e}",
+                    f"module_vs_direct_hidden_rel {result['module_hidden_rel']:.6e}",
+                    f"module_vs_direct_hidden_abs {result['module_hidden_abs']:.6e}",
                 ]
             )
-        )
+        lines.append(" ".join(fields))
     max_residual_abs = max(result["residual_abs"] for result in rank_results)
     max_hidden_abs = max(result["hidden_abs"] for result in rank_results)
     max_local_ar_residual_abs = max(result["local_ar_residual_abs"] for result in rank_results)
     max_local_ar_hidden_abs = max(result["local_ar_hidden_abs"] for result in rank_results)
     max_stage1_ar_residual_abs = max(result["stage1_ar_residual_abs"] for result in rank_results)
     max_rms_hidden_abs = max(result["rms_hidden_abs"] for result in rank_results)
-    lines.append(
-        " ".join(
+    fields = [
+        "Average over 8 ranks:",
+        f"max_wip_vs_baseline_residual_abs {max_residual_abs:.6e}",
+        f"max_wip_vs_baseline_hidden_abs {max_hidden_abs:.6e}",
+        f"max_wip_ar_vs_trtllm_ar_residual_abs {max_local_ar_residual_abs:.6e}",
+        f"max_wip_ar_vs_trtllm_ar_hidden_abs {max_local_ar_hidden_abs:.6e}",
+        f"max_stage1_ar_vs_trtllm_ar_residual_abs {max_stage1_ar_residual_abs:.6e}",
+        f"max_wip_rms_vs_python_rms_hidden_abs {max_rms_hidden_abs:.6e}",
+    ]
+    if module_path_checked:
+        max_module_residual_abs = max(result["module_residual_abs"] for result in rank_results)
+        max_module_hidden_abs = max(result["module_hidden_abs"] for result in rank_results)
+        fields.extend(
             [
-                "Average over 8 ranks:",
-                f"max_wip_vs_baseline_residual_abs {max_residual_abs:.6e}",
-                f"max_wip_vs_baseline_hidden_abs {max_hidden_abs:.6e}",
-                f"max_wip_ar_vs_trtllm_ar_residual_abs {max_local_ar_residual_abs:.6e}",
-                f"max_wip_ar_vs_trtllm_ar_hidden_abs {max_local_ar_hidden_abs:.6e}",
-                f"max_stage1_ar_vs_trtllm_ar_residual_abs {max_stage1_ar_residual_abs:.6e}",
-                f"max_wip_rms_vs_python_rms_hidden_abs {max_rms_hidden_abs:.6e}",
+                f"max_module_vs_direct_residual_abs {max_module_residual_abs:.6e}",
+                f"max_module_vs_direct_hidden_abs {max_module_hidden_abs:.6e}",
             ]
         )
-    )
+    lines.append(" ".join(fields))
     path.write_text("\n".join(lines) + "\n")
 
 
@@ -800,6 +983,17 @@ def test_deepseekv3_fused_moe_post_moe_allreduce_wip_path() -> None:
             residual,
             norm_weight,
         )
+        module_path_checked = _has_production_fused_expert_down_ar_residual_rms_norm_op()
+        module_hidden_states = None
+        module_residual = None
+        if module_path_checked:
+            fused_moe = _build_fused_moe_module(tensors, rank, world_size)
+            module_hidden_states, module_residual = _run_fused_moe_module_wip(
+                fused_moe,
+                tensors["hidden_states"],
+                residual,
+                norm_weight,
+            )
         torch.cuda.synchronize()
 
     local_ar_residual_rel, local_ar_residual_abs = _max_errors(
@@ -817,6 +1011,19 @@ def test_deepseekv3_fused_moe_post_moe_allreduce_wip_path() -> None:
     rms_hidden_rel, rms_hidden_abs = _max_errors(wip_hidden_states, wip_python_rms_hidden_states)
     residual_rel, residual_abs = _max_errors(wip_residual, baseline_residual)
     hidden_rel, hidden_abs = _max_errors(wip_hidden_states, baseline_hidden_states)
+    if module_path_checked:
+        assert module_hidden_states is not None
+        assert module_residual is not None
+        module_residual_rel, module_residual_abs = _max_errors(module_residual, wip_residual)
+        module_hidden_rel, module_hidden_abs = _max_errors(
+            module_hidden_states,
+            wip_hidden_states,
+        )
+    else:
+        module_residual_rel = 0.0
+        module_residual_abs = 0.0
+        module_hidden_rel = 0.0
+        module_hidden_abs = 0.0
     result = {
         "rank": float(rank),
         "residual_rel": residual_rel,
@@ -831,6 +1038,11 @@ def test_deepseekv3_fused_moe_post_moe_allreduce_wip_path() -> None:
         "stage1_ar_residual_abs": stage1_ar_residual_abs,
         "rms_hidden_rel": rms_hidden_rel,
         "rms_hidden_abs": rms_hidden_abs,
+        "module_path_checked": 1.0 if module_path_checked else 0.0,
+        "module_residual_rel": module_residual_rel,
+        "module_residual_abs": module_residual_abs,
+        "module_hidden_rel": module_hidden_rel,
+        "module_hidden_abs": module_hidden_abs,
     }
     gathered_results = [item for item in comm.allgather(result) if item is not None]
     if rank == 0:
@@ -838,12 +1050,20 @@ def test_deepseekv3_fused_moe_post_moe_allreduce_wip_path() -> None:
         max_residual_abs = max(item["residual_abs"] for item in gathered_results)
         max_hidden_abs = max(item["hidden_abs"] for item in gathered_results)
         max_rms_hidden_abs = max(item["rms_hidden_abs"] for item in gathered_results)
-        print(
+        message = (
             "DeepSeekV3 fused MoE post-MoE AllReduce WIP path: "
             f"max_wip_vs_baseline_residual_abs {max_residual_abs:.6e}, "
             f"max_wip_vs_baseline_hidden_abs {max_hidden_abs:.6e}, "
             f"max_wip_rms_vs_python_rms_hidden_abs {max_rms_hidden_abs:.6e}"
         )
+        if any(item["module_path_checked"] > 0.5 for item in gathered_results):
+            max_module_residual_abs = max(item["module_residual_abs"] for item in gathered_results)
+            max_module_hidden_abs = max(item["module_hidden_abs"] for item in gathered_results)
+            message += (
+                f", max_module_vs_direct_residual_abs {max_module_residual_abs:.6e}, "
+                f"max_module_vs_direct_hidden_abs {max_module_hidden_abs:.6e}"
+            )
+        print(message)
     comm.Barrier()
 
     residual_abs_threshold = _float_env(
@@ -858,3 +1078,5 @@ def test_deepseekv3_fused_moe_post_moe_allreduce_wip_path() -> None:
     assert hidden_abs <= hidden_abs_threshold
     assert stage1_ar_residual_abs <= residual_abs_threshold
     assert rms_hidden_abs <= hidden_abs_threshold
+    assert module_residual_abs <= residual_abs_threshold
+    assert module_hidden_abs <= hidden_abs_threshold

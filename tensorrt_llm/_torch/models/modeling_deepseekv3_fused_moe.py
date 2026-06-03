@@ -11,7 +11,8 @@ from tensorrt_llm._utils import is_sm_100f
 from tensorrt_llm.bindings.internal.thop import BufferKind
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
-from ..distributed import AllReduceParams
+from ..distributed import AllReduceFusionOp, AllReduceParams
+from ..distributed.ops import get_allreduce_workspace
 from ..model_config import ModelConfig
 from ..modules.fused_moe import MoE
 from ..modules.linear import TensorParallelMode, load_weight_shard
@@ -417,6 +418,11 @@ class Deepseekv3FusedMoE(nn.Module):
             self.allreduce = AllReduce(
                 mapping=model_config.mapping, strategy=model_config.allreduce_strategy
             )
+        self.register_buffer("_fused_expert_down_allreduce_workspace", None, persistent=False)
+        self.register_buffer("_fused_expert_down_local_output", None, persistent=False)
+        self.register_buffer("_fused_expert_down_residual_output", None, persistent=False)
+        self.register_buffer("_fused_expert_down_hidden_output", None, persistent=False)
+        self.register_buffer("_fused_expert_down_rms_sums", None, persistent=False)
 
     @property
     def experts(self) -> MoE:
@@ -440,6 +446,94 @@ class Deepseekv3FusedMoE(nn.Module):
                 setattr(module, name, tensor)
         else:
             module.register_buffer(name, tensor, persistent=False)
+
+    def _ensure_fused_expert_down_finalize_buffers(self, hidden_states: torch.Tensor) -> None:
+        max_tokens = self._WIP_DOWN_PROJECT_MAX_NUM_TOKENS
+        hidden_shape = (max_tokens, hidden_states.shape[-1])
+        buffer_specs = (
+            ("_fused_expert_down_local_output", hidden_shape, hidden_states.dtype),
+            ("_fused_expert_down_residual_output", hidden_shape, hidden_states.dtype),
+            ("_fused_expert_down_hidden_output", hidden_shape, hidden_states.dtype),
+            ("_fused_expert_down_rms_sums", (max_tokens,), torch.float32),
+        )
+        for name, shape, dtype in buffer_specs:
+            buffer = getattr(self, name)
+            if (
+                buffer is None
+                or tuple(buffer.shape) != tuple(shape)
+                or buffer.device != hidden_states.device
+                or buffer.dtype != dtype
+            ):
+                self._set_nonpersistent_buffer(
+                    self,
+                    name,
+                    torch.empty(shape, device=hidden_states.device, dtype=dtype),
+                )
+
+        if self.mapping.tp_size > 1 and self._fused_expert_down_allreduce_workspace is None:
+            self._set_nonpersistent_buffer(
+                self,
+                "_fused_expert_down_allreduce_workspace",
+                get_allreduce_workspace(self.mapping),
+            )
+
+    def _can_finalize_with_fused_expert_down(
+        self,
+        final_all_reduce_params: AllReduceParams | None,
+        num_tokens: int,
+    ) -> bool:
+        return (
+            final_all_reduce_params is not None
+            and final_all_reduce_params.enable_allreduce
+            and final_all_reduce_params.fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM
+            and final_all_reduce_params.residual is not None
+            and final_all_reduce_params.norm_weight is not None
+            and self.mapping.tp_size > 1
+            and self.allreduce is not None
+            and num_tokens <= self._WIP_DOWN_PROJECT_MAX_NUM_TOKENS
+        )
+
+    def _run_dsv3_fused_expert_down_finalize(
+        self,
+        slot_swiglu_output: torch.Tensor,
+        expert_indices: torch.Tensor,
+        expert_weights: torch.Tensor,
+        routed_w2_weight: torch.Tensor,
+        routed_w2_weight_scale: torch.Tensor,
+        shared_down_weight: torch.Tensor,
+        shared_down_weight_scale_org: torch.Tensor,
+        final_all_reduce_params: AllReduceParams,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        num_tokens = slot_swiglu_output.size(0)
+        self._ensure_fused_expert_down_finalize_buffers(final_all_reduce_params.residual)
+        local_output = self._fused_expert_down_local_output[:num_tokens]
+        residual_out = self._fused_expert_down_residual_output[:num_tokens]
+        hidden_out = self._fused_expert_down_hidden_output[:num_tokens]
+        rms_sums = self._fused_expert_down_rms_sums[:num_tokens]
+        workspace = self._fused_expert_down_allreduce_workspace
+        if workspace is None:
+            raise RuntimeError("Deepseekv3FusedMoE fused finalize workspace is not initialized")
+
+        hidden_out = torch.ops.trtllm.dsv3_fused_expert_down_ar_residual_rms_norm(
+            slot_swiglu_output.contiguous(),
+            expert_indices.contiguous(),
+            expert_weights.contiguous(),
+            routed_w2_weight,
+            routed_w2_weight_scale,
+            shared_down_weight,
+            shared_down_weight_scale_org,
+            final_all_reduce_params.residual,
+            final_all_reduce_params.norm_weight,
+            workspace,
+            self.mapping.tp_rank,
+            self.mapping.tp_size,
+            final_all_reduce_params.eps,
+            local_output,
+            residual_out,
+            hidden_out,
+            rms_sums,
+        )
+        return hidden_out, residual_out
 
     @staticmethod
     def _checkpoint_tensor(weights, key: str) -> torch.Tensor:
@@ -832,7 +926,7 @@ class Deepseekv3FusedMoE(nn.Module):
         block_scale_int32_hidden_size: int,
         block_scale_fp32_expert_intermediate_size: int,
         gate_up_output_size: int,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         del all_rank_num_tokens, block_scale_int32_hidden_size, gate_up_output_size
         if not self._wip_weights_loaded:
             raise RuntimeError(
@@ -1007,6 +1101,31 @@ class Deepseekv3FusedMoE(nn.Module):
             (num_tokens, self.top_k + 1, expert_intermediate_size),
         )
 
+        if self._can_finalize_with_fused_expert_down(final_all_reduce_params, num_tokens):
+            final_hidden_states, residual_out = self._run_dsv3_fused_expert_down_finalize(
+                slot_swiglu_output,
+                expert_indices,
+                expert_weights,
+                routed_w2_weight_for_fused_expert_down,
+                routed_w2_weight_scale,
+                shared_down_weight_for_fused_expert_down,
+                shared_down_weight_scale_org,
+                final_all_reduce_params,
+            )
+            check_data(
+                final_hidden_states,
+                "dsv3_fused_expert_down.final_hidden_states",
+                torch.bfloat16,
+                tuple(hidden_states.shape),
+            )
+            check_data(
+                residual_out,
+                "dsv3_fused_expert_down.residual_out",
+                torch.bfloat16,
+                tuple(hidden_states.shape),
+            )
+            return final_hidden_states, residual_out
+
         output_tensor = None
         if not self.use_dp and self.mapping.tp_size > 1:
             w, actual_kind = torch.ops.trtllm.allocate_output(
@@ -1062,7 +1181,7 @@ class Deepseekv3FusedMoE(nn.Module):
         block_scale_int32_hidden_size: int,
         block_scale_fp32_expert_intermediate_size: int,
         gate_up_output_size: int,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """
         DeepSeek-V3 fused expert kernel implementation of forward().
         """
@@ -1087,7 +1206,7 @@ class Deepseekv3FusedMoE(nn.Module):
         all_rank_num_tokens: list[int] | None = None,
         final_all_reduce_params: AllReduceParams | None = None,
         do_finalize: bool | None = True,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         assert do_finalize is True, "Deepseekv3FusedMoE only supports do_finalize=True"
         del hidden_states_fp4
 

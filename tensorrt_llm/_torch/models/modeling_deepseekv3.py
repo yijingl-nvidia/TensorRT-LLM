@@ -1300,7 +1300,8 @@ class DeepseekV3DecoderLayer(DecoderLayer):
 
         fused_expert_down_finalizes_post_moe = (
             isinstance(self.mlp, Deepseekv3FusedMoE)
-            and self.fusion_config.POST_MOE_FUSION
+            and self.fusion_config.POST_MOE_FUSION and hidden_states.shape[0]
+            <= Deepseekv3FusedMoE._WIP_DOWN_PROJECT_MAX_NUM_TOKENS
             and get_fused_expert_down_finalize_mode()
             == FUSED_EXPERT_DOWN_FINALIZE_MODE_ALLREDUCE_RESIDUAL_RMS_NORM)
 
@@ -1574,7 +1575,8 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
 
         fused_expert_down_finalizes_post_moe = (
             isinstance(self.mlp, Deepseekv3FusedMoE)
-            and self.fusion_config.POST_MOE_FUSION
+            and self.fusion_config.POST_MOE_FUSION and hidden_states.shape[0]
+            <= Deepseekv3FusedMoE._WIP_DOWN_PROJECT_MAX_NUM_TOKENS
             and get_fused_expert_down_finalize_mode()
             == FUSED_EXPERT_DOWN_FINALIZE_MODE_ALLREDUCE_RESIDUAL_RMS_NORM)
 
