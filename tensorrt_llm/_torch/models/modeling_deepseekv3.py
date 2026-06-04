@@ -1059,12 +1059,25 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                 mapping_with_cp=mapping_with_cp,
                 reduce_output=needs_tp_reduce or needs_cp_reduce)
         else:
-            self.self_attn = DeepseekV3Attention(
-                model_config,
-                layer_idx=layer_idx_for_attention,
-                aux_stream=aux_stream_dict[AuxStreamType.Attention],
-                mapping_with_cp=mapping_with_cp,
-                reduce_output=needs_tp_reduce or needs_cp_reduce)
+            from .modeling_deepseekv3_fused_mla import (FUSED_MLA_MODE_WIP,
+                                                        DeepseekV3FusedMLA,
+                                                        get_fused_mla_mode)
+
+            fused_mla_mode = get_fused_mla_mode()
+            if fused_mla_mode == FUSED_MLA_MODE_WIP:
+                self.self_attn = DeepseekV3FusedMLA(
+                    model_config,
+                    layer_idx=layer_idx_for_attention,
+                    aux_stream=aux_stream_dict[AuxStreamType.Attention],
+                    mapping_with_cp=mapping_with_cp,
+                    reduce_output=needs_tp_reduce or needs_cp_reduce)
+            else:
+                self.self_attn = DeepseekV3Attention(
+                    model_config,
+                    layer_idx=layer_idx_for_attention,
+                    aux_stream=aux_stream_dict[AuxStreamType.Attention],
+                    mapping_with_cp=mapping_with_cp,
+                    reduce_output=needs_tp_reduce or needs_cp_reduce)
 
         self.fusion_config = EagerFusionConfig()
         self.enable_fusion = os.environ.get(

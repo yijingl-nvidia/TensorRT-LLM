@@ -22,11 +22,14 @@ from typing import List, Optional, cast
 
 import torch
 from torch import nn
+from transformers import PretrainedConfig
 
 import tensorrt_llm.quantization.utils.fp8_utils as fp8_utils
 from tensorrt_llm._utils import get_sm_version, is_sm_100f, nvtx_range, nvtx_range_debug
+from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from ..attention_backend import (
     AttentionForwardArgs,
@@ -39,6 +42,7 @@ from ..attention_backend.interface import (
     AttentionBackend,
     PositionalEmbeddingParams,
     PredefinedAttentionMask,
+    RopeParams,
 )
 from ..attention_backend.sparse.dsa import (
     DSAtrtllmAttentionMetadata,
@@ -47,18 +51,111 @@ from ..attention_backend.sparse.dsa import (
 from ..attention_backend.utils import create_attention
 from ..distributed import AllReduceParams
 from ..model_config import ModelConfig
-from ..modules.attention import _helix_post_process, extract_extra_attrs, fp8_block_scaling_bmm_out
-from ..modules.linear import Linear, TensorParallelMode
+from ..modules.attention import _helix_post_process, fp8_block_scaling_bmm_out
+from ..modules.linear import Linear, TensorParallelMode, WeightsLoadingConfig
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
 from ..modules.rotary_embedding import RotaryEmbedding
-from ..utils import is_torch_compiling, maybe_compiled_cat, maybe_compiled_copy_
+from ..peft.lora.layer import LoraLayer
+from ..utils import (
+    get_model_extra_attrs,
+    is_torch_compiling,
+    maybe_compiled_cat,
+    maybe_compiled_copy_,
+)
 
 # Import FlashMLA sparse attention kernel
 try:
     from tensorrt_llm.flash_mla import flash_mla_sparse_fwd
 except ImportError:
     flash_mla_sparse_fwd = None
+
+
+_FUSED_MLA_MODE_ENV = "TRTLLM_DEEPSEEKV3_FUSED_MLA_MODE"
+FUSED_MLA_MODE_BASELINE = "baseline"
+FUSED_MLA_MODE_WIP = "wip"
+
+
+def get_fused_mla_mode() -> str:
+    mode = os.environ.get(_FUSED_MLA_MODE_ENV, "").strip().lower()
+    if not mode:
+        return FUSED_MLA_MODE_BASELINE
+
+    mode_aliases = {
+        "0": FUSED_MLA_MODE_BASELINE,
+        "false": FUSED_MLA_MODE_BASELINE,
+        "off": FUSED_MLA_MODE_BASELINE,
+        "original": FUSED_MLA_MODE_BASELINE,
+        "baseline": FUSED_MLA_MODE_BASELINE,
+        "mla": FUSED_MLA_MODE_BASELINE,
+        "1": FUSED_MLA_MODE_WIP,
+        "true": FUSED_MLA_MODE_WIP,
+        "on": FUSED_MLA_MODE_WIP,
+        "wip": FUSED_MLA_MODE_WIP,
+        "fused_mla": FUSED_MLA_MODE_WIP,
+        "wip_fused_mla": FUSED_MLA_MODE_WIP,
+    }
+    if mode not in mode_aliases:
+        allowed_modes = ", ".join((FUSED_MLA_MODE_BASELINE, FUSED_MLA_MODE_WIP))
+        raise ValueError(
+            f"Unsupported {_FUSED_MLA_MODE_ENV}={mode!r}; expected one of: {allowed_modes}"
+        )
+    return mode_aliases[mode]
+
+
+class DeepseekV3Linear(Linear):
+    """
+    A wrapper around Linear because we may optionally use min-latency kernels
+    depending on input shapes.
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        bias: bool = True,
+        dtype: torch.dtype = None,
+        mapping: Optional[Mapping] = None,
+        tensor_parallel_mode: Optional[TensorParallelMode] = None,
+        gather_output: bool = False,  # COLUMN parallel only
+        quant_config: Optional[QuantConfig] = None,
+        weights_loading_config: Optional[WeightsLoadingConfig] = None,
+        reduce_output: bool = True,  # ROW parallel only
+        skip_create_weights_in_init: bool = False,
+        use_custom_cublas_mm: bool = False,
+        use_cute_dsl_blockscaling_mm: bool = False,
+        lora: Optional[LoraLayer] = None,
+    ):
+        super().__init__(
+            in_features,
+            out_features,
+            bias,
+            dtype,
+            mapping,
+            tensor_parallel_mode,
+            gather_output,
+            quant_config,
+            weights_loading_config,
+            reduce_output,
+            skip_create_weights_in_init,
+            use_custom_cublas_mm,
+            lora,
+            use_cute_dsl_blockscaling_mm=use_cute_dsl_blockscaling_mm,
+        )
+
+    def apply_linear(
+        self,
+        input,
+        bias,
+        lora_params: dict | None = None,
+        layer_idx: int | None = None,
+    ):
+        num_tokens = input.shape[0]
+        if not self.has_any_quant and 1 <= num_tokens <= 16 and get_sm_version() not in [120, 121]:
+            output = torch.ops.trtllm.dsv3_fused_a_gemm_op(input, self.weight.t(), bias, None)
+        else:
+            output = super().apply_linear(input, bias, lora_params, layer_idx)
+        return output
 
 
 class FusedMLA(nn.Module):
@@ -204,6 +301,7 @@ class FusedMLA(nn.Module):
             o_lora_rank (int): The dimension of the compressed output.
         """
         super().__init__()
+        print(f"FusedMLA::__init__: layer_idx={layer_idx}")
         self.layer_idx = layer_idx
         self.layer_idx_str = str(layer_idx)
         self.dtype = dtype
@@ -298,7 +396,7 @@ class FusedMLA(nn.Module):
         self.use_cute_dsl_bf16_gemm = config.use_cute_dsl_bf16_gemm
 
         if not self.is_lite:
-            self.kv_a_proj_with_mqa = Linear(
+            self.kv_a_proj_with_mqa = DeepseekV3Linear(
                 hidden_size,
                 self.q_lora_rank + self.kv_lora_rank + self.qk_rope_head_dim,
                 bias=bias,
@@ -306,9 +404,7 @@ class FusedMLA(nn.Module):
                 quant_config=quant_config,
                 skip_create_weights_in_init=config.skip_create_weights_in_init,
                 use_custom_cublas_mm=True,
-                force_dynamic_quantization=config.force_dynamic_quantization,
                 use_cute_dsl_blockscaling_mm=self.use_cute_dsl_blockscaling_mm,
-                use_cute_dsl_bf16_gemm=self.use_cute_dsl_bf16_gemm,
             )
 
             self.q_a_layernorm = RMSNorm(
@@ -330,7 +426,7 @@ class FusedMLA(nn.Module):
                 use_cute_dsl_bf16_gemm=self.use_cute_dsl_bf16_gemm,
             )
         else:
-            self.kv_a_proj_with_mqa = Linear(
+            self.kv_a_proj_with_mqa = DeepseekV3Linear(
                 hidden_size,
                 self.kv_lora_rank + self.qk_rope_head_dim,
                 bias=bias,
@@ -338,9 +434,7 @@ class FusedMLA(nn.Module):
                 quant_config=quant_config,
                 skip_create_weights_in_init=config.skip_create_weights_in_init,
                 use_custom_cublas_mm=True,
-                force_dynamic_quantization=config.force_dynamic_quantization,
                 use_cute_dsl_blockscaling_mm=self.use_cute_dsl_blockscaling_mm,
-                use_cute_dsl_bf16_gemm=self.use_cute_dsl_bf16_gemm,
             )
 
             self.q_proj = Linear(
@@ -2007,6 +2101,77 @@ class FusedMLA(nn.Module):
             )
 
 
+class DeepseekV3FusedMLA(FusedMLA):
+    def __init__(
+        self,
+        model_config: ModelConfig[PretrainedConfig],
+        layer_idx: Optional[int] = None,
+        aux_stream: Optional[torch.cuda.Stream] = None,
+        mapping_with_cp: Optional[Mapping] = None,
+        reduce_output: bool = True,
+    ):
+        mapping = mapping_with_cp if mapping_with_cp is not None else model_config.mapping
+        if (
+            model_config.mapping.enable_attention_dp
+            or mapping.cp_size > 1
+            or model_config.mapping.pp_size > 1
+        ):
+            raise RuntimeError(
+                "TRTLLM_DEEPSEEKV3_FUSED_MLA_MODE=wip currently supports TP-only "
+                "DeepSeekV3 execution."
+            )
+
+        config = model_config.pretrained_config
+        predicted_tokens_per_seq = (
+            model_config.spec_config.tokens_per_gen_step
+            if model_config.spec_config is not None
+            else 1
+        )
+        super().__init__(
+            hidden_size=config.hidden_size,
+            num_attention_heads=config.num_attention_heads,
+            num_key_value_heads=config.num_key_value_heads,
+            qk_rope_head_dim=config.qk_rope_head_dim,
+            qk_nope_head_dim=config.qk_nope_head_dim,
+            q_lora_rank=config.q_lora_rank,
+            kv_lora_rank=config.kv_lora_rank,
+            v_head_dim=config.v_head_dim,
+            predicted_tokens_per_seq=predicted_tokens_per_seq,
+            max_position_embeddings=config.max_position_embeddings,
+            bias=False,
+            pos_embd_params=PositionalEmbeddingParams(
+                type=PositionEmbeddingType.yarn,
+                rope=RopeParams.from_config(config),
+                is_neox=False,
+            ),
+            layer_idx=layer_idx,
+            dtype=config.torch_dtype,
+            config=model_config,
+            aux_stream=aux_stream,
+            mapping_with_cp=mapping_with_cp,
+            reduce_output=reduce_output,
+        )
+
+
+def _extract_fused_mla_extra_attrs(layer_idx: str):
+    extra_attrs = get_model_extra_attrs()
+    assert extra_attrs is not None, "Model extra attrs is not set"
+
+    metadata_ref = extra_attrs.get("attention_metadata", None)
+    assert metadata_ref is not None, "Attention metadata is not set"
+    metadata = metadata_ref()
+    assert isinstance(metadata, TrtllmAttentionMetadata)
+
+    mla_layers = extra_attrs.get("mla_layers", None)
+    assert mla_layers is not None, "MLA layer is not registered"
+    mla_layer_ref = mla_layers.get(layer_idx, None)
+    assert mla_layer_ref is not None, f"Cannot find fused MLA layer for layer {layer_idx}"
+    mla_layer = mla_layer_ref()
+    assert isinstance(mla_layer, FusedMLA), "MLA layer must be a FusedMLA instance"
+
+    return metadata, mla_layer
+
+
 @torch.library.custom_op("trtllm::fused_mla_dsa_proj", mutates_args=())
 def mla_dsa_proj(
     hidden_states: torch.Tensor,
@@ -2028,7 +2193,7 @@ def mla_dsa_proj(
     The trailing q_scale is only consumed by the FP4 dispatch; the FP8
     path ignores it in forward_dsa_attn.
     """
-    metadata, mla_layer = extract_extra_attrs(layer_idx, "mla")
+    metadata, mla_layer = _extract_fused_mla_extra_attrs(layer_idx)
     return mla_layer.forward_dsa_proj(position_ids, hidden_states, metadata)
 
 
@@ -2051,7 +2216,7 @@ def mla_dsa_attn_inplace(
     ignores it. Runs sparse_attn_indexer then dispatches context/generation
     attention. This op is excluded from CUDA graph capture.
     """
-    metadata, mla_layer = extract_extra_attrs(layer_idx, "mla")
+    metadata, mla_layer = _extract_fused_mla_extra_attrs(layer_idx)
     mla_layer.forward_dsa_attn(
         q, compressed_kv, k_pe, latent_cache, indexer_intermediates, position_ids, metadata, output
     )
