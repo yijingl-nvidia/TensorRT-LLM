@@ -13,7 +13,7 @@
 #   scripts/build_dsv3_fused_expert_up_dev_in_session.sh
 #   TRTLLM_DEEPSEEKV3_FUSED_MOE_TEST_EXTRA_OP_LIBRARY=cpp/build/dsv3_fused_expert_up_dev/libdsv3_fused_expert_up_dev.so \
 #   TRTLLM_DEEPSEEKV3_FUSED_MOE_TEST_FUSED_EXPERT_UP_OP=dsv3_fused_expert_up_dev \
-#     pytest -q tests/unittest/_torch/models/test_modeling_deepseekv3_fused_moe_allreduce.py -s
+#     pytest -q tests/unittest/_torch/models/test_modeling_deepseekv3_fused_moe.py -s
 
 set -euo pipefail
 
@@ -32,6 +32,10 @@ format_duration() {
     else
         printf '%ds' "$seconds"
     fi
+}
+
+shell_quote() {
+    printf '%q' "$1"
 }
 
 report_duration() {
@@ -106,17 +110,26 @@ echo "  ld flags   : $EXTRA_LDFLAGS_VALUE"
 echo "  log        : $LOG"
 echo "================================================================="
 
+SRC_DIR_Q="$(shell_quote "$SRC_DIR")"
+BUILD_DIR_Q="$(shell_quote "$BUILD_DIR")"
+OUT_SO_Q="$(shell_quote "$OUT_SO")"
+TORCH_CUDA_ARCH_LIST_Q="$(shell_quote "$TORCH_CUDA_ARCH_LIST_VALUE")"
+MAX_JOBS_Q="$(shell_quote "$MAX_JOBS_VALUE")"
+VERBOSE_Q="$(shell_quote "$VERBOSE_VALUE")"
+EXTRA_CUDA_FLAGS_Q="$(shell_quote "$EXTRA_CUDA_FLAGS_VALUE")"
+EXTRA_LDFLAGS_Q="$(shell_quote "$EXTRA_LDFLAGS_VALUE")"
+
 INNER_CMD="
     set -euo pipefail
-    export SRC_DIR='$SRC_DIR'
-    export BUILD_DIR='$BUILD_DIR'
-    export OUT_SO='$OUT_SO'
-    export TORCH_CUDA_ARCH_LIST='$TORCH_CUDA_ARCH_LIST_VALUE'
-    export MAX_JOBS='$MAX_JOBS_VALUE'
-    export DSV3_FUSED_EXPERT_UP_DEV_VERBOSE='$VERBOSE_VALUE'
-    export DSV3_FUSED_EXPERT_UP_DEV_EXTRA_CUDA_FLAGS='$EXTRA_CUDA_FLAGS_VALUE'
-    export DSV3_FUSED_EXPERT_UP_DEV_EXTRA_LDFLAGS='$EXTRA_LDFLAGS_VALUE'
-    cd '$SRC_DIR'
+    export SRC_DIR=${SRC_DIR_Q}
+    export BUILD_DIR=${BUILD_DIR_Q}
+    export OUT_SO=${OUT_SO_Q}
+    export TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST_Q}
+    export MAX_JOBS=${MAX_JOBS_Q}
+    export DSV3_FUSED_EXPERT_UP_DEV_VERBOSE=${VERBOSE_Q}
+    export DSV3_FUSED_EXPERT_UP_DEV_EXTRA_CUDA_FLAGS=${EXTRA_CUDA_FLAGS_Q}
+    export DSV3_FUSED_EXPERT_UP_DEV_EXTRA_LDFLAGS=${EXTRA_LDFLAGS_Q}
+    cd \"\$SRC_DIR\"
     python3 -u scripts/build_dsv3_fused_expert_up_dev.py
 "
 
