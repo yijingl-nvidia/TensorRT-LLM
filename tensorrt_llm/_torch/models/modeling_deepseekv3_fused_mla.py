@@ -2118,7 +2118,7 @@ class DeepseekV3FusedMLA(FusedMLA):
         ):
             raise RuntimeError(
                 "TRTLLM_DEEPSEEKV3_FUSED_MLA_MODE=wip currently supports TP-only "
-                "DeepSeekV3 execution."
+                "DeepSeekV3/DeepSeekV32 execution."
             )
 
         config = model_config.pretrained_config
@@ -2150,6 +2150,36 @@ class DeepseekV3FusedMLA(FusedMLA):
             aux_stream=aux_stream,
             mapping_with_cp=mapping_with_cp,
             reduce_output=reduce_output,
+        )
+
+
+class DeepseekV32FusedMLA(DeepseekV3FusedMLA):
+    def __init__(
+        self,
+        model_config: ModelConfig[PretrainedConfig],
+        layer_idx: Optional[int] = None,
+        aux_stream: Optional[torch.cuda.Stream] = None,
+        mapping_with_cp: Optional[Mapping] = None,
+        reduce_output: bool = True,
+    ):
+        super().__init__(
+            model_config,
+            layer_idx=layer_idx,
+            aux_stream=aux_stream,
+            mapping_with_cp=mapping_with_cp,
+            reduce_output=reduce_output,
+        )
+
+        config = model_config.pretrained_config
+        self.indexer = self.mqa.indexer
+        self.kv_a_proj_with_mqa = DeepseekV3Linear(
+            config.hidden_size,
+            self.kv_lora_rank + self.qk_rope_head_dim + self.q_lora_rank,
+            bias=False,
+            dtype=config.torch_dtype,
+            quant_config=model_config.get_quant_config(),
+            skip_create_weights_in_init=model_config.skip_create_weights_in_init,
+            use_custom_cublas_mm=True,
         )
 
 

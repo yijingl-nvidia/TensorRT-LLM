@@ -1051,33 +1051,25 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         needs_tp_reduce = not self.enable_attention_dp and self.mapping.tp_size > 1
         needs_cp_reduce = mapping_with_cp is not None and mapping_with_cp.has_cp_helix(
         )
-        if config.model_type == "deepseek_v32":
-            self.self_attn = DeepseekV32Attention(
-                model_config,
-                layer_idx=layer_idx_for_attention,
-                aux_stream=aux_stream_dict[AuxStreamType.Attention],
-                mapping_with_cp=mapping_with_cp,
-                reduce_output=needs_tp_reduce or needs_cp_reduce)
-        else:
-            from .modeling_deepseekv3_fused_mla import (FUSED_MLA_MODE_WIP,
-                                                        DeepseekV3FusedMLA,
-                                                        get_fused_mla_mode)
+        from .modeling_deepseekv3_fused_mla import (FUSED_MLA_MODE_WIP,
+                                                    DeepseekV3FusedMLA,
+                                                    DeepseekV32FusedMLA,
+                                                    get_fused_mla_mode)
 
-            fused_mla_mode = get_fused_mla_mode()
-            if fused_mla_mode == FUSED_MLA_MODE_WIP:
-                self.self_attn = DeepseekV3FusedMLA(
-                    model_config,
-                    layer_idx=layer_idx_for_attention,
-                    aux_stream=aux_stream_dict[AuxStreamType.Attention],
-                    mapping_with_cp=mapping_with_cp,
-                    reduce_output=needs_tp_reduce or needs_cp_reduce)
-            else:
-                self.self_attn = DeepseekV3Attention(
-                    model_config,
-                    layer_idx=layer_idx_for_attention,
-                    aux_stream=aux_stream_dict[AuxStreamType.Attention],
-                    mapping_with_cp=mapping_with_cp,
-                    reduce_output=needs_tp_reduce or needs_cp_reduce)
+        fused_mla_mode = get_fused_mla_mode()
+        if config.model_type == "deepseek_v32":
+            attention_cls = (DeepseekV32FusedMLA if fused_mla_mode
+                             == FUSED_MLA_MODE_WIP else DeepseekV32Attention)
+        else:
+            attention_cls = (DeepseekV3FusedMLA if fused_mla_mode
+                             == FUSED_MLA_MODE_WIP else DeepseekV3Attention)
+
+        self.self_attn = attention_cls(
+            model_config,
+            layer_idx=layer_idx_for_attention,
+            aux_stream=aux_stream_dict[AuxStreamType.Attention],
+            mapping_with_cp=mapping_with_cp,
+            reduce_output=needs_tp_reduce or needs_cp_reduce)
 
         self.fusion_config = EagerFusionConfig()
         self.enable_fusion = os.environ.get(
