@@ -223,6 +223,7 @@ def _run_fused_expert_up_outputs(
             helpers._n_group(),
             helpers._topk_group(),
             helpers._routed_scaling_factor(),
+            fused_expert_up_op_name=helpers._fused_expert_up_op_name(),
         )
     )
     return expert_indices, expert_weights, slot_swiglu_output

@@ -3,18 +3,16 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
-# Build only the in-development DeepSeek-V3 fused expert-down Torch ops inside
+# Build only the in-development DeepSeek-V3 fused expert-up Torch op inside
 # the active gpu_dev_session.
 #
 # Output:
-#   cpp/build/dsv3_fused_expert_down_dev/libdsv3_fused_expert_down_dev.so
+#   cpp/build/dsv3_fused_expert_up_dev/libdsv3_fused_expert_up_dev.so
 #
 # Example:
-#   scripts/build_dsv3_fused_expert_down_dev_in_session.sh
-#   TRTLLM_DEEPSEEKV3_FUSED_MOE_TEST_EXTRA_OP_LIBRARY=cpp/build/dsv3_fused_expert_down_dev/libdsv3_fused_expert_down_dev.so \
-#   TRTLLM_DEEPSEEKV3_FUSED_MOE_TEST_FUSED_EXPERT_DOWN_OP=dsv3_fused_expert_down_dev \
-#   TRTLLM_DEEPSEEKV3_FUSED_MOE_TEST_FUSED_EXPERT_DOWN_AR_RESIDUAL_OP=dsv3_fused_expert_down_ar_residual_dev \
-#   TRTLLM_DEEPSEEKV3_FUSED_MOE_TEST_FUSED_EXPERT_DOWN_AR_RESIDUAL_RMS_NORM_OP=dsv3_fused_expert_down_ar_residual_rms_norm_dev \
+#   scripts/build_dsv3_fused_expert_up_dev_in_session.sh
+#   TRTLLM_DEEPSEEKV3_FUSED_MOE_TEST_EXTRA_OP_LIBRARY=cpp/build/dsv3_fused_expert_up_dev/libdsv3_fused_expert_up_dev.so \
+#   TRTLLM_DEEPSEEKV3_FUSED_MOE_TEST_FUSED_EXPERT_UP_OP=dsv3_fused_expert_up_dev \
 #     pytest -q tests/unittest/_torch/models/test_modeling_deepseekv3_fused_moe_allreduce.py -s
 
 set -euo pipefail
@@ -46,9 +44,9 @@ report_duration() {
     echo ""
     echo "================================================================="
     if [ "$status" -eq 0 ]; then
-        echo "  dsv3_fused_expert_down_dev build OK"
+        echo "  dsv3_fused_expert_up_dev build OK"
     else
-        echo "  dsv3_fused_expert_down_dev build FAILED (exit $status)"
+        echo "  dsv3_fused_expert_up_dev build FAILED (exit $status)"
     fi
     echo "  Build duration: $(format_duration "$elapsed")"
     echo "================================================================="
@@ -79,20 +77,20 @@ fi
 # shellcheck source=/dev/null
 source "$SESSION_ENV_FILE"
 
-BUILD_DIR="${DSV3_FUSED_EXPERT_DOWN_DEV_BUILD_DIR:-${SRC_DIR}/cpp/build/dsv3_fused_expert_down_dev}"
-OUT_SO="${DSV3_FUSED_EXPERT_DOWN_DEV_OUTPUT_SO:-${BUILD_DIR}/libdsv3_fused_expert_down_dev.so}"
+BUILD_DIR="${DSV3_FUSED_EXPERT_UP_DEV_BUILD_DIR:-${SRC_DIR}/cpp/build/dsv3_fused_expert_up_dev}"
+OUT_SO="${DSV3_FUSED_EXPERT_UP_DEV_OUTPUT_SO:-${BUILD_DIR}/libdsv3_fused_expert_up_dev.so}"
 TORCH_CUDA_ARCH_LIST_VALUE="${TORCH_CUDA_ARCH_LIST:-10.0a}"
 MAX_JOBS_VALUE="${MAX_JOBS:-${BUILD_JOBS:-32}}"
-VERBOSE_VALUE="${DSV3_FUSED_EXPERT_DOWN_DEV_VERBOSE:-1}"
-EXTRA_CUDA_FLAGS_VALUE="${DSV3_FUSED_EXPERT_DOWN_DEV_EXTRA_CUDA_FLAGS:-}"
-EXTRA_LDFLAGS_VALUE="${DSV3_FUSED_EXPERT_DOWN_DEV_EXTRA_LDFLAGS:-}"
+VERBOSE_VALUE="${DSV3_FUSED_EXPERT_UP_DEV_VERBOSE:-1}"
+EXTRA_CUDA_FLAGS_VALUE="${DSV3_FUSED_EXPERT_UP_DEV_EXTRA_CUDA_FLAGS:-}"
+EXTRA_LDFLAGS_VALUE="${DSV3_FUSED_EXPERT_UP_DEV_EXTRA_LDFLAGS:-}"
 OUT_ROOT="${STORAGE_DIR:-/scratch/fsw/portfolios/coreai/projects/coreai_mlperf_inference/users/${USER}}/nvbug6108841_logs"
-RUN_DIR="${OUT_ROOT}/trtllm/fused_down_dev_build_$(date +%Y%m%d_%H%M%S)${SESSION_NAME:+_session${SESSION_NAME}}"
+RUN_DIR="${OUT_ROOT}/trtllm/fused_up_dev_build_$(date +%Y%m%d_%H%M%S)${SESSION_NAME:+_session${SESSION_NAME}}"
 mkdir -p "$RUN_DIR"
-LOG="${RUN_DIR}/build_dsv3_fused_expert_down_dev.log"
+LOG="${RUN_DIR}/build_dsv3_fused_expert_up_dev.log"
 
 echo "================================================================="
-echo "  dsv3_fused_expert_down_dev standalone build"
+echo "  dsv3_fused_expert_up_dev standalone build"
 echo "================================================================="
 echo "  session    : job ${GPU_DEV_JOB:-unknown} on ${GPU_DEV_NODE:-unknown}"
 echo "  container  : ${GPU_DEV_CONTAINER:-unknown}"
@@ -115,11 +113,11 @@ INNER_CMD="
     export OUT_SO='$OUT_SO'
     export TORCH_CUDA_ARCH_LIST='$TORCH_CUDA_ARCH_LIST_VALUE'
     export MAX_JOBS='$MAX_JOBS_VALUE'
-    export DSV3_FUSED_EXPERT_DOWN_DEV_VERBOSE='$VERBOSE_VALUE'
-    export DSV3_FUSED_EXPERT_DOWN_DEV_EXTRA_CUDA_FLAGS='$EXTRA_CUDA_FLAGS_VALUE'
-    export DSV3_FUSED_EXPERT_DOWN_DEV_EXTRA_LDFLAGS='$EXTRA_LDFLAGS_VALUE'
+    export DSV3_FUSED_EXPERT_UP_DEV_VERBOSE='$VERBOSE_VALUE'
+    export DSV3_FUSED_EXPERT_UP_DEV_EXTRA_CUDA_FLAGS='$EXTRA_CUDA_FLAGS_VALUE'
+    export DSV3_FUSED_EXPERT_UP_DEV_EXTRA_LDFLAGS='$EXTRA_LDFLAGS_VALUE'
     cd '$SRC_DIR'
-    python3 -u scripts/build_dsv3_fused_expert_down_dev.py
+    python3 -u scripts/build_dsv3_fused_expert_up_dev.py
 "
 
 set +e
@@ -130,7 +128,7 @@ set -e
 if [ "$BUILD_STATUS" -ne 0 ]; then
     echo "" >&2
     echo "=================================================================" >&2
-    echo "  Standalone fused expert-down dev build failed with exit code $BUILD_STATUS" >&2
+    echo "  Standalone fused expert-up dev build failed with exit code $BUILD_STATUS" >&2
     echo "  Build log: $LOG" >&2
     echo "" >&2
     echo "  Tail of log:" >&2
@@ -141,7 +139,7 @@ fi
 
 echo ""
 echo "================================================================="
-echo "  Standalone fused expert-down dev build complete"
+echo "  Standalone fused expert-up dev build complete"
 echo "  Build log: $LOG"
 echo "  Output so: $OUT_SO"
 echo "================================================================="

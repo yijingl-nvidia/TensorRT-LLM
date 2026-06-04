@@ -848,6 +848,7 @@ class Deepseekv3FusedMoE(nn.Module):
         n_group: int,
         topk_group: int,
         routed_scaling_factor: float,
+        fused_expert_up_op_name: str = "dsv3_fused_expert_up",
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         # fp32, [num_tokens, num_router_experts]
         router_logits = torch.ops.trtllm.dsv3_router_gemm_op(
@@ -865,7 +866,8 @@ class Deepseekv3FusedMoE(nn.Module):
         assert n_group == 1, f"dsv3_fused_expert_up only supports n_group=1, got {n_group}"
         assert topk_group == 1, f"dsv3_fused_expert_up only supports topk_group=1, got {topk_group}"
 
-        expert_weights, expert_indices, slot_swiglu_output = torch.ops.trtllm.dsv3_fused_expert_up(
+        fused_expert_up_op = getattr(torch.ops.trtllm, fused_expert_up_op_name)
+        expert_weights, expert_indices, slot_swiglu_output = fused_expert_up_op(
             router_logits.contiguous(),
             hidden_states.contiguous(),
             routing_bias.contiguous(),

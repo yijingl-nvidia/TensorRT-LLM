@@ -46,6 +46,7 @@ _DEFAULT_DEBUG_OUTPUT_DIR = "~/dev/debug_output"
 _PHASE_ENV = "TRTLLM_DEEPSEEKV3_FUSED_MOE_TEST_PHASE"
 _PREPACK_FUSED_EXPERT_DOWN_ENV = "TRTLLM_DEEPSEEKV3_FUSED_MOE_TEST_PREPACK_FUSED_EXPERT_DOWN"
 _EXTRA_OP_LIBRARY_ENV = "TRTLLM_DEEPSEEKV3_FUSED_MOE_TEST_EXTRA_OP_LIBRARY"
+_FUSED_EXPERT_UP_OP_ENV = "TRTLLM_DEEPSEEKV3_FUSED_MOE_TEST_FUSED_EXPERT_UP_OP"
 _FUSED_EXPERT_DOWN_OP_ENV = "TRTLLM_DEEPSEEKV3_FUSED_MOE_TEST_FUSED_EXPERT_DOWN_OP"
 
 _NUM_RANKS = 8
@@ -231,6 +232,10 @@ def _prepack_fused_expert_down_enabled() -> bool:
 
 def _fused_expert_down_op_name() -> str:
     return _env(_FUSED_EXPERT_DOWN_OP_ENV, "dsv3_fused_expert_down")
+
+
+def _fused_expert_up_op_name() -> str:
+    return _env(_FUSED_EXPERT_UP_OP_ENV, "dsv3_fused_expert_up")
 
 
 def _fused_kernel_abs_error_threshold_slack() -> float:
@@ -433,7 +438,7 @@ def _require_cuda_and_ops(
             ]
         )
     if require_fused_ops:
-        required_ops.extend(["dsv3_fused_expert_up", _fused_expert_down_op_name()])
+        required_ops.extend([_fused_expert_up_op_name(), _fused_expert_down_op_name()])
 
     missing_ops = [name for name in required_ops if not hasattr(torch.ops.trtllm, name)]
     if missing_ops:
@@ -1031,7 +1036,8 @@ def _run_fused_kernel(
     # expert_weights: torch.float32, [T, K].
     # expert_indices: torch.int32, [T, K].
     # slot_swiglu_output: torch.float16, [T, K + 1, I].
-    expert_weights, expert_indices, slot_swiglu_output = torch.ops.trtllm.dsv3_fused_expert_up(
+    fused_expert_up_op = getattr(torch.ops.trtllm, _fused_expert_up_op_name())
+    expert_weights, expert_indices, slot_swiglu_output = fused_expert_up_op(
         router_logits.contiguous(),
         tensors["hidden_states"].contiguous(),
         tensors["routing_bias"].contiguous(),

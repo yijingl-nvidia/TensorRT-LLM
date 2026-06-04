@@ -138,6 +138,7 @@ constexpr int kPackedLoadTma = 1;
 
 constexpr float kInvalidScore = -INFINITY;
 constexpr float kFp8Max = 448.f;
+constexpr float kInvFp8Max = 1.f / kFp8Max;
 
 constexpr int kActBytes = kHidden * 2;                               // 12288
 constexpr int kActCpAsyncs = kActBytes / 16;                         // 768
@@ -485,10 +486,8 @@ __device__ __forceinline__ void quant_act_blocks_fused_expert_up(cg::thread_bloc
         float lane_max = fmaxf(fmaxf(fabsf(f0), fabsf(f1)), fmaxf(fabsf(f2), fabsf(f3)));
         float amax = cg::reduce(warp, lane_max, cg::greater<float>{});
         amax = fmaxf(amax, 1e-10f);
-        float const quant_scale = kFp8Max / amax; // bf16 * quant_scale -> fp8
-        // Compute dequant as 1/quant_scale so the
-        // (quant_scale * dequant_scale) chain simplifies to exactly 1.0 in fp32.
-        float const dequant_scale = 1.f / quant_scale; // fp8 * dequant -> bf16
+        float const quant_scale = kFp8Max / amax;      // bf16 * quant_scale -> fp8
+        float const dequant_scale = amax * kInvFp8Max; // fp8 * dequant -> bf16
 
         if (lane == 0)
         {
@@ -630,27 +629,24 @@ __global__ __launch_bounds__(384, DSV3_FUSED_EXPERT_UP_LB_BLOCKS_PER_SM) void ds
         }
         asm volatile("cp.async.commit_group;\n" :::);
     }
-    // Wait for activation cp.async completion BEFORE we let any warp read
-    // smem_act_bf16. We move the wait+sync to the top so the per-128-col
-    // quant (running in parallel with top-K) sees the activation immediately.
-    asm volatile("cp.async.wait_all;\n" :::);
-    __syncthreads();
-
     // ===== Phase 1: noaux_tc score prep - every thread =====
-    // (Independent of activation; could be done in parallel with cp.async,
-    // but the sync at the top is needed anyway for activation visibility.)
+    // Independent of activation, so keep it overlapped with the activation
+    // cp.async flight issued above.
     {
         int const expert = tidx;
         bool const valid = expert < kNumExperts;
-        float const bias_val = valid ? __bfloat162float(bias[expert]) : kInvalidScore;
-        float const score = valid ? scores[static_cast<int64_t>(token) * kNumExperts + expert] : kInvalidScore;
-        float const score_sigmoid = sigmoid_accurate(score);
         if (valid)
         {
+            float const bias_val = __bfloat162float(bias[expert]);
+            float const score = scores[static_cast<int64_t>(token) * kNumExperts + expert];
+            float const score_sigmoid = sigmoid_accurate(score);
             smem_score_sigmoid[expert] = score_sigmoid;
             smem_score_bias[expert] = score_sigmoid + bias_val;
         }
     }
+    // Wait for activation cp.async completion before quant warps read
+    // smem_act_bf16. The CTA sync also publishes the score-prep writes.
+    asm volatile("cp.async.wait_all;\n" :::);
     __syncthreads();
 
     // ===== Phase 1+2 FUSED: top-K (warps 0..kNumExpertWarps-1)
@@ -821,66 +817,6 @@ __global__ __launch_bounds__(384, DSV3_FUSED_EXPERT_UP_LB_BLOCKS_PER_SM) void ds
             }
         }
 
-        // Per-K-iter, per-K-block scale load: 6 fp32 weight scales per K-iter.
-        // Also load the corresponding 6 per-128-col activation dequant scales
-        // (produced by the in-kernel 1x128 quant during Phase 1) so the
-        // compute_mma helper can fold both per-K-block.
-        float gate_block_scales[kWeightScaleKBlocksPerKIter];
-        float up_block_scales[kWeightScaleKBlocksPerKIter];
-        float act_block_scales[kWeightScaleKBlocksPerKIter];
-        if (is_gate_worker || is_up_worker)
-        {
-#pragma unroll
-            for (int kb = 0; kb < kWeightScaleKBlocksPerKIter; ++kb)
-            {
-                act_block_scales[kb] = smem_act_block_scales[k * kWeightScaleKBlocksPerKIter + kb];
-            }
-        }
-        else
-        {
-#pragma unroll
-            for (int kb = 0; kb < kWeightScaleKBlocksPerKIter; ++kb)
-            {
-                act_block_scales[kb] = 0.f;
-            }
-        }
-        if (is_gate_worker)
-        {
-            float const* const gate_block_scale_base = raw_scale_ptr<kInterPerTpParam, true>(
-                shared_gate_up_scale, routed_w3_w1_scale, my_expert, sub_row, k);
-#pragma unroll
-            for (int kb = 0; kb < kWeightScaleKBlocksPerKIter; ++kb)
-            {
-                gate_block_scales[kb] = __ldg(gate_block_scale_base + kb);
-            }
-        }
-        else
-        {
-#pragma unroll
-            for (int kb = 0; kb < kWeightScaleKBlocksPerKIter; ++kb)
-            {
-                gate_block_scales[kb] = 0.f;
-            }
-        }
-        if (is_up_worker)
-        {
-            float const* const up_block_scale_base = raw_scale_ptr<kInterPerTpParam, false>(
-                shared_gate_up_scale, routed_w3_w1_scale, my_expert, sub_row, k);
-#pragma unroll
-            for (int kb = 0; kb < kWeightScaleKBlocksPerKIter; ++kb)
-            {
-                up_block_scales[kb] = __ldg(up_block_scale_base + kb);
-            }
-        }
-        else
-        {
-#pragma unroll
-            for (int kb = 0; kb < kWeightScaleKBlocksPerKIter; ++kb)
-            {
-                up_block_scales[kb] = 0.f;
-            }
-        }
-
         if constexpr (kUsePackedWeights && !kDoubleBufferedWeights)
         {
             if constexpr (kUsePackedTmaWeights)
@@ -928,11 +864,38 @@ __global__ __launch_bounds__(384, DSV3_FUSED_EXPERT_UP_LB_BLOCKS_PER_SM) void ds
 
         if (is_gate_worker)
         {
+            // Per-K-iter, per-K-block scale load: 6 fp32 weight scales per K-iter.
+            // Also load the corresponding activation dequant scales produced by
+            // the in-kernel 1x128 quant during Phase 1.
+            float gate_block_scales[kWeightScaleKBlocksPerKIter];
+            float act_block_scales[kWeightScaleKBlocksPerKIter];
+            float const* const gate_block_scale_base = raw_scale_ptr<kInterPerTpParam, true>(
+                shared_gate_up_scale, routed_w3_w1_scale, my_expert, sub_row, k);
+#pragma unroll
+            for (int kb = 0; kb < kWeightScaleKBlocksPerKIter; ++kb)
+            {
+                float const gate_scale = lane == 0 ? __ldg(gate_block_scale_base + kb) : 0.f;
+                float const act_scale = lane == 0 ? smem_act_block_scales[k * kWeightScaleKBlocksPerKIter + kb] : 0.f;
+                gate_block_scales[kb] = __shfl_sync(0xffffffff, gate_scale, 0);
+                act_block_scales[kb] = __shfl_sync(0xffffffff, act_scale, 0);
+            }
             compute_mma_kiter_fused_expert_up(smem_gate_tiles + current_stage * kTileBytes, smem_act_fp8, k, my_m_gate,
                 lane, gate_block_scales, act_block_scales, d_gate);
         }
         if (is_up_worker)
         {
+            float up_block_scales[kWeightScaleKBlocksPerKIter];
+            float act_block_scales[kWeightScaleKBlocksPerKIter];
+            float const* const up_block_scale_base = raw_scale_ptr<kInterPerTpParam, false>(
+                shared_gate_up_scale, routed_w3_w1_scale, my_expert, sub_row, k);
+#pragma unroll
+            for (int kb = 0; kb < kWeightScaleKBlocksPerKIter; ++kb)
+            {
+                float const up_scale = lane == 0 ? __ldg(up_block_scale_base + kb) : 0.f;
+                float const act_scale = lane == 0 ? smem_act_block_scales[k * kWeightScaleKBlocksPerKIter + kb] : 0.f;
+                up_block_scales[kb] = __shfl_sync(0xffffffff, up_scale, 0);
+                act_block_scales[kb] = __shfl_sync(0xffffffff, act_scale, 0);
+            }
             compute_mma_kiter_fused_expert_up(smem_up_tiles + current_stage * kTileBytes, smem_act_fp8, k, my_m_up,
                 lane, up_block_scales, act_block_scales, d_up);
         }
@@ -988,22 +951,20 @@ __global__ __launch_bounds__(384, DSV3_FUSED_EXPERT_UP_LB_BLOCKS_PER_SM) void ds
     // inside one CTA; the reference uses 128-row blocks.
     if (expert_slot != 0)
     {
-        float const gate_abs = tidx < kCtaOutRows ? fabsf(smem_gate_acc[tidx]) : 0.f;
-        float const warp_amax = cg::reduce(warp, gate_abs, cg::greater<float>{});
-        if (lane == 0 && warp_idx < 2)
+        if (warp_idx == 0)
         {
-            smem_score_sigmoid[warp_idx] = warp_amax;
-        }
-        __syncthreads();
-        if (tidx == 0)
-        {
-            smem_score_sigmoid[0] = fmaxf(smem_score_sigmoid[0], smem_score_sigmoid[1]);
+            float const gate_abs = fmaxf(fabsf(smem_gate_acc[lane]), fabsf(smem_gate_acc[lane + kWarpSize]));
+            float const warp_amax = cg::reduce(warp, gate_abs, cg::greater<float>{});
+            if (lane == 0)
+            {
+                smem_score_sigmoid[0] = warp_amax;
+            }
         }
         __syncthreads();
         if (tidx < kCtaOutRows)
         {
             float const amax = smem_score_sigmoid[0];
-            float const dequant_scale = amax > 0.f ? (amax / kFp8Max) : 0.f;
+            float const dequant_scale = amax > 0.f ? (amax * kInvFp8Max) : 0.f;
             float const quant_scale = amax > 0.f ? (kFp8Max / amax) : 1.f;
             float const q = fmaxf(-kFp8Max, fminf(kFp8Max, smem_gate_acc[tidx] * quant_scale));
             smem_gate_acc[tidx] = static_cast<float>(__nv_fp8_e4m3(q)) * dequant_scale;
@@ -1307,7 +1268,15 @@ static std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> dsv3_fused_expert
 namespace dsv3_fused_expert
 {
 
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> dsv3_fused_expert_up_raw(torch::Tensor scores,
+#ifndef DSV3_FUSED_EXPERT_UP_RAW_NAME
+#define DSV3_FUSED_EXPERT_UP_RAW_NAME dsv3_fused_expert_up_raw
+#endif
+
+#ifndef DSV3_FUSED_EXPERT_UP_NAME
+#define DSV3_FUSED_EXPERT_UP_NAME dsv3_fused_expert_up
+#endif
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> DSV3_FUSED_EXPERT_UP_RAW_NAME(torch::Tensor scores,
     torch::Tensor hidden_in, torch::Tensor bias, torch::Tensor shared_gate_up_weight,
     torch::Tensor shared_gate_up_scale, torch::Tensor routed_w3_w1_weight, torch::Tensor routed_w3_w1_scale,
     double routed_scaling_factor)
@@ -1375,7 +1344,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> dsv3_fused_expert_up_raw
     }
 }
 
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> dsv3_fused_expert_up(torch::Tensor scores,
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> DSV3_FUSED_EXPERT_UP_NAME(torch::Tensor scores,
     torch::Tensor hidden_in, torch::Tensor bias, torch::Tensor shared_gate_up_weight,
     torch::Tensor shared_gate_up_scale, torch::Tensor routed_w3_w1_weight, torch::Tensor routed_w3_w1_scale,
     double routed_scaling_factor)
