@@ -126,7 +126,7 @@ mkdir -p "$RUN_DIR"
 LOG="${RUN_DIR}/test_dsv3_fused_expert_up_dev.log"
 
 if [ "$#" -eq 0 ]; then
-    PYTEST_ARGS=(-q tests/unittest/_torch/models/test_modeling_deepseekv3_fused_moe.py -s)
+    PYTEST_ARGS=(-q tests/unittest/_torch/models/test_modeling_deepseekv3_fused_moe.py -s -rs)
 else
     PYTEST_ARGS=("$@")
 fi
@@ -188,6 +188,16 @@ if [ "$TEST_STATUS" -ne 0 ]; then
     tail -120 "$LOG" >&2 || true
     echo "=================================================================" >&2
     exit "$TEST_STATUS"
+fi
+
+if grep -Eq "^[0-9]+ skipped" "$LOG" && ! grep -Eq "([0-9]+ failed|[0-9]+ passed)" "$LOG"; then
+    echo "" >&2
+    echo "=================================================================" >&2
+    echo "  pytest completed but all selected tests were skipped" >&2
+    echo "  Test log: $LOG" >&2
+    echo "  Re-run output includes skip reasons because the default pytest args now include -rs." >&2
+    echo "=================================================================" >&2
+    exit 2
 fi
 
 case "$(printf '%s' "$TEST_PHASE_VALUE" | tr '[:upper:]' '[:lower:]')" in
