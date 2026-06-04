@@ -1060,6 +1060,7 @@ class FusedMLA(nn.Module):
             )
 
         assert output is not None, "output must be provided"
+        sm_version = get_sm_version()
 
         if num_contexts > 0:
             q_ctx = q[:num_ctx_tokens, ...]
@@ -1070,16 +1071,41 @@ class FusedMLA(nn.Module):
                 assert position_ids is not None
                 k_pe_ctx = self.apply_rope(q_ctx, k_pe_ctx, position_ids)
 
-            self.forward_context_sparse_mla(
-                q_ctx,
-                compressed_kv_ctx,
-                k_pe_ctx,
-                attn_metadata,
-                output[:num_ctx_tokens, :],
-                latent_cache_ctx,
-                topk_indices=topk_indices[:num_ctx_tokens, :] if topk_indices is not None else None,
-                position_ids=position_ids,
+            context_output = output[:num_ctx_tokens, :]
+            topk_indices_ctx = (
+                topk_indices[:num_ctx_tokens, :] if topk_indices is not None else None
             )
+            if use_short_mha_for_ctx:
+                assert position_ids is not None
+                self.forward_context(
+                    q_ctx,
+                    compressed_kv_ctx,
+                    k_pe_ctx,
+                    position_ids,
+                    attn_metadata,
+                    context_output,
+                    latent_cache_ctx,
+                )
+            elif sm_version >= 100:
+                self.forward_absorption_context(
+                    q_ctx,
+                    compressed_kv_ctx,
+                    k_pe_ctx,
+                    attn_metadata,
+                    context_output,
+                    position_ids=position_ids,
+                    latent_cache=latent_cache_ctx,
+                    topk_indices=topk_indices_ctx,
+                )
+            else:
+                self.forward_sparse_mla_kvcache_bf16(
+                    q_ctx,
+                    latent_cache_ctx,
+                    attn_metadata,
+                    context_output,
+                    topk_indices_ctx,
+                    is_generation=False,
+                )
 
         if num_generations > 0:
             q_gen = q[num_ctx_tokens:, ...]
@@ -1090,15 +1116,27 @@ class FusedMLA(nn.Module):
                 assert position_ids is not None
                 k_pe_gen = self.apply_rope(q_gen, k_pe_gen, position_ids)
 
-            self.forward_generation_sparse_mla(
-                q_gen,
-                compressed_kv_gen,
-                k_pe_gen,
-                attn_metadata,
-                output[num_ctx_tokens:num_tokens, :],
-                latent_cache=latent_cache_gen,
-                topk_indices=topk_indices[num_ctx_tokens:num_tokens, :],
-            )
+            generation_output = output[num_ctx_tokens:num_tokens, :]
+            topk_indices_gen = topk_indices[num_ctx_tokens:num_tokens, :]
+            if sm_version >= 100:
+                self.forward_absorption_generation(
+                    q_gen,
+                    compressed_kv_gen,
+                    k_pe_gen,
+                    attn_metadata,
+                    generation_output,
+                    latent_cache=latent_cache_gen,
+                    topk_indices=topk_indices_gen,
+                )
+            else:
+                self.forward_sparse_mla_kvcache_bf16(
+                    q_gen,
+                    latent_cache_gen,
+                    attn_metadata,
+                    generation_output,
+                    topk_indices_gen,
+                    is_generation=True,
+                )
 
     def forward_context_default(
         self,
@@ -2043,21 +2081,25 @@ class FusedMLA(nn.Module):
         all_reduce_params: Optional[AllReduceParams] = None,
         # latent_cache_gen: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        attn_output = self.create_output(hidden_states, attn_metadata.num_contexts)
+        attn_output = hidden_states.new_empty(
+            [hidden_states.shape[0], self.o_proj.in_features], dtype=hidden_states.dtype
+        )
         assert self.register_to_config
-        proj_outputs = torch.ops.trtllm.fused_mla_dsa_proj(
-            hidden_states, position_ids, self.layer_idx_str
+        proj_outputs = self.forward_dsa_proj(
+            position_ids,
+            hidden_states,
+            attn_metadata,
         )
         q, compressed_kv, k_pe, latent_cache = proj_outputs[:4]
         indexer_intermediates = proj_outputs[4:]
-        torch.ops.trtllm.fused_mla_dsa_attn_inplace(
+        self.forward_dsa_attn(
             q,
             compressed_kv,
             k_pe,
             latent_cache,
             indexer_intermediates,
             position_ids,
-            self.layer_idx_str,
+            attn_metadata,
             attn_output,
         )
         attn_output = self.o_proj(
