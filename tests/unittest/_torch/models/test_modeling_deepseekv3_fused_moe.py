@@ -30,8 +30,7 @@ from tensorrt_llm._torch.models.modeling_deepseekv3_fused_moe import (
     check_data,
     prepack_fused_expert_down_routed_w2_weight,
     prepack_fused_expert_down_shared_down_weight,
-    prepack_fused_expert_up_routed_w3_w1_weight,
-    prepack_fused_expert_up_shared_gate_up_weight,
+    prepack_fused_expert_up_expert_gate_up_weight,
 )
 from tensorrt_llm._torch.models.modeling_deepseekv3_moe import Deepseekv3MoE
 from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
@@ -513,19 +512,37 @@ def _load_inputs(
     return tensors
 
 
+def _prepack_fused_expert_up_unified_scale(
+    shared_gate_up_scale: torch.Tensor, routed_w3_w1_scale: torch.Tensor
+) -> torch.Tensor:
+    scale_m_blocks = shared_gate_up_scale.shape[0] // 2
+    unified = torch.empty(
+        (routed_w3_w1_scale.shape[0] + 1, *shared_gate_up_scale.shape),
+        device=shared_gate_up_scale.device,
+        dtype=shared_gate_up_scale.dtype,
+    )
+    unified[0].copy_(shared_gate_up_scale)
+    unified[1:, :scale_m_blocks].copy_(routed_w3_w1_scale[:, scale_m_blocks:])
+    unified[1:, scale_m_blocks:].copy_(routed_w3_w1_scale[:, :scale_m_blocks])
+    return unified
+
+
 def _ensure_fused_expert_up_prepacked_tensors(tensors: dict[str, torch.Tensor]) -> None:
-    if "shared_gate_up_weight_packed_fused_expert_up" in tensors:
+    if "expert_gate_up_weight_packed_fused_expert_up" in tensors:
         return
 
-    # shared_gate_up_weight_packed_fused_expert_up:
-    # torch.float8_e4m3fn, [2, I / 64, 8, 49152], stored as [gate, up].
-    tensors["shared_gate_up_weight_packed_fused_expert_up"] = (
-        prepack_fused_expert_up_shared_gate_up_weight(tensors["shared_gate_up_weight_org"])
+    # expert_gate_up_weight_packed_fused_expert_up:
+    # torch.float8_e4m3fn, [E + 1, I / 64, 8, 98304], expert 0 is shared,
+    # routed experts start at 1, and each physical 16-row tile is [8 gate, 8 up].
+    tensors["expert_gate_up_weight_packed_fused_expert_up"] = (
+        prepack_fused_expert_up_expert_gate_up_weight(
+            tensors["shared_gate_up_weight_org"], tensors["routed_w3_w1_weight"]
+        )
     )
-    # routed_w3_w1_weight_packed_fused_expert_up:
-    # torch.float8_e4m3fn, [E, 2, I / 64, 8, 49152], stored as [gate, up].
-    tensors["routed_w3_w1_weight_packed_fused_expert_up"] = (
-        prepack_fused_expert_up_routed_w3_w1_weight(tensors["routed_w3_w1_weight"])
+    # expert_gate_up_scale:
+    # torch.float32, [E + 1, 2 * I / 128, 48], stored as [gate, up].
+    tensors["expert_gate_up_scale"] = _prepack_fused_expert_up_unified_scale(
+        tensors["shared_gate_up_weight_scale_org"], tensors["routed_w3_w1_weight_scale"]
     )
     torch.cuda.synchronize()
 
@@ -1041,10 +1058,8 @@ def _run_fused_kernel(
         router_logits.contiguous(),
         tensors["hidden_states"].contiguous(),
         tensors["routing_bias"].contiguous(),
-        tensors["shared_gate_up_weight_packed_fused_expert_up"],
-        tensors["shared_gate_up_weight_scale_org"],
-        tensors["routed_w3_w1_weight_packed_fused_expert_up"],
-        tensors["routed_w3_w1_weight_scale"],
+        tensors["expert_gate_up_weight_packed_fused_expert_up"],
+        tensors["expert_gate_up_scale"],
         _routed_scaling_factor(),
     )
     if fused_expert_up_end_event is not None:

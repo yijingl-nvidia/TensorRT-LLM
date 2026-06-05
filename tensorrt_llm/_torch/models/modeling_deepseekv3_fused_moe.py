@@ -36,6 +36,8 @@ _FUSED_EXPERT_UP_COL_HALVES_PER_K_SUB = 2
 _FUSED_EXPERT_UP_COL_QUADS_PER_HALF = 4
 _FUSED_EXPERT_UP_BYTES_PER_COL_QUAD = 4
 _FUSED_EXPERT_UP_TILE_BYTES = 49152
+_FUSED_EXPERT_UP_COMBINED_M_TILES_PER_CTA = 8
+_FUSED_EXPERT_UP_COMBINED_TILE_BYTES = 2 * _FUSED_EXPERT_UP_TILE_BYTES
 _FUSED_EXPERT_DOWN_HIDDEN_SIZE = 6144
 _FUSED_EXPERT_DOWN_NUM_CTAS = 148
 _FUSED_EXPERT_DOWN_ROWS_PER_CTA = 42
@@ -210,6 +212,108 @@ def prepack_fused_expert_up_routed_w3_w1_weight_pytorch(weight: torch.Tensor) ->
     return packed
 
 
+def _interleave_packed_fused_expert_up_gate_up(
+    gate_packed: torch.Tensor, up_packed: torch.Tensor
+) -> torch.Tensor:
+    if gate_packed.shape != up_packed.shape:
+        raise ValueError(
+            f"gate/up packed shapes must match, got {gate_packed.shape} and {up_packed.shape}"
+        )
+    if gate_packed.shape[-1] != _FUSED_EXPERT_UP_TILE_BYTES:
+        raise ValueError(
+            f"fused expert up interleave expects side tile bytes {_FUSED_EXPERT_UP_TILE_BYTES}, "
+            f"got {gate_packed.shape[-1]}"
+        )
+
+    prefix_shape = tuple(gate_packed.shape[:-3])
+    sub_rows = gate_packed.shape[-3]
+    num_k_iter = gate_packed.shape[-2]
+    if num_k_iter != _FUSED_EXPERT_UP_NUM_K_ITER:
+        raise ValueError(
+            f"fused expert up interleave expects {_FUSED_EXPERT_UP_NUM_K_ITER} K iters, got {num_k_iter}"
+        )
+
+    side_view_shape = (
+        *prefix_shape,
+        sub_rows,
+        num_k_iter,
+        _FUSED_EXPERT_UP_K_THIRDS_PER_ITER,
+        _FUSED_EXPERT_UP_M_TILES_PER_CTA,
+        _FUSED_EXPERT_UP_K_SUBS_PER_THIRD,
+        _FUSED_EXPERT_UP_ROWS_PER_HALF,
+        _FUSED_EXPERT_UP_COL_QUADS_PER_HALF,
+        _FUSED_EXPERT_UP_COL_HALVES_PER_K_SUB,
+        _FUSED_EXPERT_UP_ROW_HALVES_PER_M_TILE,
+        _FUSED_EXPERT_UP_BYTES_PER_COL_QUAD,
+    )
+    combined = torch.empty(
+        (*prefix_shape, sub_rows, num_k_iter, _FUSED_EXPERT_UP_COMBINED_TILE_BYTES),
+        device=gate_packed.device,
+        dtype=gate_packed.dtype,
+    )
+    combined_view = combined.reshape(
+        *prefix_shape,
+        sub_rows,
+        num_k_iter,
+        _FUSED_EXPERT_UP_K_THIRDS_PER_ITER,
+        _FUSED_EXPERT_UP_COMBINED_M_TILES_PER_CTA,
+        _FUSED_EXPERT_UP_K_SUBS_PER_THIRD,
+        _FUSED_EXPERT_UP_ROWS_PER_HALF,
+        _FUSED_EXPERT_UP_COL_QUADS_PER_HALF,
+        _FUSED_EXPERT_UP_COL_HALVES_PER_K_SUB,
+        _FUSED_EXPERT_UP_ROW_HALVES_PER_M_TILE,
+        _FUSED_EXPERT_UP_BYTES_PER_COL_QUAD,
+    )
+    gate_view = gate_packed.reshape(side_view_shape)
+    up_view = up_packed.reshape(side_view_shape)
+
+    for worker_m in range(_FUSED_EXPERT_UP_COMBINED_M_TILES_PER_CTA):
+        old_m = worker_m // _FUSED_EXPERT_UP_ROW_HALVES_PER_M_TILE
+        old_row_half = worker_m % _FUSED_EXPERT_UP_ROW_HALVES_PER_M_TILE
+        combined_view[..., :, worker_m, :, :, :, :, 0, :].copy_(
+            gate_view[..., :, old_m, :, :, :, :, old_row_half, :]
+        )
+        combined_view[..., :, worker_m, :, :, :, :, 1, :].copy_(
+            up_view[..., :, old_m, :, :, :, :, old_row_half, :]
+        )
+
+    return combined
+
+
+def prepack_fused_expert_up_expert_gate_up_weight_pytorch(
+    shared_gate_up_weight: torch.Tensor, routed_w3_w1_weight: torch.Tensor
+) -> torch.Tensor:
+    shared_packed = prepack_fused_expert_up_shared_gate_up_weight_pytorch(shared_gate_up_weight)
+    routed_packed = prepack_fused_expert_up_routed_w3_w1_weight_pytorch(routed_w3_w1_weight)
+    shared_combined = _interleave_packed_fused_expert_up_gate_up(shared_packed[0], shared_packed[1])
+    routed_combined = _interleave_packed_fused_expert_up_gate_up(
+        routed_packed[:, 0], routed_packed[:, 1]
+    )
+    packed = torch.empty(
+        (routed_combined.shape[0] + 1, *shared_combined.shape),
+        device=shared_combined.device,
+        dtype=shared_combined.dtype,
+    )
+    packed[0].copy_(shared_combined)
+    packed[1:].copy_(routed_combined)
+    return packed
+
+
+def prepack_fused_expert_up_expert_gate_up_scale(
+    shared_gate_up_scale: torch.Tensor, routed_w3_w1_scale: torch.Tensor
+) -> torch.Tensor:
+    scale_m_blocks = shared_gate_up_scale.shape[0] // 2
+    packed = torch.empty(
+        (routed_w3_w1_scale.shape[0] + 1, *shared_gate_up_scale.shape),
+        device=shared_gate_up_scale.device,
+        dtype=shared_gate_up_scale.dtype,
+    )
+    packed[0].copy_(shared_gate_up_scale)
+    packed[1:, :scale_m_blocks].copy_(routed_w3_w1_scale[:, scale_m_blocks:])
+    packed[1:, scale_m_blocks:].copy_(routed_w3_w1_scale[:, :scale_m_blocks])
+    return packed
+
+
 def _should_use_cute_fused_expert_up_weight_pack(weight: torch.Tensor) -> bool:
     return weight.is_cuda and torch.cuda.is_available()
 
@@ -240,6 +344,27 @@ def prepack_fused_expert_up_routed_w3_w1_weight(weight: torch.Tensor) -> torch.T
         except ImportError:
             pass
     return prepack_fused_expert_up_routed_w3_w1_weight_pytorch(weight)
+
+
+def prepack_fused_expert_up_expert_gate_up_weight(
+    shared_gate_up_weight: torch.Tensor, routed_w3_w1_weight: torch.Tensor
+) -> torch.Tensor:
+    if _should_use_cute_fused_expert_up_weight_pack(shared_gate_up_weight):
+        try:
+            from tensorrt_llm._torch.cute_dsl_kernels.blackwell import (
+                deepseekv3_fused_moe_weight_pack,
+            )
+
+            return deepseekv3_fused_moe_weight_pack.pack_fused_expert_up_expert_gate_up_weight(
+                shared_gate_up_weight, routed_w3_w1_weight
+            )
+        except ImportError:
+            pass
+        except AttributeError:
+            pass
+    return prepack_fused_expert_up_expert_gate_up_weight_pytorch(
+        shared_gate_up_weight, routed_w3_w1_weight
+    )
 
 
 def _fused_expert_down_packed_indices(
@@ -796,20 +921,18 @@ class Deepseekv3FusedMoE(nn.Module):
         self._set_nonpersistent_buffer(self, "router_weight", router_weight)
         self._set_nonpersistent_buffer(self, "routing_bias", routing_bias)
         self._set_nonpersistent_buffer(
-            self, "shared_gate_up_weight_scale_org", shared_gate_up_weight_scale
+            self,
+            "expert_gate_up_weight_packed_fused_expert_up",
+            prepack_fused_expert_up_expert_gate_up_weight(
+                shared_gate_up_weight, routed_w3_w1_weight
+            ),
         )
         self._set_nonpersistent_buffer(
             self,
-            "shared_gate_up_weight_packed_fused_expert_up",
-            prepack_fused_expert_up_shared_gate_up_weight(shared_gate_up_weight),
-        )
-        self._set_nonpersistent_buffer(
-            self, "routed_w3_w1_weight_scaling_factor", routed_w3_w1_weight_scale
-        )
-        self._set_nonpersistent_buffer(
-            self,
-            "routed_w3_w1_weight_packed_fused_expert_up",
-            prepack_fused_expert_up_routed_w3_w1_weight(routed_w3_w1_weight),
+            "expert_gate_up_scale",
+            prepack_fused_expert_up_expert_gate_up_scale(
+                shared_gate_up_weight_scale, routed_w3_w1_weight_scale
+            ),
         )
         self._set_nonpersistent_buffer(
             self, "routed_w2_weight_scaling_factor", routed_w2_weight_scale
@@ -840,10 +963,8 @@ class Deepseekv3FusedMoE(nn.Module):
         hidden_states: torch.Tensor,
         router_weight: torch.Tensor,
         routing_bias: torch.Tensor,
-        shared_gate_up_weight_packed_fused_expert_up: torch.Tensor,
-        shared_gate_up_weight_scale_org: torch.Tensor,
-        routed_w3_w1_weight_packed_fused_expert_up: torch.Tensor,
-        routed_w3_w1_weight_scale: torch.Tensor,
+        expert_gate_up_weight_packed_fused_expert_up: torch.Tensor,
+        expert_gate_up_scale: torch.Tensor,
         top_k: int,
         n_group: int,
         topk_group: int,
@@ -871,10 +992,8 @@ class Deepseekv3FusedMoE(nn.Module):
             router_logits.contiguous(),
             hidden_states.contiguous(),
             routing_bias.contiguous(),
-            shared_gate_up_weight_packed_fused_expert_up,
-            shared_gate_up_weight_scale_org,
-            routed_w3_w1_weight_packed_fused_expert_up,
-            routed_w3_w1_weight_scale,
+            expert_gate_up_weight_packed_fused_expert_up,
+            expert_gate_up_scale,
             routed_scaling_factor,
         )
         check_data(
@@ -964,12 +1083,10 @@ class Deepseekv3FusedMoE(nn.Module):
 
         router_weight = self.router_weight
         routing_bias = self.routing_bias
-        shared_gate_up_weight_packed_fused_expert_up = (
-            self.shared_gate_up_weight_packed_fused_expert_up
+        expert_gate_up_weight_packed_fused_expert_up = (
+            self.expert_gate_up_weight_packed_fused_expert_up
         )
-        shared_gate_up_weight_scale_org = self.shared_gate_up_weight_scale_org
-        routed_w3_w1_weight_packed_fused_expert_up = self.routed_w3_w1_weight_packed_fused_expert_up
-        routed_w3_w1_weight_scale = self.routed_w3_w1_weight_scaling_factor
+        expert_gate_up_scale = self.expert_gate_up_scale
         routed_w2_weight_scale = self.routed_w2_weight_scaling_factor
         shared_down_weight_scale_org = self.shared_down_weight_scale_org
         routed_w2_weight_for_fused_expert_down = getattr(
@@ -996,40 +1113,22 @@ class Deepseekv3FusedMoE(nn.Module):
             (num_router_experts,),
         )
         check_data(
-            shared_gate_up_weight_packed_fused_expert_up,
-            "dsv3_fused_expert_up.shared_gate_up_weight_packed",
+            expert_gate_up_weight_packed_fused_expert_up,
+            "dsv3_fused_expert_up.expert_gate_up_weight_packed",
             torch.float8_e4m3fn,
             (
-                2,
+                num_router_experts + 1,
                 expert_intermediate_size // _FUSED_EXPERT_UP_CTA_OUT_ROWS,
                 _FUSED_EXPERT_UP_NUM_K_ITER,
-                _FUSED_EXPERT_UP_TILE_BYTES,
+                _FUSED_EXPERT_UP_COMBINED_TILE_BYTES,
             ),
         )
         check_data(
-            shared_gate_up_weight_scale_org,
-            "dsv3_fused_expert_up.shared_gate_up_weight_scale",
-            torch.float32,
-            (2 * block_scale_fp32_expert_intermediate_size, block_scale_fp32_hidden_size),
-        )
-        check_data(
-            routed_w3_w1_weight_packed_fused_expert_up,
-            "dsv3_fused_expert_up.routed_w3_w1_weight_packed",
-            torch.float8_e4m3fn,
-            (
-                num_router_experts,
-                2,
-                expert_intermediate_size // _FUSED_EXPERT_UP_CTA_OUT_ROWS,
-                _FUSED_EXPERT_UP_NUM_K_ITER,
-                _FUSED_EXPERT_UP_TILE_BYTES,
-            ),
-        )
-        check_data(
-            routed_w3_w1_weight_scale,
-            "dsv3_fused_expert_up.routed_w3_w1_weight_scale",
+            expert_gate_up_scale,
+            "dsv3_fused_expert_up.expert_gate_up_scale",
             torch.float32,
             (
-                num_router_experts,
+                num_router_experts + 1,
                 2 * block_scale_fp32_expert_intermediate_size,
                 block_scale_fp32_hidden_size,
             ),
@@ -1092,10 +1191,8 @@ class Deepseekv3FusedMoE(nn.Module):
             hidden_states,
             router_weight,
             routing_bias,
-            shared_gate_up_weight_packed_fused_expert_up,
-            shared_gate_up_weight_scale_org,
-            routed_w3_w1_weight_packed_fused_expert_up,
-            routed_w3_w1_weight_scale,
+            expert_gate_up_weight_packed_fused_expert_up,
+            expert_gate_up_scale,
             self.top_k,
             self.n_group,
             self.topk_group,

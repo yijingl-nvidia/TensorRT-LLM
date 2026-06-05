@@ -32,6 +32,7 @@ _FUSED_EXPERT_UP_HIDDEN_SIZE = 6144
 _FUSED_EXPERT_UP_CTA_OUT_ROWS = 64
 _FUSED_EXPERT_UP_NUM_K_ITER = 8
 _FUSED_EXPERT_UP_TILE_BYTES = 49152
+_FUSED_EXPERT_UP_COMBINED_TILE_BYTES = 2 * _FUSED_EXPERT_UP_TILE_BYTES
 _FUSED_EXPERT_UP_NUM_THREADS = 256
 
 _pack_compile_cache: dict[tuple[object, ...], object] = {}
@@ -181,6 +182,70 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 stream=stream,
             )
 
+    class _PackFusedExpertUpExpertGateUpKernel:
+        def __init__(self, num_experts: int, inter_per_tp: int):
+            self.num_experts = num_experts
+            self.inter_per_tp = inter_per_tp
+            self.sub_rows = inter_per_tp // _FUSED_EXPERT_UP_CTA_OUT_ROWS
+
+        @cute.kernel
+        def pack_kernel(
+            self, shared_raw: cute.Tensor, routed_raw: cute.Tensor, packed: cute.Tensor
+        ):
+            tidx, _, _ = cute.arch.thread_idx()
+            tile_idx, _, _ = cute.arch.block_idx()
+
+            k_iter = tile_idx % _FUSED_EXPERT_UP_NUM_K_ITER
+            sub_row = (tile_idx // _FUSED_EXPERT_UP_NUM_K_ITER) % self.sub_rows
+            expert_slot = tile_idx // (self.sub_rows * _FUSED_EXPERT_UP_NUM_K_ITER)
+
+            for elem in range(
+                tidx, _FUSED_EXPERT_UP_COMBINED_TILE_BYTES, _FUSED_EXPERT_UP_NUM_THREADS
+            ):
+                byte = elem % 4
+                side = (elem // 4) % 2
+                col_half = (elem // 8) % 2
+                col_quad = (elem // 16) % 4
+                row = (elem // 64) % 8
+                k_sub = (elem // 512) % 4
+                m_tile = (elem // 2048) % 8
+                k_third = elem // 16384
+
+                src_row_in_side = sub_row * 64 + m_tile * 8 + row
+                src_col = (
+                    k_iter * 768 + k_third * 128 + k_sub * 32 + col_half * 16 + col_quad * 4 + byte
+                )
+                dst_offset = tile_idx * _FUSED_EXPERT_UP_COMBINED_TILE_BYTES + elem
+                if expert_slot == 0:
+                    src_offset = (
+                        side * self.inter_per_tp + src_row_in_side
+                    ) * _FUSED_EXPERT_UP_HIDDEN_SIZE + src_col
+                    packed[dst_offset] = shared_raw[src_offset]
+                else:
+                    raw_expert_idx = expert_slot - 1
+                    raw_side = 1 - side
+                    src_offset = (
+                        raw_expert_idx * 2 * self.inter_per_tp * _FUSED_EXPERT_UP_HIDDEN_SIZE
+                        + (raw_side * self.inter_per_tp + src_row_in_side)
+                        * _FUSED_EXPERT_UP_HIDDEN_SIZE
+                        + src_col
+                    )
+                    packed[dst_offset] = routed_raw[src_offset]
+
+        @cute.jit
+        def __call__(
+            self,
+            shared_raw: cute.Tensor,
+            routed_raw: cute.Tensor,
+            packed: cute.Tensor,
+            stream: cuda.CUstream,
+        ):
+            self.pack_kernel(shared_raw, routed_raw, packed).launch(
+                grid=((self.num_experts + 1) * self.sub_rows * _FUSED_EXPERT_UP_NUM_K_ITER, 1, 1),
+                block=(_FUSED_EXPERT_UP_NUM_THREADS, 1, 1),
+                stream=stream,
+            )
+
 
 def _to_cute_tensor(tensor: torch.Tensor):
     return from_dlpack(_CUDAGraphCompatibleWrapper(tensor.detach()), assumed_align=16)
@@ -204,6 +269,23 @@ def _compile_pack_kernel(kind: str, raw_cute, packed_cute, *shape_key: int):
     return compiled
 
 
+def _compile_expert_gate_up_pack_kernel(
+    shared_raw_cute, routed_raw_cute, packed_cute, num_experts: int, inter_per_tp: int
+):
+    compile_key = ("expert_gate_up", num_experts, inter_per_tp)
+    compiled = _pack_compile_cache.get(compile_key)
+    if compiled is None:
+        kernel = _PackFusedExpertUpExpertGateUpKernel(
+            num_experts=num_experts, inter_per_tp=inter_per_tp
+        )
+        current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+        compiled = cute.compile(
+            kernel, shared_raw_cute, routed_raw_cute, packed_cute, current_stream
+        )
+        _pack_compile_cache[compile_key] = compiled
+    return compiled
+
+
 def _run_pack_kernel(
     kind: str, raw_flat: torch.Tensor, packed_flat: torch.Tensor, *shape_key: int
 ) -> None:
@@ -212,6 +294,23 @@ def _run_pack_kernel(
     packed_cute = _to_cute_tensor(packed_flat)
     compiled = _compile_pack_kernel(kind, raw_cute, packed_cute, *shape_key)
     compiled(raw_cute, packed_cute, current_stream)
+
+
+def _run_expert_gate_up_pack_kernel(
+    shared_raw_flat: torch.Tensor,
+    routed_raw_flat: torch.Tensor,
+    packed_flat: torch.Tensor,
+    num_experts: int,
+    inter_per_tp: int,
+) -> None:
+    current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    shared_raw_cute = _to_cute_tensor(shared_raw_flat)
+    routed_raw_cute = _to_cute_tensor(routed_raw_flat)
+    packed_cute = _to_cute_tensor(packed_flat)
+    compiled = _compile_expert_gate_up_pack_kernel(
+        shared_raw_cute, routed_raw_cute, packed_cute, num_experts, inter_per_tp
+    )
+    compiled(shared_raw_cute, routed_raw_cute, packed_cute, current_stream)
 
 
 def precompile_fused_expert_up_weight_pack_kernels(
@@ -234,9 +333,45 @@ def precompile_fused_expert_up_weight_pack_kernels(
         )
     if routed_num_experts <= 0:
         raise ValueError(f"routed_num_experts must be positive, got {routed_num_experts}")
+    if shared_inter_per_tp != routed_inter_per_tp:
+        raise ValueError(
+            "unified fused expert up pack expects matching shared and routed I, got "
+            f"{shared_inter_per_tp} and {routed_inter_per_tp}"
+        )
 
     if device is None:
         device = torch.device("cuda", torch.cuda.current_device())
+    unified_key = ("expert_gate_up", routed_num_experts, routed_inter_per_tp)
+    if unified_key not in _pack_compile_cache:
+        sub_rows = routed_inter_per_tp // _FUSED_EXPERT_UP_CTA_OUT_ROWS
+        shared_raw = torch.empty(
+            (2 * shared_inter_per_tp * _FUSED_EXPERT_UP_HIDDEN_SIZE,),
+            device=device,
+            dtype=torch.float8_e4m3fn,
+        )
+        routed_raw = torch.empty(
+            (routed_num_experts * 2 * routed_inter_per_tp * _FUSED_EXPERT_UP_HIDDEN_SIZE,),
+            device=device,
+            dtype=torch.float8_e4m3fn,
+        )
+        packed = torch.empty(
+            (
+                (routed_num_experts + 1)
+                * sub_rows
+                * _FUSED_EXPERT_UP_NUM_K_ITER
+                * _FUSED_EXPERT_UP_COMBINED_TILE_BYTES,
+            ),
+            device=device,
+            dtype=torch.float8_e4m3fn,
+        )
+        _compile_expert_gate_up_pack_kernel(
+            _to_cute_tensor(shared_raw),
+            _to_cute_tensor(routed_raw),
+            _to_cute_tensor(packed),
+            routed_num_experts,
+            routed_inter_per_tp,
+        )
+
     shared_key = ("shared", shared_inter_per_tp)
     if shared_key not in _pack_compile_cache:
         shared_sub_rows = shared_inter_per_tp // _FUSED_EXPERT_UP_CTA_OUT_ROWS
@@ -316,4 +451,41 @@ def pack_fused_expert_up_routed_w3_w1_weight(weight: torch.Tensor) -> torch.Tens
         dtype=weight.dtype,
     )
     _run_pack_kernel("routed", weight.reshape(-1), packed.reshape(-1), num_experts, inter_per_tp)
+    return packed
+
+
+def pack_fused_expert_up_expert_gate_up_weight(
+    shared_gate_up_weight: torch.Tensor, routed_w3_w1_weight: torch.Tensor
+) -> torch.Tensor:
+    if not IS_CUTLASS_DSL_AVAILABLE:
+        raise ImportError("CUTLASS DSL is not available")
+    if not shared_gate_up_weight.is_cuda or not routed_w3_w1_weight.is_cuda:
+        raise ValueError("CuTe DSL fused expert up pack expects CUDA tensors")
+    shared_inter_per_tp = _validate_shared_gate_up_weight(shared_gate_up_weight)
+    num_experts, routed_inter_per_tp = _validate_routed_w3_w1_weight(routed_w3_w1_weight)
+    if shared_inter_per_tp != routed_inter_per_tp:
+        raise ValueError(
+            "unified fused expert up pack expects matching shared and routed I, got "
+            f"{shared_inter_per_tp} and {routed_inter_per_tp}"
+        )
+    shared_gate_up_weight = shared_gate_up_weight.contiguous()
+    routed_w3_w1_weight = routed_w3_w1_weight.contiguous()
+    sub_rows = shared_inter_per_tp // _FUSED_EXPERT_UP_CTA_OUT_ROWS
+    packed = torch.empty(
+        (
+            num_experts + 1,
+            sub_rows,
+            _FUSED_EXPERT_UP_NUM_K_ITER,
+            _FUSED_EXPERT_UP_COMBINED_TILE_BYTES,
+        ),
+        device=shared_gate_up_weight.device,
+        dtype=shared_gate_up_weight.dtype,
+    )
+    _run_expert_gate_up_pack_kernel(
+        shared_gate_up_weight.reshape(-1),
+        routed_w3_w1_weight.reshape(-1),
+        packed.reshape(-1),
+        num_experts,
+        shared_inter_per_tp,
+    )
     return packed

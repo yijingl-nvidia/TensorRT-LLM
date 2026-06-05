@@ -215,10 +215,8 @@ def _run_fused_expert_up_outputs(
             tensors["hidden_states"],
             tensors["router_weight"],
             tensors["routing_bias"],
-            tensors["shared_gate_up_weight_packed_fused_expert_up"],
-            tensors["shared_gate_up_weight_scale_org"],
-            tensors["routed_w3_w1_weight_packed_fused_expert_up"],
-            tensors["routed_w3_w1_weight_scale"],
+            tensors["expert_gate_up_weight_packed_fused_expert_up"],
+            tensors["expert_gate_up_scale"],
             helpers._top_k(),
             helpers._n_group(),
             helpers._topk_group(),
@@ -382,23 +380,13 @@ def _build_fused_moe_module(
     fused_moe._set_nonpersistent_buffer(fused_moe, "routing_bias", tensors["routing_bias"])
     fused_moe._set_nonpersistent_buffer(
         fused_moe,
-        "shared_gate_up_weight_scale_org",
-        tensors["shared_gate_up_weight_scale_org"],
+        "expert_gate_up_weight_packed_fused_expert_up",
+        tensors["expert_gate_up_weight_packed_fused_expert_up"],
     )
     fused_moe._set_nonpersistent_buffer(
         fused_moe,
-        "shared_gate_up_weight_packed_fused_expert_up",
-        tensors["shared_gate_up_weight_packed_fused_expert_up"],
-    )
-    fused_moe._set_nonpersistent_buffer(
-        fused_moe,
-        "routed_w3_w1_weight_scaling_factor",
-        tensors["routed_w3_w1_weight_scale"],
-    )
-    fused_moe._set_nonpersistent_buffer(
-        fused_moe,
-        "routed_w3_w1_weight_packed_fused_expert_up",
-        tensors["routed_w3_w1_weight_packed_fused_expert_up"],
+        "expert_gate_up_scale",
+        tensors["expert_gate_up_scale"],
     )
     fused_moe._set_nonpersistent_buffer(
         fused_moe,

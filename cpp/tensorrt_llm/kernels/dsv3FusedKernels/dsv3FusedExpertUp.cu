@@ -122,10 +122,9 @@ constexpr int kKSubsPerIter = kKTile / 32;  // 24
 constexpr int kWeightScaleKBlocks = 48; // original 128-col K-blocks (kHidden / 128)
 constexpr int kWeightScaleKBlocksPerKIter = kWeightScaleKBlocks / kNumKIter; // 6
 
-constexpr int kGateWorkerWarpBase = 4;
-constexpr int kUpWorkerWarpBase = 8;
-constexpr int kNumGateWorkers = 4;
-constexpr int kNumUpWorkers = 4;
+constexpr int kWorkerWarpBase = 4;
+constexpr int kNumWorkers = 8;
+constexpr int kRowsPerWorker = 8;
 
 constexpr int kTileBytes = kCtaOutRows * kKTile; // 49152 (48 KiB)
 
@@ -148,16 +147,22 @@ constexpr int kActCpAsyncsPerThread = kActCpAsyncs / kThreadsPerCta; // 2
 // K-major slab offset constants. The packed tile stacks 6 sub-slabs along Z
 // (k_sixth axis) so each box load stays within the TMA SWIZZLE_NONE 256-byte
 // inner-dim cap.
-constexpr int kLaneBytes = 16;                                       // 16 B per lane
-constexpr int kKsubBytes = kWarpSize * kLaneBytes;                   // 512 B per K-sub
-constexpr int kKSubsPerThird = 4;                                    // 4 k_subs per k_sixth
-constexpr int kMtileSubslabBytes = kKSubsPerThird * kKsubBytes;      // 2048 B per m_tile within a k_sixth
-constexpr int kSubslabBytes = kCtaOutRows / 16 * kMtileSubslabBytes; // 4 * 2048 = 8192 B per k_sixth
+constexpr int kLaneBytes = 16;                                                    // 16 B per lane
+constexpr int kKsubBytes = kWarpSize * kLaneBytes;                                // 512 B per K-sub
+constexpr int kKSubsPerThird = 4;                                                 // 4 k_subs per k_sixth
+constexpr int kMtileSubslabBytes = kKSubsPerThird * kKsubBytes;                   // 2048 B per m_tile within a k_sixth
+constexpr int kSubslabBytes = kCtaOutRows / 16 * kMtileSubslabBytes;              // 4 * 2048 = 8192 B per k_sixth
+constexpr int kCombinedMtilesPerCta = kCtaOutRows / kRowsPerWorker;
+constexpr int kCombinedSubslabBytes = kCombinedMtilesPerCta * kMtileSubslabBytes; // 8 * 2048 = 16384 B
+constexpr int kCombinedTileBytes = kWeightScaleKBlocksPerKIter * kCombinedSubslabBytes; // 98304 (96 KiB)
 constexpr int kPackedTmaInnerBytes = 128;
-constexpr int kPackedTmaRows = kSubslabBytes / kPackedTmaInnerBytes;
+constexpr int kCombinedPackedTmaRows = kCombinedSubslabBytes / kPackedTmaInnerBytes;
 constexpr int kPackedTmaSubslabs = kTileBytes / kSubslabBytes;
 static_assert(kSubslabBytes % kPackedTmaInnerBytes == 0);
+static_assert(kCombinedSubslabBytes % kPackedTmaInnerBytes == 0);
 static_assert(kPackedTmaSubslabs == kWeightScaleKBlocksPerKIter);
+static_assert(kCombinedTileBytes == 2 * kTileBytes);
+static_assert(kCombinedMtilesPerCta == kNumWorkers);
 
 static __device__ inline float sigmoid_accurate(float x)
 {
@@ -227,41 +232,31 @@ __device__ __forceinline__ void fence_proxy_async_shared()
     asm volatile("fence.proxy.async.shared::cta;\n" :::);
 }
 
-__device__ __forceinline__ void gate_up_pair_bar_sync(int pair_idx)
-{
-    switch (pair_idx)
-    {
-    case 0: asm volatile("bar.sync 2, 64;\n" ::: "memory"); break;
-    case 1: asm volatile("bar.sync 3, 64;\n" ::: "memory"); break;
-    case 2: asm volatile("bar.sync 4, 64;\n" ::: "memory"); break;
-    default: asm volatile("bar.sync 5, 64;\n" ::: "memory"); break;
-    }
-}
-
 // -------------------------------------------------------------------------
-// Packed-tile consumer addressing: 6 stacked sub-slabs (k_sixth dim outer,
-// then m_tile, then k_sub_in_sixth, then lane). SWIZZLE_NONE.
+// Combined packed-tile consumer addressing: 6 stacked sub-slabs (k_sixth dim
+// outer, then 8 worker m_tiles, then k_sub_in_sixth, then lane). Each worker
+// m_tile stores 8 gate rows followed by the corresponding 8 up rows.
 // Variable names `k_third` / `kKSubsPerThird` are historical; the constants
 // express 6 sub-slabs of 128 K-cols each.
 // -------------------------------------------------------------------------
-__device__ __forceinline__ int fused_expert_up_lane_offset(int m_tile, int k_sub, int lane)
+__device__ __forceinline__ int fused_expert_up_combined_lane_offset(int m_tile, int k_sub, int lane)
 {
     int const k_third = k_sub / kKSubsPerThird;        // 0..5
     int const k_sub_in_third = k_sub % kKSubsPerThird; // 0..3
-    return k_third * kSubslabBytes + m_tile * kMtileSubslabBytes + k_sub_in_third * kKsubBytes + lane * kLaneBytes;
+    return k_third * kCombinedSubslabBytes + m_tile * kMtileSubslabBytes + k_sub_in_third * kKsubBytes
+        + lane * kLaneBytes;
 }
 
 // Compute MMA for ONE K-iter (kKTile = 768 cols => 24 m16n8k32 MMAs per fragment).
 //
-// Per-K-block-scaled variant: the 24 K-subs split into 6 K-blocks of 4 K-subs
-// each (one per 128-col fp8-scale m-block). Each block's accumulator is
-// scaled by `block_scale[kb]` and reduced into `d_out[]`. Each block scale is
-// the product of the per-block activation dequant scale and per-block weight
-// dequant scale.
+// The 16-row MMA tile is physically packed as 8 gate rows followed by 8 up
+// rows for the same output-row stripe. The top half and bottom half therefore
+// use different weight dequant scales, while sharing the same activation scale.
 //
 __device__ __forceinline__ void compute_mma_kiter_fused_expert_up(__nv_fp8_e4m3 const* __restrict__ smem_tile,
     __nv_fp8_e4m3 const* __restrict__ smem_act_fp8, int k_iter, int my_m, int lane,
-    float const (&block_scale)[kWeightScaleKBlocksPerKIter], float (&d_out)[4])
+    float const (&gate_block_scale)[kWeightScaleKBlocksPerKIter],
+    float const (&up_block_scale)[kWeightScaleKBlocksPerKIter], float (&d_out)[4])
 {
 #pragma unroll
     for (int kb = 0; kb < kWeightScaleKBlocksPerKIter; ++kb)
@@ -272,7 +267,7 @@ __device__ __forceinline__ void compute_mma_kiter_fused_expert_up(__nv_fp8_e4m3 
         {
             int const k_sub = kb * kKSubsPerThird + ks_in_kb;
             // Per-lane base - natural K-major layout, 16 contiguous bytes/lane.
-            __nv_fp8_e4m3 const* lane_base = smem_tile + fused_expert_up_lane_offset(my_m, k_sub, lane);
+            __nv_fp8_e4m3 const* lane_base = smem_tile + fused_expert_up_combined_lane_offset(my_m, k_sub, lane);
 
             // 2 x LDS.64 fetch the 4 b32 A-frag chunks. ptxas typically merges
             // these into a single LDS.128 in the SASS.
@@ -310,9 +305,10 @@ __device__ __forceinline__ void compute_mma_kiter_fused_expert_up(__nv_fp8_e4m3 
         }
 
 #pragma unroll
-        for (int i = 0; i < 4; ++i)
+        for (int i = 0; i < 2; ++i)
         {
-            d_out[i] += c_frag[i] * block_scale[kb];
+            d_out[i] += c_frag[i] * gate_block_scale[kb];
+            d_out[i + 2] += c_frag[i + 2] * up_block_scale[kb];
         }
     }
 }
@@ -356,81 +352,60 @@ __device__ __forceinline__ float const* raw_scale_ptr(float const* __restrict__ 
         + k_iter * kWeightScaleKBlocksPerKIter;
 }
 
-template <int kInterPerTpParam, bool kGate>
+template <int kInterPerTpParam>
 __device__ __forceinline__ int packed_weight_tile_idx(int expert, int sub_row, int k_iter)
 {
     constexpr int kSubRowsPerExpert = sub_rows_per_expert(kInterPerTpParam);
-    constexpr int kGateUpIdx = kGate ? 0 : 1;
-    if (expert == kSharedExpert)
-    {
-        return (kGateUpIdx * kSubRowsPerExpert + sub_row) * kNumKIter + k_iter;
-    }
-
-    return ((expert * 2 + kGateUpIdx) * kSubRowsPerExpert + sub_row) * kNumKIter + k_iter;
+    return (expert * kSubRowsPerExpert + sub_row) * kNumKIter + k_iter;
 }
 
-template <int kInterPerTpParam, bool kGate>
+template <int kInterPerTpParam>
 __device__ __forceinline__ __nv_fp8_e4m3 const* packed_weight_tile_ptr(
-    __nv_fp8_e4m3 const* __restrict__ shared_gate_up_weight, __nv_fp8_e4m3 const* __restrict__ routed_w3_w1_weight,
-    int expert, int sub_row, int k_iter)
+    __nv_fp8_e4m3 const* __restrict__ expert_gate_up_weight, int expert, int sub_row, int k_iter)
 {
-    int const tile_idx = packed_weight_tile_idx<kInterPerTpParam, kGate>(expert, sub_row, k_iter);
-    if (expert == kSharedExpert)
-    {
-        return shared_gate_up_weight + static_cast<int64_t>(tile_idx) * kTileBytes;
-    }
-
-    return routed_w3_w1_weight + static_cast<int64_t>(tile_idx) * kTileBytes;
+    int const tile_idx = packed_weight_tile_idx<kInterPerTpParam>(expert, sub_row, k_iter);
+    return expert_gate_up_weight + static_cast<int64_t>(tile_idx) * kCombinedTileBytes;
 }
 
-template <int kInterPerTpParam, bool kGate>
+template <int kInterPerTpParam>
 __device__ __forceinline__ void load_packed_weight_tile_fused_expert_up(__nv_fp8_e4m3* __restrict__ smem_tile,
-    __nv_fp8_e4m3 const* __restrict__ shared_gate_up_weight, __nv_fp8_e4m3 const* __restrict__ routed_w3_w1_weight,
-    int expert, int sub_row, int k_iter, int tidx)
+    __nv_fp8_e4m3 const* __restrict__ expert_gate_up_weight, int expert, int sub_row, int k_iter, int tidx)
 {
     constexpr int kCopyBytes = 16;
-    static_assert(kTileBytes % kCopyBytes == 0);
+    static_assert(kCombinedTileBytes % kCopyBytes == 0);
 
-    char const* const src = reinterpret_cast<char const*>(packed_weight_tile_ptr<kInterPerTpParam, kGate>(
-        shared_gate_up_weight, routed_w3_w1_weight, expert, sub_row, k_iter));
+    char const* const src = reinterpret_cast<char const*>(
+        packed_weight_tile_ptr<kInterPerTpParam>(expert_gate_up_weight, expert, sub_row, k_iter));
     char* const dst = reinterpret_cast<char*>(smem_tile);
 
 #pragma unroll 1
-    for (int byte_off = tidx * kCopyBytes; byte_off < kTileBytes; byte_off += kThreadsPerCta * kCopyBytes)
+    for (int byte_off = tidx * kCopyBytes; byte_off < kCombinedTileBytes; byte_off += kThreadsPerCta * kCopyBytes)
     {
         unsigned const dst_smem = __cvta_generic_to_shared(dst + byte_off);
         asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(dst_smem), "l"(src + byte_off));
     }
 }
 
-template <int kInterPerTpParam, bool kGate>
+template <int kInterPerTpParam>
 __device__ __forceinline__ void issue_packed_weight_tma_fused_expert_up(__nv_fp8_e4m3* __restrict__ smem_tile,
-    CUtensorMap const* shared_gate_up_tma, CUtensorMap const* routed_w3_w1_tma, int expert, int sub_row, int k_iter,
-    uint64_t* mbar)
+    CUtensorMap const* expert_gate_up_tma, int expert, int sub_row, int k_iter, uint64_t* mbar)
 {
-    int const tile_idx = packed_weight_tile_idx<kInterPerTpParam, kGate>(expert, sub_row, k_iter);
+    int const tile_idx = packed_weight_tile_idx<kInterPerTpParam>(expert, sub_row, k_iter);
     int const coord_z = tile_idx * kPackedTmaSubslabs;
-    mbarrier_arrive_expect_tx(mbar, kTileBytes);
-    if (expert == kSharedExpert)
-    {
-        cp_async_bulk_tensor_3d(smem_tile, shared_gate_up_tma, 0, 0, coord_z, mbar);
-    }
-    else
-    {
-        cp_async_bulk_tensor_3d(smem_tile, routed_w3_w1_tma, 0, 0, coord_z, mbar);
-    }
+    mbarrier_arrive_expect_tx(mbar, kCombinedTileBytes);
+    cp_async_bulk_tensor_3d(smem_tile, expert_gate_up_tma, 0, 0, coord_z, mbar);
 }
 
-template <int kInterPerTpParam, bool kGate>
+template <int kInterPerTpParam>
 __device__ __forceinline__ void load_raw_weight_tile_fused_expert_up(__nv_fp8_e4m3* __restrict__ smem_tile,
     __nv_fp8_e4m3 const* __restrict__ shared_gate_up_weight, __nv_fp8_e4m3 const* __restrict__ routed_w3_w1_weight,
     int expert, int sub_row, int k_iter, int tidx)
 {
-    // Fill the same 48 KiB K-major slab layout that the legacy packed path
-    // produced, but source directly from the existing row-major
-    // model weights. 3072 lane records * 16 bytes = 49152 bytes.
+    // Fill the combined 96 KiB K-major slab layout directly from the existing
+    // row-major model weights. Each worker tile stores 8 gate rows followed by
+    // the corresponding 8 up rows.
 #pragma unroll 1
-    for (int tri = tidx; tri < 3072; tri += kThreadsPerCta)
+    for (int tri = tidx; tri < 6144; tri += kThreadsPerCta)
     {
         int const m_tile = tri / (kKSubsPerIter * kWarpSize);
         int const tri_in_mtile = tri % (kKSubsPerIter * kWarpSize);
@@ -440,27 +415,25 @@ __device__ __forceinline__ void load_raw_weight_tile_fused_expert_up(__nv_fp8_e4
         int const k_third = k_sub / kKSubsPerThird;
         int const k_sub_in_third = k_sub % kKSubsPerThird;
 
-        int const row_lo = m_tile * 16 + (lane >> 2);
-        int const row_hi = row_lo + 8;
+        int const expert_row = m_tile * kRowsPerWorker + (lane >> 2);
         int const col_lo_in_block = k_sub_in_third * 32 + ((lane & 3) << 2);
         int const col_hi_in_block = col_lo_in_block + 16;
 
-        int const gm_lo = sub_row * kCtaOutRows + row_lo;
-        int const gm_hi = sub_row * kCtaOutRows + row_hi;
+        int const gm = sub_row * kCtaOutRows + expert_row;
         int const gk_lo = k_iter * kKTile + k_third * 128 + col_lo_in_block;
         int const gk_hi = k_iter * kKTile + k_third * 128 + col_hi_in_block;
 
         uint32_t const a = *reinterpret_cast<uint32_t const*>(
-            raw_weight_ptr<kInterPerTpParam, kGate>(shared_gate_up_weight, routed_w3_w1_weight, expert, gm_lo, gk_lo));
+            raw_weight_ptr<kInterPerTpParam, true>(shared_gate_up_weight, routed_w3_w1_weight, expert, gm, gk_lo));
         uint32_t const b = *reinterpret_cast<uint32_t const*>(
-            raw_weight_ptr<kInterPerTpParam, kGate>(shared_gate_up_weight, routed_w3_w1_weight, expert, gm_hi, gk_lo));
+            raw_weight_ptr<kInterPerTpParam, false>(shared_gate_up_weight, routed_w3_w1_weight, expert, gm, gk_lo));
         uint32_t const c = *reinterpret_cast<uint32_t const*>(
-            raw_weight_ptr<kInterPerTpParam, kGate>(shared_gate_up_weight, routed_w3_w1_weight, expert, gm_lo, gk_hi));
+            raw_weight_ptr<kInterPerTpParam, true>(shared_gate_up_weight, routed_w3_w1_weight, expert, gm, gk_hi));
         uint32_t const d = *reinterpret_cast<uint32_t const*>(
-            raw_weight_ptr<kInterPerTpParam, kGate>(shared_gate_up_weight, routed_w3_w1_weight, expert, gm_hi, gk_hi));
+            raw_weight_ptr<kInterPerTpParam, false>(shared_gate_up_weight, routed_w3_w1_weight, expert, gm, gk_hi));
 
-        uint8_t* dst = reinterpret_cast<uint8_t*>(smem_tile) + k_third * kSubslabBytes + m_tile * kMtileSubslabBytes
-            + k_sub_in_third * kKsubBytes + lane * kLaneBytes;
+        uint8_t* dst = reinterpret_cast<uint8_t*>(smem_tile) + k_third * kCombinedSubslabBytes
+            + m_tile * kMtileSubslabBytes + k_sub_in_third * kKsubBytes + lane * kLaneBytes;
         *reinterpret_cast<uint32_t*>(dst) = a;
         *reinterpret_cast<uint32_t*>(dst + 4) = b;
         *reinterpret_cast<uint32_t*>(dst + 8) = c;
@@ -498,16 +471,17 @@ __device__ __forceinline__ void quant_act_blocks_fused_expert_up(cg::thread_bloc
         float const f2 = __bfloat162float(__low2bfloat16(v23));
         float const f3 = __bfloat162float(__high2bfloat16(v23));
 
-        float lane_max = fmaxf(fmaxf(fabsf(f0), fabsf(f1)), fmaxf(fabsf(f2), fabsf(f3)));
+        float const lane_max = fmaxf(fmaxf(fabsf(f0), fabsf(f1)), fmaxf(fabsf(f2), fabsf(f3)));
         float amax = cg::reduce(warp, lane_max, cg::greater<float>{});
         amax = fmaxf(amax, 1e-10f);
-        float const quant_scale = kFp8Max / amax;      // bf16 * quant_scale -> fp8
-        float const dequant_scale = amax * kInvFp8Max; // fp8 * dequant -> bf16
+        float quant_scale = 0.f; // bf16 * quant_scale -> fp8
 
         if (lane == 0)
         {
-            smem_act_block_scales[kb_global] = dequant_scale;
+            quant_scale = kFp8Max / amax;
+            smem_act_block_scales[kb_global] = amax * kInvFp8Max;
         }
+        quant_scale = __shfl_sync(0xffffffff, quant_scale, 0);
 
         // Quantize and write 4 fp8 elements per lane.
         __nv_fp8_e4m3* lane_dst = smem_act_fp8 + block_off + lane * kElemsPerLane128Block;
@@ -572,10 +546,10 @@ __global__ __launch_bounds__(384, DSV3_FUSED_EXPERT_UP_LB_BLOCKS_PER_SM) void ds
 
     extern __shared__ __align__(128) unsigned char smem_buf[];
 
-    __nv_fp8_e4m3* const smem_gate_tiles = reinterpret_cast<__nv_fp8_e4m3*>(smem_buf);
-    __nv_fp8_e4m3* const smem_up_tiles = smem_gate_tiles + kWeightStages * kTileBytes;
+    __nv_fp8_e4m3* const smem_weight_tiles = reinterpret_cast<__nv_fp8_e4m3*>(smem_buf);
 
-    __nv_bfloat16* const smem_act_bf16 = reinterpret_cast<__nv_bfloat16*>(smem_up_tiles + kWeightStages * kTileBytes);
+    __nv_bfloat16* const smem_act_bf16
+        = reinterpret_cast<__nv_bfloat16*>(smem_weight_tiles + kWeightStages * kCombinedTileBytes);
     // In-kernel per-128-col act quant writes fp8 to a SEPARATE buffer
     // (not aliased over bf16) so multiple warps can read bf16 / write fp8
     // in parallel without aliasing races. Costs 6 KiB.
@@ -620,21 +594,12 @@ __global__ __launch_bounds__(384, DSV3_FUSED_EXPERT_UP_LB_BLOCKS_PER_SM) void ds
     rs_base += sizeof(float) * kWeightScaleKBlocks;
     rs_base = align_up_128(rs_base);
 
-    float* const smem_gate_acc = reinterpret_cast<float*>(rs_base);
-    rs_base += sizeof(float) * kCtaOutRows;
-    rs_base = align_up_128(rs_base);
-
-    float* const smem_up_acc = reinterpret_cast<float*>(rs_base);
-    rs_base += sizeof(float) * kCtaOutRows;
-    rs_base = align_up_128(rs_base);
-
     rs_base = (rs_base + 15u) & ~uintptr_t(15);
-    uint64_t* const smem_tma_full_gate = reinterpret_cast<uint64_t*>(rs_base);
-    uint64_t* const smem_tma_full_up = smem_tma_full_gate + kWeightStages;
-    uint64_t* const smem_tma_empty = smem_tma_full_up + kWeightStages;
+    uint64_t* const smem_tma_full = reinterpret_cast<uint64_t*>(rs_base);
+    uint64_t* const smem_tma_empty = smem_tma_full + kWeightStages;
     if constexpr (kUsePackedTmaWeights)
     {
-        rs_base += sizeof(uint64_t) * (kUsePackedTmaFullEmptyPipeline ? 3 : 2) * kWeightStages;
+        rs_base += sizeof(uint64_t) * 2 * kWeightStages;
     }
 
     auto block = cg::this_thread_block();
@@ -670,8 +635,35 @@ __global__ __launch_bounds__(384, DSV3_FUSED_EXPERT_UP_LB_BLOCKS_PER_SM) void ds
             smem_score_bias[expert] = score_sigmoid + bias_val;
         }
     }
+    if constexpr (kUsePackedTmaWeights)
+    {
+        if constexpr (kUsePackedTmaFullEmptyPipeline)
+        {
+            if (tidx == 0)
+            {
+#pragma unroll
+                for (int s = 0; s < kWeightStages; ++s)
+                {
+                    mbarrier_init(&smem_tma_full[s], 1);
+                    mbarrier_init(&smem_tma_empty[s], kNumWorkers);
+                }
+            }
+        }
+        else
+        {
+            if (tidx < kWeightStages)
+            {
+                mbarrier_init(&smem_tma_full[tidx], 1);
+            }
+        }
+        if (tidx == 0)
+        {
+            fence_proxy_async_shared();
+        }
+    }
     // Wait for activation cp.async completion before quant warps read
-    // smem_act_bf16. The CTA sync also publishes the score-prep writes.
+    // smem_act_bf16. The CTA sync also publishes the score-prep writes and any
+    // TMA mbarrier initialization.
     asm volatile("cp.async.wait_all;\n" :::);
     __syncthreads();
 
@@ -735,6 +727,23 @@ __global__ __launch_bounds__(384, DSV3_FUSED_EXPERT_UP_LB_BLOCKS_PER_SM) void ds
                     topk_indices[out_off] = expert_idx;
                 }
             }
+
+            if constexpr (kUsePackedTmaFullEmptyPipeline)
+            {
+                int const early_expert_lane = (expert_slot == 0) ? 0 : (expert_slot - 1);
+                int const early_expert_idx = __shfl_sync(0xffffffff, expert_idx, early_expert_lane);
+                int const early_packed_expert = (expert_slot == 0) ? 0 : (early_expert_idx + 1);
+                if (lane == 0)
+                {
+#pragma unroll
+                    for (int s = 0; s < kWeightStages; ++s)
+                    {
+                        issue_packed_weight_tma_fused_expert_up<kInterPerTpParam>(
+                            smem_weight_tiles + s * kCombinedTileBytes, &shared_gate_up_tma, early_packed_expert,
+                            sub_row, s, smem_tma_full + s);
+                    }
+                }
+            }
         }
     }
     else
@@ -745,98 +754,21 @@ __global__ __launch_bounds__(384, DSV3_FUSED_EXPERT_UP_LB_BLOCKS_PER_SM) void ds
     __syncthreads();
 
     int const my_expert = (expert_slot == 0) ? kSharedExpert : smem_topk_i[expert_slot - 1];
+    int const packed_expert = (expert_slot == 0) ? 0 : (my_expert + 1);
 
-    bool const is_gate_worker = (warp_idx >= kGateWorkerWarpBase && warp_idx < (kGateWorkerWarpBase + kNumGateWorkers));
-    bool const is_up_worker = (warp_idx >= kUpWorkerWarpBase && warp_idx < (kUpWorkerWarpBase + kNumUpWorkers));
-    int const my_m_gate = is_gate_worker ? (warp_idx - kGateWorkerWarpBase) : 0;
-    int const my_m_up = is_up_worker ? (warp_idx - kUpWorkerWarpBase) : 0;
+    bool const is_worker = (warp_idx >= kWorkerWarpBase && warp_idx < (kWorkerWarpBase + kNumWorkers));
+    int const my_m = is_worker ? (warp_idx - kWorkerWarpBase) : 0;
 
-    float d_gate[4] = {0.f, 0.f, 0.f, 0.f};
-    float d_up[4] = {0.f, 0.f, 0.f, 0.f};
-    uint32_t tma_gate_phase[kPackedStagesDouble] = {0u, 0u};
-    uint32_t tma_up_phase[kPackedStagesDouble] = {0u, 0u};
-
-    if constexpr (kUsePackedTmaWeights)
-    {
-        if constexpr (kUsePackedTmaFullEmptyPipeline)
-        {
-            if (tidx == 0)
-            {
-#pragma unroll
-                for (int s = 0; s < kWeightStages; ++s)
-                {
-                    mbarrier_init(&smem_tma_full_gate[s], 1);
-                    mbarrier_init(&smem_tma_full_up[s], 1);
-                    mbarrier_init(&smem_tma_empty[s], kNumGateWorkers + kNumUpWorkers);
-                }
-            }
-        }
-        else
-        {
-            if (tidx < 2 * kWeightStages)
-            {
-                uint64_t* const smem_tma_mbar = smem_tma_full_gate;
-                mbarrier_init(&smem_tma_mbar[tidx], 1);
-            }
-        }
-        if (tidx == 0)
-        {
-            fence_proxy_async_shared();
-        }
-        __syncthreads();
-    }
+    float d_pair[4] = {0.f, 0.f, 0.f, 0.f};
+    uint32_t tma_phase[kPackedStagesDouble] = {0u, 0u};
 
     if constexpr (kDoubleBufferedWeights)
     {
         // Prime stages before entering the loop; later iterations preload into empty stages.
-        if constexpr (kUsePackedTmaWeights)
+        if constexpr (!kUsePackedTmaWeights)
         {
-            if constexpr (kUsePackedTmaFullEmptyPipeline)
-            {
-                if (tidx == 0)
-                {
-#pragma unroll
-                    for (int s = 0; s < kWeightStages; ++s)
-                    {
-                        issue_packed_weight_tma_fused_expert_up<kInterPerTpParam, true>(
-                            smem_gate_tiles + s * kTileBytes, &shared_gate_up_tma, &routed_w3_w1_tma, my_expert,
-                            sub_row, s, smem_tma_full_gate + s);
-                        issue_packed_weight_tma_fused_expert_up<kInterPerTpParam, false>(smem_up_tiles + s * kTileBytes,
-                            &shared_gate_up_tma, &routed_w3_w1_tma, my_expert, sub_row, s, smem_tma_full_up + s);
-                    }
-                }
-            }
-            else
-            {
-                uint64_t* const smem_tma_mbar = smem_tma_full_gate;
-                if (tidx == 0)
-                {
-                    issue_packed_weight_tma_fused_expert_up<kInterPerTpParam, true>(
-                        smem_gate_tiles, &shared_gate_up_tma, &routed_w3_w1_tma, my_expert, sub_row, 0, smem_tma_mbar);
-                }
-                if (tidx == 1)
-                {
-                    issue_packed_weight_tma_fused_expert_up<kInterPerTpParam, false>(smem_up_tiles, &shared_gate_up_tma,
-                        &routed_w3_w1_tma, my_expert, sub_row, 0, smem_tma_mbar + kWeightStages);
-                }
-                if (tidx == 0)
-                {
-                    mbarrier_wait_parity(smem_tma_mbar, tma_gate_phase[0]);
-                    tma_gate_phase[0] ^= 1u;
-                }
-                if (tidx == 1)
-                {
-                    mbarrier_wait_parity(smem_tma_mbar + kWeightStages, tma_up_phase[0]);
-                    tma_up_phase[0] ^= 1u;
-                }
-            }
-        }
-        else
-        {
-            load_packed_weight_tile_fused_expert_up<kInterPerTpParam, true>(
-                smem_gate_tiles, shared_gate_up_weight, routed_w3_w1_weight, my_expert, sub_row, 0, tidx);
-            load_packed_weight_tile_fused_expert_up<kInterPerTpParam, false>(
-                smem_up_tiles, shared_gate_up_weight, routed_w3_w1_weight, my_expert, sub_row, 0, tidx);
+            load_packed_weight_tile_fused_expert_up<kInterPerTpParam>(
+                smem_weight_tiles, shared_gate_up_weight, packed_expert, sub_row, 0, tidx);
             asm volatile("cp.async.commit_group;\n" :::);
             asm volatile("cp.async.wait_all;\n" :::);
         }
@@ -844,10 +776,25 @@ __global__ __launch_bounds__(384, DSV3_FUSED_EXPERT_UP_LB_BLOCKS_PER_SM) void ds
 
     if (tidx < kWeightScaleKBlocks)
     {
-        float const* const gate_weight_scale_base
-            = raw_scale_ptr<kInterPerTpParam, true>(shared_gate_up_scale, routed_w3_w1_scale, my_expert, sub_row, 0);
-        float const* const up_weight_scale_base
-            = raw_scale_ptr<kInterPerTpParam, false>(shared_gate_up_scale, routed_w3_w1_scale, my_expert, sub_row, 0);
+        float const* gate_weight_scale_base = nullptr;
+        float const* up_weight_scale_base = nullptr;
+        if constexpr (kUsePackedWeights)
+        {
+            constexpr int kWeightScaleMBlocks = weight_scale_m_blocks(kInterPerTpParam);
+            int const m_block_idx = sub_row / (kSubRowsPerExpert / kWeightScaleMBlocks);
+            gate_weight_scale_base = shared_gate_up_scale
+                + (static_cast<int64_t>(packed_expert) * 2 * kWeightScaleMBlocks + m_block_idx) * kWeightScaleKBlocks;
+            up_weight_scale_base = shared_gate_up_scale
+                + (static_cast<int64_t>(packed_expert) * 2 * kWeightScaleMBlocks + kWeightScaleMBlocks + m_block_idx)
+                    * kWeightScaleKBlocks;
+        }
+        else
+        {
+            gate_weight_scale_base = raw_scale_ptr<kInterPerTpParam, true>(
+                shared_gate_up_scale, routed_w3_w1_scale, my_expert, sub_row, 0);
+            up_weight_scale_base = raw_scale_ptr<kInterPerTpParam, false>(
+                shared_gate_up_scale, routed_w3_w1_scale, my_expert, sub_row, 0);
+        }
         smem_gate_weight_scales[tidx] = __ldg(gate_weight_scale_base + tidx);
         smem_up_weight_scales[tidx] = __ldg(up_weight_scale_base + tidx);
     }
@@ -873,12 +820,9 @@ __global__ __launch_bounds__(384, DSV3_FUSED_EXPERT_UP_LB_BLOCKS_PER_SM) void ds
                     uint32_t const wait_phase = static_cast<uint32_t>(load_phase ^ 1);
                     mbarrier_wait_parity(smem_tma_empty + load_stage, wait_phase);
 
-                    issue_packed_weight_tma_fused_expert_up<kInterPerTpParam, true>(
-                        smem_gate_tiles + load_stage * kTileBytes, &shared_gate_up_tma, &routed_w3_w1_tma, my_expert,
-                        sub_row, k_load, smem_tma_full_gate + load_stage);
-                    issue_packed_weight_tma_fused_expert_up<kInterPerTpParam, false>(
-                        smem_up_tiles + load_stage * kTileBytes, &shared_gate_up_tma, &routed_w3_w1_tma, my_expert,
-                        sub_row, k_load, smem_tma_full_up + load_stage);
+                    issue_packed_weight_tma_fused_expert_up<kInterPerTpParam>(
+                        smem_weight_tiles + load_stage * kCombinedTileBytes, &shared_gate_up_tma, packed_expert,
+                        sub_row, k_load, smem_tma_full + load_stage);
                 }
             }
             else if (k + 1 < kNumKIter)
@@ -887,28 +831,18 @@ __global__ __launch_bounds__(384, DSV3_FUSED_EXPERT_UP_LB_BLOCKS_PER_SM) void ds
                 // Keep this prefetch ahead of MMA so copy latency overlaps with the current K tile.
                 if constexpr (kUsePackedTmaWeights)
                 {
-                    uint64_t* const smem_tma_mbar = smem_tma_full_gate;
                     if (tidx == 0)
                     {
-                        issue_packed_weight_tma_fused_expert_up<kInterPerTpParam, true>(
-                            smem_gate_tiles + preload_stage * kTileBytes, &shared_gate_up_tma, &routed_w3_w1_tma,
-                            my_expert, sub_row, k + 1, smem_tma_mbar + preload_stage);
-                    }
-                    if (tidx == 1)
-                    {
-                        issue_packed_weight_tma_fused_expert_up<kInterPerTpParam, false>(
-                            smem_up_tiles + preload_stage * kTileBytes, &shared_gate_up_tma, &routed_w3_w1_tma,
-                            my_expert, sub_row, k + 1, smem_tma_mbar + kWeightStages + preload_stage);
+                        issue_packed_weight_tma_fused_expert_up<kInterPerTpParam>(
+                            smem_weight_tiles + preload_stage * kCombinedTileBytes, &shared_gate_up_tma, packed_expert,
+                            sub_row, k + 1, smem_tma_full + preload_stage);
                     }
                 }
                 else
                 {
-                    load_packed_weight_tile_fused_expert_up<kInterPerTpParam, true>(
-                        smem_gate_tiles + preload_stage * kTileBytes, shared_gate_up_weight, routed_w3_w1_weight,
-                        my_expert, sub_row, k + 1, tidx);
-                    load_packed_weight_tile_fused_expert_up<kInterPerTpParam, false>(
-                        smem_up_tiles + preload_stage * kTileBytes, shared_gate_up_weight, routed_w3_w1_weight,
-                        my_expert, sub_row, k + 1, tidx);
+                    load_packed_weight_tile_fused_expert_up<kInterPerTpParam>(
+                        smem_weight_tiles + preload_stage * kCombinedTileBytes, shared_gate_up_weight, packed_expert,
+                        sub_row, k + 1, tidx);
                     asm volatile("cp.async.commit_group;\n" :::);
                 }
             }
@@ -918,34 +852,21 @@ __global__ __launch_bounds__(384, DSV3_FUSED_EXPERT_UP_LB_BLOCKS_PER_SM) void ds
         {
             if constexpr (kUsePackedTmaWeights)
             {
-                uint64_t* const smem_tma_mbar = smem_tma_full_gate;
                 if (tidx == 0)
                 {
-                    issue_packed_weight_tma_fused_expert_up<kInterPerTpParam, true>(
-                        smem_gate_tiles, &shared_gate_up_tma, &routed_w3_w1_tma, my_expert, sub_row, k, smem_tma_mbar);
-                }
-                if (tidx == 1)
-                {
-                    issue_packed_weight_tma_fused_expert_up<kInterPerTpParam, false>(smem_up_tiles, &shared_gate_up_tma,
-                        &routed_w3_w1_tma, my_expert, sub_row, k, smem_tma_mbar + kWeightStages);
+                    issue_packed_weight_tma_fused_expert_up<kInterPerTpParam>(
+                        smem_weight_tiles, &shared_gate_up_tma, packed_expert, sub_row, k, smem_tma_full);
                 }
                 if (tidx == 0)
                 {
-                    mbarrier_wait_parity(smem_tma_mbar, tma_gate_phase[0]);
-                    tma_gate_phase[0] ^= 1u;
-                }
-                if (tidx == 1)
-                {
-                    mbarrier_wait_parity(smem_tma_mbar + kWeightStages, tma_up_phase[0]);
-                    tma_up_phase[0] ^= 1u;
+                    mbarrier_wait_parity(smem_tma_full, tma_phase[0]);
+                    tma_phase[0] ^= 1u;
                 }
             }
             else
             {
-                load_packed_weight_tile_fused_expert_up<kInterPerTpParam, true>(
-                    smem_gate_tiles, shared_gate_up_weight, routed_w3_w1_weight, my_expert, sub_row, k, tidx);
-                load_packed_weight_tile_fused_expert_up<kInterPerTpParam, false>(
-                    smem_up_tiles, shared_gate_up_weight, routed_w3_w1_weight, my_expert, sub_row, k, tidx);
+                load_packed_weight_tile_fused_expert_up<kInterPerTpParam>(
+                    smem_weight_tiles, shared_gate_up_weight, packed_expert, sub_row, k, tidx);
                 asm volatile("cp.async.commit_group;\n" :::);
                 asm volatile("cp.async.wait_all;\n" :::);
             }
@@ -953,51 +874,28 @@ __global__ __launch_bounds__(384, DSV3_FUSED_EXPERT_UP_LB_BLOCKS_PER_SM) void ds
         }
         else if constexpr (!kUsePackedWeights)
         {
-            load_raw_weight_tile_fused_expert_up<kInterPerTpParam, true>(
-                smem_gate_tiles, shared_gate_up_weight, routed_w3_w1_weight, my_expert, sub_row, k, tidx);
-            load_raw_weight_tile_fused_expert_up<kInterPerTpParam, false>(
-                smem_up_tiles, shared_gate_up_weight, routed_w3_w1_weight, my_expert, sub_row, k, tidx);
+            load_raw_weight_tile_fused_expert_up<kInterPerTpParam>(
+                smem_weight_tiles, shared_gate_up_weight, routed_w3_w1_weight, my_expert, sub_row, k, tidx);
             __syncthreads();
         }
 
-        if (is_gate_worker)
+        if (is_worker)
         {
             float gate_block_scales[kWeightScaleKBlocksPerKIter];
-#pragma unroll
-            for (int kb = 0; kb < kWeightScaleKBlocksPerKIter; ++kb)
-            {
-                int const scale_idx = k * kWeightScaleKBlocksPerKIter + kb;
-                gate_block_scales[kb] = smem_gate_weight_scales[scale_idx] * smem_act_block_scales[scale_idx];
-            }
-            if constexpr (kUsePackedTmaFullEmptyPipeline)
-            {
-                mbarrier_wait_parity(smem_tma_full_gate + current_stage, static_cast<uint32_t>(current_phase));
-            }
-            compute_mma_kiter_fused_expert_up(smem_gate_tiles + current_stage * kTileBytes, smem_act_fp8, k, my_m_gate,
-                lane, gate_block_scales, d_gate);
-            if constexpr (kUsePackedTmaFullEmptyPipeline)
-            {
-                if (lane == 0)
-                {
-                    mbarrier_arrive(smem_tma_empty + current_stage);
-                }
-            }
-        }
-        if (is_up_worker)
-        {
             float up_block_scales[kWeightScaleKBlocksPerKIter];
 #pragma unroll
             for (int kb = 0; kb < kWeightScaleKBlocksPerKIter; ++kb)
             {
                 int const scale_idx = k * kWeightScaleKBlocksPerKIter + kb;
+                gate_block_scales[kb] = smem_gate_weight_scales[scale_idx] * smem_act_block_scales[scale_idx];
                 up_block_scales[kb] = smem_up_weight_scales[scale_idx] * smem_act_block_scales[scale_idx];
             }
             if constexpr (kUsePackedTmaFullEmptyPipeline)
             {
-                mbarrier_wait_parity(smem_tma_full_up + current_stage, static_cast<uint32_t>(current_phase));
+                mbarrier_wait_parity(smem_tma_full + current_stage, static_cast<uint32_t>(current_phase));
             }
-            compute_mma_kiter_fused_expert_up(
-                smem_up_tiles + current_stage * kTileBytes, smem_act_fp8, k, my_m_up, lane, up_block_scales, d_up);
+            compute_mma_kiter_fused_expert_up(smem_weight_tiles + current_stage * kCombinedTileBytes, smem_act_fp8, k,
+                my_m, lane, gate_block_scales, up_block_scales, d_pair);
             if constexpr (kUsePackedTmaFullEmptyPipeline)
             {
                 if (lane == 0)
@@ -1017,17 +915,10 @@ __global__ __launch_bounds__(384, DSV3_FUSED_EXPERT_UP_LB_BLOCKS_PER_SM) void ds
                 int const preload_stage = (k + 1) & 1;
                 if constexpr (kUsePackedTmaWeights)
                 {
-                    uint64_t* const smem_tma_mbar = smem_tma_full_gate;
                     if (tidx == 0)
                     {
-                        mbarrier_wait_parity(smem_tma_mbar + preload_stage, tma_gate_phase[preload_stage]);
-                        tma_gate_phase[preload_stage] ^= 1u;
-                    }
-                    if (tidx == 1)
-                    {
-                        mbarrier_wait_parity(
-                            smem_tma_mbar + kWeightStages + preload_stage, tma_up_phase[preload_stage]);
-                        tma_up_phase[preload_stage] ^= 1u;
+                        mbarrier_wait_parity(smem_tma_full + preload_stage, tma_phase[preload_stage]);
+                        tma_phase[preload_stage] ^= 1u;
                     }
                 }
                 else
@@ -1044,33 +935,12 @@ __global__ __launch_bounds__(384, DSV3_FUSED_EXPERT_UP_LB_BLOCKS_PER_SM) void ds
     }
 
     // ===== Phase 5: SiLU*x writer =====
-    if (is_gate_worker && (lane & 3) == 0)
+    if (is_worker && (lane & 3) == 0)
     {
-        int const row_top = lane >> 2;
-        int const row_bot = row_top + 8;
-        smem_gate_acc[my_m_gate * 16 + row_top] = d_gate[0];
-        smem_gate_acc[my_m_gate * 16 + row_bot] = d_gate[2];
-    }
-    if (is_up_worker && (lane & 3) == 0)
-    {
-        int const row_top = lane >> 2;
-        int const row_bot = row_top + 8;
-        smem_up_acc[my_m_up * 16 + row_top] = d_up[0];
-        smem_up_acc[my_m_up * 16 + row_bot] = d_up[2];
-    }
-
-    if (is_gate_worker || is_up_worker)
-    {
-        int const pair_m = is_gate_worker ? my_m_gate : my_m_up;
-        gate_up_pair_bar_sync(pair_m);
-    }
-
-    if (is_gate_worker && lane < 16)
-    {
-        int const local_row = lane;
-        int const global_row = row_stripe_start + my_m_gate * 16 + local_row;
-        float const g = smem_gate_acc[my_m_gate * 16 + local_row];
-        float const u = smem_up_acc[my_m_gate * 16 + local_row];
+        int const local_row = lane >> 2;
+        int const global_row = row_stripe_start + my_m * kRowsPerWorker + local_row;
+        float const g = d_pair[0];
+        float const u = d_pair[2];
         float const silu_g = g * sigmoid_accurate(g);
         float const h = silu_g * u;
         int64_t const out_off = static_cast<int64_t>(token) * kSlotsPerToken * kInterPerTp
@@ -1089,10 +959,8 @@ static inline size_t fused_expert_up_smem_bytes()
     static_assert(kPackedWeightLoadModeParam == kPackedLoadCpAsync || kPackedWeightLoadModeParam == kPackedLoadTma);
     constexpr int kWeightStages = kUsePackedWeights ? kPackedWeightStagesParam : kStages;
     constexpr bool kUsePackedTmaWeights = kUsePackedWeights && (kPackedWeightLoadModeParam == kPackedLoadTma);
-    constexpr bool kUsePackedTmaFullEmptyPipeline = kUsePackedTmaWeights && (kWeightStages == kPackedStagesDouble);
     size_t bytes = 0;
-    bytes += static_cast<size_t>(kWeightStages) * kTileBytes;
-    bytes += static_cast<size_t>(kWeightStages) * kTileBytes;
+    bytes += static_cast<size_t>(kWeightStages) * kCombinedTileBytes;
     bytes += static_cast<size_t>(kHidden) * sizeof(__nv_bfloat16);
     // Separate fp8 act buffer (no longer aliased over bf16). +6 KiB.
     bytes += static_cast<size_t>(kHidden) * sizeof(__nv_fp8_e4m3);
@@ -1114,14 +982,10 @@ static inline size_t fused_expert_up_smem_bytes()
     bytes = align_up_128(bytes);
     bytes += sizeof(float) * kWeightScaleKBlocks;
     bytes = align_up_128(bytes);
-    bytes += sizeof(float) * kCtaOutRows;
-    bytes = align_up_128(bytes);
-    bytes += sizeof(float) * kCtaOutRows;
-    bytes = align_up_128(bytes);
     bytes = (bytes + 15u) & ~size_t(15);
     if constexpr (kUsePackedTmaWeights)
     {
-        bytes += sizeof(uint64_t) * (kUsePackedTmaFullEmptyPipeline ? 3 : 2) * kWeightStages;
+        bytes += sizeof(uint64_t) * 2 * kWeightStages;
         bytes = (bytes + 15u) & ~size_t(15);
     }
     return bytes;
@@ -1167,16 +1031,16 @@ static CUtensorMap make_packed_fused_expert_up_tmap(void* base_ptr, int num_tile
     CUtensorMap map = {};
     cuuint64_t global_dim[3] = {
         static_cast<cuuint64_t>(kPackedTmaInnerBytes),
-        static_cast<cuuint64_t>(kPackedTmaRows),
+        static_cast<cuuint64_t>(kCombinedPackedTmaRows),
         static_cast<cuuint64_t>(num_tiles * kPackedTmaSubslabs),
     };
     cuuint64_t global_stride[2] = {
         static_cast<cuuint64_t>(kPackedTmaInnerBytes),
-        static_cast<cuuint64_t>(kSubslabBytes),
+        static_cast<cuuint64_t>(kCombinedSubslabBytes),
     };
     cuuint32_t box_dim[3] = {
         static_cast<cuuint32_t>(kPackedTmaInnerBytes),
-        static_cast<cuuint32_t>(kPackedTmaRows),
+        static_cast<cuuint32_t>(kCombinedPackedTmaRows),
         static_cast<cuuint32_t>(kPackedTmaSubslabs),
     };
     cuuint32_t elem_stride[3] = {1u, 1u, 1u};
@@ -1267,13 +1131,14 @@ static std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> dsv3_fused_expert
 
     if constexpr (kUsePackedWeights)
     {
-        TORCH_CHECK(shared_gate_up_weight.size(0) == 2 && shared_gate_up_weight.size(1) == kSubRowsPerExpert
-                && shared_gate_up_weight.size(2) == kNumKIter && shared_gate_up_weight.size(3) == kTileBytes,
-            "packed shared_gate_up_weight shape mismatch");
-        TORCH_CHECK(routed_w3_w1_weight.size(0) == kNumExperts && routed_w3_w1_weight.size(1) == 2
-                && routed_w3_w1_weight.size(2) == kSubRowsPerExpert && routed_w3_w1_weight.size(3) == kNumKIter
-                && routed_w3_w1_weight.size(4) == kTileBytes,
-            "packed routed_w3_w1_weight shape mismatch");
+        TORCH_CHECK(shared_gate_up_weight.size(0) == kNumExperts + 1
+                && shared_gate_up_weight.size(1) == kSubRowsPerExpert && shared_gate_up_weight.size(2) == kNumKIter
+                && shared_gate_up_weight.size(3) == kCombinedTileBytes,
+            "packed expert_gate_up_weight shape mismatch");
+        TORCH_CHECK(shared_gate_up_scale.size(0) == kNumExperts + 1
+                && shared_gate_up_scale.size(1) == 2 * kWeightScaleMBlocks
+                && shared_gate_up_scale.size(2) == kWeightScaleKBlocks,
+            "expert_gate_up_scale shape mismatch");
     }
     else
     {
@@ -1283,12 +1148,15 @@ static std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> dsv3_fused_expert
                 && routed_w3_w1_weight.size(2) == kHidden,
             "routed_w3_w1_weight shape mismatch");
     }
-    TORCH_CHECK(
-        shared_gate_up_scale.size(0) == 2 * kWeightScaleMBlocks && shared_gate_up_scale.size(1) == kWeightScaleKBlocks,
-        "shared_gate_up_scale shape mismatch");
-    TORCH_CHECK(routed_w3_w1_scale.size(0) == kNumExperts && routed_w3_w1_scale.size(1) == 2 * kWeightScaleMBlocks
-            && routed_w3_w1_scale.size(2) == kWeightScaleKBlocks,
-        "routed_w3_w1_scale shape mismatch");
+    if constexpr (!kUsePackedWeights)
+    {
+        TORCH_CHECK(shared_gate_up_scale.size(0) == 2 * kWeightScaleMBlocks
+                && shared_gate_up_scale.size(1) == kWeightScaleKBlocks,
+            "shared_gate_up_scale shape mismatch");
+        TORCH_CHECK(routed_w3_w1_scale.size(0) == kNumExperts && routed_w3_w1_scale.size(1) == 2 * kWeightScaleMBlocks
+                && routed_w3_w1_scale.size(2) == kWeightScaleKBlocks,
+            "routed_w3_w1_scale shape mismatch");
+    }
 
     auto stream = at::cuda::getCurrentCUDAStream();
     const at::cuda::OptionalCUDAGuard device_guard(scores.device());
@@ -1301,18 +1169,11 @@ static std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> dsv3_fused_expert
         AT_CUDA_CHECK(cudaGetDevice(&device_id));
 
         CUresult shared_tma_err = CUDA_SUCCESS;
-        shared_gate_up_tma = get_cached_packed_fused_expert_up_tmap(
-            shared_gate_up_weight.data_ptr(), 2 * kSubRowsPerExpert * kNumKIter, device_id, &shared_tma_err);
+        shared_gate_up_tma = get_cached_packed_fused_expert_up_tmap(shared_gate_up_weight.data_ptr(),
+            (kNumExperts + 1) * kSubRowsPerExpert * kNumKIter, device_id, &shared_tma_err);
         TORCH_CHECK(shared_tma_err == CUDA_SUCCESS,
-            "cuTensorMapEncodeTiled (dsv3_fused_expert_up shared_gate_up packed) failed: CUresult=",
+            "cuTensorMapEncodeTiled (dsv3_fused_expert_up expert_gate_up packed) failed: CUresult=",
             (int) shared_tma_err);
-
-        CUresult routed_tma_err = CUDA_SUCCESS;
-        routed_w3_w1_tma = get_cached_packed_fused_expert_up_tmap(routed_w3_w1_weight.data_ptr(),
-            kNumExperts * 2 * kSubRowsPerExpert * kNumKIter, device_id, &routed_tma_err);
-        TORCH_CHECK(routed_tma_err == CUDA_SUCCESS,
-            "cuTensorMapEncodeTiled (dsv3_fused_expert_up routed_w3_w1 packed) failed: CUresult=",
-            (int) routed_tma_err);
     }
 
     static bool s_logged = false;
@@ -1445,18 +1306,16 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> DSV3_FUSED_EXPERT_UP_RAW
 }
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> DSV3_FUSED_EXPERT_UP_NAME(torch::Tensor scores,
-    torch::Tensor hidden_in, torch::Tensor bias, torch::Tensor shared_gate_up_weight,
-    torch::Tensor shared_gate_up_scale, torch::Tensor routed_w3_w1_weight, torch::Tensor routed_w3_w1_scale,
-    double routed_scaling_factor)
+    torch::Tensor hidden_in, torch::Tensor bias, torch::Tensor expert_gate_up_weight,
+    torch::Tensor expert_gate_up_scale, double routed_scaling_factor)
 {
 
-    TORCH_CHECK(scores.is_cuda() && hidden_in.is_cuda() && bias.is_cuda() && shared_gate_up_weight.is_cuda()
-            && shared_gate_up_scale.is_cuda() && routed_w3_w1_weight.is_cuda() && routed_w3_w1_scale.is_cuda(),
+    TORCH_CHECK(scores.is_cuda() && hidden_in.is_cuda() && bias.is_cuda() && expert_gate_up_weight.is_cuda()
+            && expert_gate_up_scale.is_cuda(),
         "inputs must be CUDA");
     TORCH_CHECK(scores.dtype() == torch::kFloat32 && hidden_in.dtype() == torch::kBFloat16
-            && bias.dtype() == torch::kBFloat16 && shared_gate_up_weight.dtype() == torch::kFloat8_e4m3fn
-            && shared_gate_up_scale.dtype() == torch::kFloat32 && routed_w3_w1_weight.dtype() == torch::kFloat8_e4m3fn
-            && routed_w3_w1_scale.dtype() == torch::kFloat32,
+            && bias.dtype() == torch::kBFloat16 && expert_gate_up_weight.dtype() == torch::kFloat8_e4m3fn
+            && expert_gate_up_scale.dtype() == torch::kFloat32,
         "dtype mismatch");
 
     auto const M = scores.size(0);
@@ -1465,34 +1324,22 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> DSV3_FUSED_EXPERT_UP_NAM
     TORCH_CHECK(bias.size(0) == kNumExperts);
 
     TORCH_CHECK(scores.is_contiguous() && hidden_in.is_contiguous() && bias.is_contiguous()
-            && shared_gate_up_weight.is_contiguous() && shared_gate_up_scale.is_contiguous()
-            && routed_w3_w1_weight.is_contiguous() && routed_w3_w1_scale.is_contiguous(),
+            && expert_gate_up_weight.is_contiguous() && expert_gate_up_scale.is_contiguous(),
         "inputs must be contiguous");
 
-    TORCH_CHECK(shared_gate_up_weight.dim() == 4,
-        "packed shared_gate_up_weight must be 4D [gate_up, sub_row, k_iter, tile_bytes]");
-    TORCH_CHECK(
-        shared_gate_up_scale.dim() == 2, "shared_gate_up_scale must be 2D [2 * inter_per_tp / 128, hidden / 128]");
-    TORCH_CHECK(routed_w3_w1_weight.dim() == 5,
-        "packed routed_w3_w1_weight must be 5D [num_experts, gate_up, sub_row, k_iter, tile_bytes]");
-    TORCH_CHECK(routed_w3_w1_scale.dim() == 3,
-        "routed_w3_w1_scale must be 3D [num_experts, 2 * inter_per_tp / 128, hidden / 128]");
-    TORCH_CHECK(shared_gate_up_weight.size(0) == 2 && shared_gate_up_weight.size(2) == kNumKIter
-            && shared_gate_up_weight.size(3) == kTileBytes,
-        "packed shared_gate_up_weight shape mismatch");
-    TORCH_CHECK(routed_w3_w1_weight.size(0) == kNumExperts && routed_w3_w1_weight.size(1) == 2
-            && routed_w3_w1_weight.size(3) == kNumKIter && routed_w3_w1_weight.size(4) == kTileBytes,
-        "packed routed_w3_w1_weight shape mismatch");
-    TORCH_CHECK(routed_w3_w1_scale.size(0) == kNumExperts && routed_w3_w1_scale.size(2) == kWeightScaleKBlocks,
-        "routed_w3_w1_scale shape mismatch");
+    TORCH_CHECK(expert_gate_up_weight.dim() == 4,
+        "packed expert_gate_up_weight must be 4D [num_experts_plus_shared, sub_row, k_iter, tile_bytes]");
+    TORCH_CHECK(expert_gate_up_scale.dim() == 3,
+        "expert_gate_up_scale must be 3D [num_experts_plus_shared, 2 * inter_per_tp / 128, hidden / 128]");
+    TORCH_CHECK(expert_gate_up_weight.size(0) == kNumExperts + 1 && expert_gate_up_weight.size(2) == kNumKIter
+            && expert_gate_up_weight.size(3) == kCombinedTileBytes,
+        "packed expert_gate_up_weight shape mismatch");
+    TORCH_CHECK(expert_gate_up_scale.size(0) == kNumExperts + 1 && expert_gate_up_scale.size(2) == kWeightScaleKBlocks,
+        "expert_gate_up_scale shape mismatch");
 
-    int64_t const inter_per_tp = routed_w3_w1_weight.size(2) * kCtaOutRows;
-    TORCH_CHECK(shared_gate_up_weight.size(1) == routed_w3_w1_weight.size(2),
-        "packed shared and routed weight sub_row dimensions must match");
+    int64_t const inter_per_tp = expert_gate_up_weight.size(1) * kCtaOutRows;
     TORCH_CHECK(
-        shared_gate_up_scale.size(0) == 2 * (inter_per_tp / 128) && shared_gate_up_scale.size(1) == kWeightScaleKBlocks,
-        "shared_gate_up_scale shape mismatch");
-    TORCH_CHECK(routed_w3_w1_scale.size(1) == 2 * (inter_per_tp / 128), "routed_w3_w1_scale shape mismatch");
+        expert_gate_up_scale.size(1) == 2 * (inter_per_tp / 128), "expert_gate_up_scale m-block shape mismatch");
     int const packed_stages = fused_expert_up_packed_weight_stages();
     int const packed_load_mode = fused_expert_up_packed_weight_load_mode();
 
@@ -1503,26 +1350,22 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> DSV3_FUSED_EXPERT_UP_NAM
             if (packed_load_mode == kPackedLoadTma)
             {
                 return dsv3_fused_expert_up_impl<kInterPerTp_TP8, true, kPackedStagesSingle, kPackedLoadTma>(
-                    std::move(scores), std::move(hidden_in), std::move(bias), std::move(shared_gate_up_weight),
-                    std::move(shared_gate_up_scale), std::move(routed_w3_w1_weight), std::move(routed_w3_w1_scale),
-                    routed_scaling_factor);
+                    std::move(scores), std::move(hidden_in), std::move(bias), expert_gate_up_weight,
+                    expert_gate_up_scale, expert_gate_up_weight, expert_gate_up_scale, routed_scaling_factor);
             }
             return dsv3_fused_expert_up_impl<kInterPerTp_TP8, true, kPackedStagesSingle, kPackedLoadCpAsync>(
-                std::move(scores), std::move(hidden_in), std::move(bias), std::move(shared_gate_up_weight),
-                std::move(shared_gate_up_scale), std::move(routed_w3_w1_weight), std::move(routed_w3_w1_scale),
-                routed_scaling_factor);
+                std::move(scores), std::move(hidden_in), std::move(bias), expert_gate_up_weight, expert_gate_up_scale,
+                expert_gate_up_weight, expert_gate_up_scale, routed_scaling_factor);
         }
         if (packed_load_mode == kPackedLoadTma)
         {
             return dsv3_fused_expert_up_impl<kInterPerTp_TP8, true, kPackedStagesDouble, kPackedLoadTma>(
-                std::move(scores), std::move(hidden_in), std::move(bias), std::move(shared_gate_up_weight),
-                std::move(shared_gate_up_scale), std::move(routed_w3_w1_weight), std::move(routed_w3_w1_scale),
-                routed_scaling_factor);
+                std::move(scores), std::move(hidden_in), std::move(bias), expert_gate_up_weight, expert_gate_up_scale,
+                expert_gate_up_weight, expert_gate_up_scale, routed_scaling_factor);
         }
         return dsv3_fused_expert_up_impl<kInterPerTp_TP8, true, kPackedStagesDouble, kPackedLoadCpAsync>(
-            std::move(scores), std::move(hidden_in), std::move(bias), std::move(shared_gate_up_weight),
-            std::move(shared_gate_up_scale), std::move(routed_w3_w1_weight), std::move(routed_w3_w1_scale),
-            routed_scaling_factor);
+            std::move(scores), std::move(hidden_in), std::move(bias), expert_gate_up_weight, expert_gate_up_scale,
+            expert_gate_up_weight, expert_gate_up_scale, routed_scaling_factor);
     }
     else if (inter_per_tp == kInterPerTp_TP4)
     {
@@ -1531,26 +1374,22 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> DSV3_FUSED_EXPERT_UP_NAM
             if (packed_load_mode == kPackedLoadTma)
             {
                 return dsv3_fused_expert_up_impl<kInterPerTp_TP4, true, kPackedStagesSingle, kPackedLoadTma>(
-                    std::move(scores), std::move(hidden_in), std::move(bias), std::move(shared_gate_up_weight),
-                    std::move(shared_gate_up_scale), std::move(routed_w3_w1_weight), std::move(routed_w3_w1_scale),
-                    routed_scaling_factor);
+                    std::move(scores), std::move(hidden_in), std::move(bias), expert_gate_up_weight,
+                    expert_gate_up_scale, expert_gate_up_weight, expert_gate_up_scale, routed_scaling_factor);
             }
             return dsv3_fused_expert_up_impl<kInterPerTp_TP4, true, kPackedStagesSingle, kPackedLoadCpAsync>(
-                std::move(scores), std::move(hidden_in), std::move(bias), std::move(shared_gate_up_weight),
-                std::move(shared_gate_up_scale), std::move(routed_w3_w1_weight), std::move(routed_w3_w1_scale),
-                routed_scaling_factor);
+                std::move(scores), std::move(hidden_in), std::move(bias), expert_gate_up_weight, expert_gate_up_scale,
+                expert_gate_up_weight, expert_gate_up_scale, routed_scaling_factor);
         }
         if (packed_load_mode == kPackedLoadTma)
         {
             return dsv3_fused_expert_up_impl<kInterPerTp_TP4, true, kPackedStagesDouble, kPackedLoadTma>(
-                std::move(scores), std::move(hidden_in), std::move(bias), std::move(shared_gate_up_weight),
-                std::move(shared_gate_up_scale), std::move(routed_w3_w1_weight), std::move(routed_w3_w1_scale),
-                routed_scaling_factor);
+                std::move(scores), std::move(hidden_in), std::move(bias), expert_gate_up_weight, expert_gate_up_scale,
+                expert_gate_up_weight, expert_gate_up_scale, routed_scaling_factor);
         }
         return dsv3_fused_expert_up_impl<kInterPerTp_TP4, true, kPackedStagesDouble, kPackedLoadCpAsync>(
-            std::move(scores), std::move(hidden_in), std::move(bias), std::move(shared_gate_up_weight),
-            std::move(shared_gate_up_scale), std::move(routed_w3_w1_weight), std::move(routed_w3_w1_scale),
-            routed_scaling_factor);
+            std::move(scores), std::move(hidden_in), std::move(bias), expert_gate_up_weight, expert_gate_up_scale,
+            expert_gate_up_weight, expert_gate_up_scale, routed_scaling_factor);
     }
     else
     {

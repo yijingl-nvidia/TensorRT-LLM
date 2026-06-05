@@ -31,9 +31,8 @@ namespace th = torch;
 namespace dsv3_fused_expert
 {
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> dsv3_fused_expert_up_dev_cuda(torch::Tensor scores,
-    torch::Tensor hidden_in, torch::Tensor bias, torch::Tensor shared_gate_up_weight,
-    torch::Tensor shared_gate_up_scale, torch::Tensor routed_w3_w1_weight, torch::Tensor routed_w3_w1_scale,
-    double routed_scaling_factor);
+    torch::Tensor hidden_in, torch::Tensor bias, torch::Tensor expert_gate_up_weight,
+    torch::Tensor expert_gate_up_scale, double routed_scaling_factor);
 } // namespace dsv3_fused_expert
 
 namespace tensorrt_llm
@@ -43,12 +42,10 @@ namespace torch_ext
 {
 
 std::tuple<th::Tensor, th::Tensor, th::Tensor> dsv3_fused_expert_up_dev(th::Tensor scores, th::Tensor hidden_in,
-    th::Tensor bias, th::Tensor shared_gate_up_weight, th::Tensor shared_gate_up_scale, th::Tensor routed_w3_w1_weight,
-    th::Tensor routed_w3_w1_scale, double routed_scaling_factor)
+    th::Tensor bias, th::Tensor expert_gate_up_weight, th::Tensor expert_gate_up_scale, double routed_scaling_factor)
 {
     return dsv3_fused_expert::dsv3_fused_expert_up_dev_cuda(std::move(scores), std::move(hidden_in), std::move(bias),
-        std::move(shared_gate_up_weight), std::move(shared_gate_up_scale), std::move(routed_w3_w1_weight),
-        std::move(routed_w3_w1_scale), routed_scaling_factor);
+        std::move(expert_gate_up_weight), std::move(expert_gate_up_scale), routed_scaling_factor);
 }
 
 } // namespace torch_ext
@@ -59,8 +56,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
         "dsv3_fused_expert_up_dev(Tensor scores, Tensor hidden_in, Tensor bias, "
-        "Tensor shared_gate_up_weight, Tensor shared_gate_up_scale, Tensor routed_w3_w1_weight, "
-        "Tensor routed_w3_w1_scale, float routed_scaling_factor) -> "
+        "Tensor expert_gate_up_weight, Tensor expert_gate_up_scale, float routed_scaling_factor) -> "
         "(Tensor topk_values, Tensor topk_indices, Tensor hidden_out)");
 }
 
