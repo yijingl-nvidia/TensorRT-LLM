@@ -597,6 +597,14 @@ __global__ __launch_bounds__(384, DSV3_FUSED_EXPERT_UP_LB_BLOCKS_PER_SM) void ds
     rs_base += sizeof(float) * kWeightScaleKBlocks;
     rs_base = align_up_128(rs_base);
 
+    float* const smem_gate_weight_scales = reinterpret_cast<float*>(rs_base);
+    rs_base += sizeof(float) * kWeightScaleKBlocks;
+    rs_base = align_up_128(rs_base);
+
+    float* const smem_up_weight_scales = reinterpret_cast<float*>(rs_base);
+    rs_base += sizeof(float) * kWeightScaleKBlocks;
+    rs_base = align_up_128(rs_base);
+
     float* const smem_gate_acc = reinterpret_cast<float*>(rs_base);
     rs_base += sizeof(float) * kCtaOutRows;
     rs_base = align_up_128(rs_base);
@@ -812,11 +820,18 @@ __global__ __launch_bounds__(384, DSV3_FUSED_EXPERT_UP_LB_BLOCKS_PER_SM) void ds
             asm volatile("cp.async.commit_group;\n" :::);
             asm volatile("cp.async.wait_all;\n" :::);
         }
-        if constexpr (!kUsePackedTmaFullEmptyPipeline)
-        {
-            __syncthreads();
-        }
     }
+
+    if (tidx < kWeightScaleKBlocks)
+    {
+        float const* const gate_weight_scale_base
+            = raw_scale_ptr<kInterPerTpParam, true>(shared_gate_up_scale, routed_w3_w1_scale, my_expert, sub_row, 0);
+        float const* const up_weight_scale_base
+            = raw_scale_ptr<kInterPerTpParam, false>(shared_gate_up_scale, routed_w3_w1_scale, my_expert, sub_row, 0);
+        smem_gate_weight_scales[tidx] = __ldg(gate_weight_scale_base + tidx);
+        smem_up_weight_scales[tidx] = __ldg(up_weight_scale_base + tidx);
+    }
+    __syncthreads();
 
     // ---- fused expert up K-loop - per-K-BLOCK scaling (6 scales per K-iter, applied
     //      block-wise inside the inner MMA loop). ----
@@ -927,18 +942,12 @@ __global__ __launch_bounds__(384, DSV3_FUSED_EXPERT_UP_LB_BLOCKS_PER_SM) void ds
 
         if (is_gate_worker)
         {
-            // Per-K-iter, per-K-block scale load: 6 fp32 weight scales per K-iter.
-            // Also load the corresponding activation dequant scales produced by
-            // the in-kernel 1x128 quant during Phase 1.
             float gate_block_scales[kWeightScaleKBlocksPerKIter];
-            float const* const gate_block_scale_base = raw_scale_ptr<kInterPerTpParam, true>(
-                shared_gate_up_scale, routed_w3_w1_scale, my_expert, sub_row, k);
 #pragma unroll
             for (int kb = 0; kb < kWeightScaleKBlocksPerKIter; ++kb)
             {
-                float const gate_scale = lane == 0 ? __ldg(gate_block_scale_base + kb) : 0.f;
-                float const act_scale = lane == 0 ? smem_act_block_scales[k * kWeightScaleKBlocksPerKIter + kb] : 0.f;
-                gate_block_scales[kb] = __shfl_sync(0xffffffff, gate_scale * act_scale, 0);
+                int const scale_idx = k * kWeightScaleKBlocksPerKIter + kb;
+                gate_block_scales[kb] = smem_gate_weight_scales[scale_idx] * smem_act_block_scales[scale_idx];
             }
             if constexpr (kUsePackedTmaFullEmptyPipeline)
             {
@@ -957,14 +966,11 @@ __global__ __launch_bounds__(384, DSV3_FUSED_EXPERT_UP_LB_BLOCKS_PER_SM) void ds
         if (is_up_worker)
         {
             float up_block_scales[kWeightScaleKBlocksPerKIter];
-            float const* const up_block_scale_base = raw_scale_ptr<kInterPerTpParam, false>(
-                shared_gate_up_scale, routed_w3_w1_scale, my_expert, sub_row, k);
 #pragma unroll
             for (int kb = 0; kb < kWeightScaleKBlocksPerKIter; ++kb)
             {
-                float const up_scale = lane == 0 ? __ldg(up_block_scale_base + kb) : 0.f;
-                float const act_scale = lane == 0 ? smem_act_block_scales[k * kWeightScaleKBlocksPerKIter + kb] : 0.f;
-                up_block_scales[kb] = __shfl_sync(0xffffffff, up_scale * act_scale, 0);
+                int const scale_idx = k * kWeightScaleKBlocksPerKIter + kb;
+                up_block_scales[kb] = smem_up_weight_scales[scale_idx] * smem_act_block_scales[scale_idx];
             }
             if constexpr (kUsePackedTmaFullEmptyPipeline)
             {
@@ -1103,6 +1109,10 @@ static inline size_t fused_expert_up_smem_bytes()
     bytes += sizeof(int32_t) * kTopK;
     bytes = align_up_128(bytes);
     // smem_act_block_scales[48]: per-128-col activation dequant scales.
+    bytes += sizeof(float) * kWeightScaleKBlocks;
+    bytes = align_up_128(bytes);
+    bytes += sizeof(float) * kWeightScaleKBlocks;
+    bytes = align_up_128(bytes);
     bytes += sizeof(float) * kWeightScaleKBlocks;
     bytes = align_up_128(bytes);
     bytes += sizeof(float) * kCtaOutRows;
