@@ -121,9 +121,12 @@ constexpr int kKSubsPerIter = kKTile / 32;  // 24
 constexpr int kWeightScaleKBlocks = 48; // original 128-col K-blocks (kHidden / 128)
 constexpr int kWeightScaleKBlocksPerKIter = kWeightScaleKBlocks / kNumKIter; // 6
 
-constexpr int kWorkerWarpBase = 4;
+constexpr int kWorkerWarpBase = 0;
 constexpr int kNumWorkers = 8;
 constexpr int kRowsPerWorker = 8;
+constexpr int kTmaProducerWarp = kWorkerWarpBase + kNumWorkers;
+constexpr int kTmaProducerThread = kTmaProducerWarp * kWarpSize;
+static_assert(kTmaProducerWarp == 8);
 
 constexpr int kTileBytes = kCtaOutRows * kKTile; // 49152 (48 KiB)
 
@@ -246,26 +249,18 @@ __device__ __forceinline__ int fused_expert_up_combined_lane_offset(int m_tile, 
         + lane * kLaneBytes;
 }
 
-__device__ __forceinline__ uint16_t half_bits(__half x)
-{
-    return *reinterpret_cast<uint16_t*>(&x);
-}
-
-__device__ __forceinline__ uint32_t pack_half_pair(__half lo, __half hi)
-{
-    return static_cast<uint32_t>(half_bits(lo)) | (static_cast<uint32_t>(half_bits(hi)) << 16);
-}
-
-__device__ __forceinline__ __half fp8_byte_to_half(uint32_t packed, int byte_idx)
-{
-    __nv_fp8_e4m3 x;
-    x.__x = static_cast<decltype(x.__x)>((packed >> (byte_idx * 8)) & 0xffu);
-    return __float2half(static_cast<float>(x));
-}
-
 __device__ __forceinline__ uint32_t fp8_pair_to_half_pair(uint32_t packed, int lo_byte_idx)
 {
-    return pack_half_pair(fp8_byte_to_half(packed, lo_byte_idx), fp8_byte_to_half(packed, lo_byte_idx + 1));
+    __nv_fp8x2_storage_t const fp8_pair = static_cast<__nv_fp8x2_storage_t>((packed >> (lo_byte_idx * 8)) & 0xffffu);
+
+    union
+    {
+        __half2_raw half2;
+        uint32_t u32;
+    } out;
+
+    out.half2 = __nv_cvt_fp8x2_to_halfraw2(fp8_pair, __NV_E4M3);
+    return out.u32;
 }
 
 __device__ __forceinline__ void hmma_m16n8k16_f16(
@@ -781,7 +776,7 @@ __global__ __launch_bounds__(384, DSV3_FUSED_EXPERT_UP_LB_BLOCKS_PER_SM) void ds
             if constexpr (kUsePackedTmaFullEmptyPipeline)
             {
                 int const k_load = k + kWeightStages;
-                if (k_load < kNumKIter && tidx == 0)
+                if (k_load < kNumKIter && tidx == kTmaProducerThread)
                 {
                     int const load_stage = k_load % kWeightStages;
                     int const load_phase = (k_load / kWeightStages) & 1;
@@ -799,7 +794,7 @@ __global__ __launch_bounds__(384, DSV3_FUSED_EXPERT_UP_LB_BLOCKS_PER_SM) void ds
                 // Keep this prefetch ahead of MMA so copy latency overlaps with the current K tile.
                 if constexpr (kUsePackedTmaWeights)
                 {
-                    if (tidx == 0)
+                    if (tidx == kTmaProducerThread)
                     {
                         issue_packed_weight_tma_fused_expert_up<kInterPerTpParam>(
                             smem_weight_tiles + preload_stage * kCombinedTileBytes, &shared_gate_up_tma, packed_expert,
@@ -820,12 +815,12 @@ __global__ __launch_bounds__(384, DSV3_FUSED_EXPERT_UP_LB_BLOCKS_PER_SM) void ds
         {
             if constexpr (kUsePackedTmaWeights)
             {
-                if (tidx == 0)
+                if (tidx == kTmaProducerThread)
                 {
                     issue_packed_weight_tma_fused_expert_up<kInterPerTpParam>(
                         smem_weight_tiles, &shared_gate_up_tma, packed_expert, sub_row, k, smem_tma_full);
                 }
-                if (tidx == 0)
+                if (tidx == kTmaProducerThread)
                 {
                     mbarrier_wait_parity(smem_tma_full, tma_phase[0]);
                     tma_phase[0] ^= 1u;
@@ -883,7 +878,7 @@ __global__ __launch_bounds__(384, DSV3_FUSED_EXPERT_UP_LB_BLOCKS_PER_SM) void ds
                 int const preload_stage = (k + 1) & 1;
                 if constexpr (kUsePackedTmaWeights)
                 {
-                    if (tidx == 0)
+                    if (tidx == kTmaProducerThread)
                     {
                         mbarrier_wait_parity(smem_tma_full + preload_stage, tma_phase[preload_stage]);
                         tma_phase[preload_stage] ^= 1u;
@@ -924,6 +919,7 @@ template <bool kUsePackedWeights, int kPackedWeightStagesParam = kPackedStagesDe
 static inline size_t fused_expert_up_smem_bytes()
 {
     auto align_up_128 = [](size_t p) -> size_t { return (p + 127u) & ~size_t(127); };
+    static_assert(kPackedWeightStagesParam == kPackedStagesSingle || kPackedWeightStagesParam == kPackedStagesDouble);
     static_assert(kPackedWeightLoadModeParam == kPackedLoadCpAsync || kPackedWeightLoadModeParam == kPackedLoadTma);
     constexpr int kWeightStages = kUsePackedWeights ? kPackedWeightStagesParam : kStages;
     constexpr bool kUsePackedTmaWeights = kUsePackedWeights && (kPackedWeightLoadModeParam == kPackedLoadTma);
