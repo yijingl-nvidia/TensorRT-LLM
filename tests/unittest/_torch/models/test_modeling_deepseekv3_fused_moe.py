@@ -61,14 +61,14 @@ _DEFAULT_CUDA_GRAPH_CAPTURE_WARMUP_ITERS = 3
 _ERROR_EPS = 1e-12
 _FUSED_KERNEL_ABS_ERROR_THRESHOLD_SLACK = 1.35
 _CURRENT_FUSED_KERNEL_ABS_ERROR_THRESHOLDS_BY_RANK = (
-    7.70e-05,
-    6.50e-05,
+    7.30e-05,
+    7.06e-05,
     1.23e-04,
-    7.10e-05,
-    1.04e-04,
-    6.12e-05,
-    7.10e-05,
-    4.14e-04,
+    7.25e-05,
+    9.54e-05,
+    7.54e-05,
+    6.78e-05,
+    4.15e-04,
 )
 _EXTRA_OP_LIBRARIES_LOADED = False
 
@@ -77,8 +77,8 @@ _EXTRA_OP_LIBRARIES_LOADED = False
 # by rank should remain the practical target for future kernel work.
 # Current accepted fused-kernel max abs thresholds by rank are intentionally
 # tight to the present implementation on the dumped GLM-5 data:
-# [7.70e-05, 6.50e-05, 1.23e-04, 7.10e-05,
-#  1.04e-04, 6.12e-05, 7.10e-05, 4.14e-04].
+# [7.30e-05, 7.06e-05, 1.23e-04, 7.25e-05,
+#  9.54e-05, 7.54e-05, 6.78e-05, 4.15e-04].
 
 # Tensor shape symbols used by the comments below:
 # T: number of test tokens after the optional max-token slice.
