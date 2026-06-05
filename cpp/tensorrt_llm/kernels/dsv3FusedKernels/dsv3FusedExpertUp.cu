@@ -1027,6 +1027,15 @@ __global__ __launch_bounds__(384, DSV3_FUSED_EXPERT_UP_LB_BLOCKS_PER_SM) void ds
         smem_gate_acc[my_m_gate * 16 + row_top] = d_gate[0];
         smem_gate_acc[my_m_gate * 16 + row_bot] = d_gate[2];
     }
+    if (is_gate_worker && expert_slot != 0)
+    {
+        float const gate_abs = (lane & 3) == 0 ? fmaxf(fabsf(d_gate[0]), fabsf(d_gate[2])) : 0.f;
+        float const warp_amax = cg::reduce(warp, gate_abs, cg::greater<float>{});
+        if (lane == 0)
+        {
+            smem_score_sigmoid[my_m_gate] = warp_amax;
+        }
+    }
     if (is_up_worker && (lane & 3) == 0)
     {
         int const row_top = lane >> 2;
@@ -1041,19 +1050,10 @@ __global__ __launch_bounds__(384, DSV3_FUSED_EXPERT_UP_LB_BLOCKS_PER_SM) void ds
     // inside one CTA; the reference uses 128-row blocks.
     if (expert_slot != 0)
     {
-        if (warp_idx == 0)
-        {
-            float const gate_abs = fmaxf(fabsf(smem_gate_acc[lane]), fabsf(smem_gate_acc[lane + kWarpSize]));
-            float const warp_amax = cg::reduce(warp, gate_abs, cg::greater<float>{});
-            if (lane == 0)
-            {
-                smem_score_sigmoid[0] = warp_amax;
-            }
-        }
-        __syncthreads();
         if (tidx < kCtaOutRows)
         {
-            float const amax = smem_score_sigmoid[0];
+            float const amax = fmaxf(fmaxf(smem_score_sigmoid[0], smem_score_sigmoid[1]),
+                fmaxf(smem_score_sigmoid[2], smem_score_sigmoid[3]));
             float const dequant_scale = amax > 0.f ? (amax * kInvFp8Max) : 0.f;
             float const quant_scale = amax > 0.f ? (kFp8Max / amax) : 1.f;
             float const q = fmaxf(-kFp8Max, fminf(kFp8Max, smem_gate_acc[tidx] * quant_scale));
