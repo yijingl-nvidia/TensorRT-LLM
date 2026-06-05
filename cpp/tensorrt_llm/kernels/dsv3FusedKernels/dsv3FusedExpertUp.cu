@@ -63,6 +63,7 @@ constexpr int kWarpSize = 32;
 constexpr int kNumWarps = kThreadsPerCta / kWarpSize;
 constexpr int kMaxNumExpertsUnit = 128;
 constexpr int kNumExpertWarps = (kNumExperts - 1) / kMaxNumExpertsUnit + 1;
+static_assert(kNumExpertWarps == 2);
 constexpr int kMaxNumTopGroups = 4;
 constexpr int kNumInterTopK = kNumExpertWarps * kTopK;
 
@@ -152,9 +153,11 @@ constexpr int kKsubBytes = kWarpSize * kLaneBytes;                   // 512 B pe
 constexpr int kKSubsPerThird = 4;                                    // 4 k_subs per k_sixth
 constexpr int kMtileSubslabBytes = kKSubsPerThird * kKsubBytes;      // 2048 B per m_tile within a k_sixth
 constexpr int kSubslabBytes = kCtaOutRows / 16 * kMtileSubslabBytes; // 4 * 2048 = 8192 B per k_sixth
-constexpr int kPackedTmaInnerBytes = 256;
-constexpr int kPackedTmaRows = kTileBytes / kPackedTmaInnerBytes;
-static_assert(kTileBytes % kPackedTmaInnerBytes == 0);
+constexpr int kPackedTmaInnerBytes = 128;
+constexpr int kPackedTmaRows = kSubslabBytes / kPackedTmaInnerBytes;
+constexpr int kPackedTmaSubslabs = kTileBytes / kSubslabBytes;
+static_assert(kSubslabBytes % kPackedTmaInnerBytes == 0);
+static_assert(kPackedTmaSubslabs == kWeightScaleKBlocksPerKIter);
 
 static __device__ inline float sigmoid_accurate(float x)
 {
@@ -395,14 +398,15 @@ __device__ __forceinline__ void issue_packed_weight_tma_fused_expert_up(__nv_fp8
     uint64_t* mbar)
 {
     int const tile_idx = packed_weight_tile_idx<kInterPerTpParam, kGate>(expert, sub_row, k_iter);
+    int const coord_z = tile_idx * kPackedTmaSubslabs;
     mbarrier_arrive_expect_tx(mbar, kTileBytes);
     if (expert == kSharedExpert)
     {
-        cp_async_bulk_tensor_3d(smem_tile, shared_gate_up_tma, 0, 0, tile_idx, mbar);
+        cp_async_bulk_tensor_3d(smem_tile, shared_gate_up_tma, 0, 0, coord_z, mbar);
     }
     else
     {
-        cp_async_bulk_tensor_3d(smem_tile, routed_w3_w1_tma, 0, 0, tile_idx, mbar);
+        cp_async_bulk_tensor_3d(smem_tile, routed_w3_w1_tma, 0, 0, coord_z, mbar);
     }
 }
 
@@ -687,40 +691,45 @@ __global__ __launch_bounds__(384, DSV3_FUSED_EXPERT_UP_LB_BLOCKS_PER_SM) void ds
             smem_inter_scores[warp_idx * kTopK + lane] = top_scores[lane];
             smem_inter_experts[warp_idx * kTopK + lane] = top_experts[lane];
         }
+
+        // Only the two top-K warps need smem_inter_* published before warp 0
+        // can run stage 2; quant warps continue independently.
+        asm volatile("bar.sync 1, 64;\n" ::: "memory");
+
+        // ----- Top-K stage 2 (warp 0 only). -----
+        if (warp_idx == 0)
+        {
+            float cand_val = (lane < kNumInterTopK) ? smem_inter_scores[lane] : kInvalidScore;
+            int32_t cand_idx = (lane < kNumInterTopK) ? smem_inter_experts[lane] : (kNumExperts - 1);
+            mega_topk::reduceTopK<kTopK, float>(
+                warp, top_scores, top_experts, cand_val, cand_idx, kInvalidScore, kTopK);
+
+            int32_t const expert_idx = (lane < kTopK) ? top_experts[lane] : (kNumExperts - 1);
+            float const score_norm = (lane < kTopK) ? smem_score_sigmoid[expert_idx] : 0.f;
+            // Match noAuxTcKernels.cu: the warp reduction itself is fp32, then
+            // the double scaling factor and double literal promote the final
+            // division expression before the OutputT cast.
+            float const red_norm = cg::reduce(warp, score_norm, cg::plus<float>{});
+            double const final_score_d
+                = (double) score_norm * (double) routed_scaling_factor / ((double) red_norm + 1e-20);
+            float const final_score = static_cast<float>(final_score_d);
+
+            if (lane < kTopK)
+            {
+                smem_topk_i[lane] = expert_idx;
+                if (blockIdx.y == 0)
+                {
+                    int64_t out_off = static_cast<int64_t>(token) * kTopK + lane;
+                    topk_weights[out_off] = final_score;
+                    topk_indices[out_off] = expert_idx;
+                }
+            }
+        }
     }
     else
     {
         quant_act_blocks_fused_expert_up<kQuantWarps>(
             warp, smem_act_bf16, smem_act_fp8, smem_act_block_scales, warp_idx - kNumExpertWarps, lane);
-    }
-    __syncthreads();
-
-    // ----- Top-K stage 2 (warp 0 only); quant warps + warp 1 idle here. -----
-    if (warp_idx == 0)
-    {
-        float cand_val = (lane < kNumInterTopK) ? smem_inter_scores[lane] : kInvalidScore;
-        int32_t cand_idx = (lane < kNumInterTopK) ? smem_inter_experts[lane] : (kNumExperts - 1);
-        mega_topk::reduceTopK<kTopK, float>(warp, top_scores, top_experts, cand_val, cand_idx, kInvalidScore, kTopK);
-
-        int32_t const expert_idx = (lane < kTopK) ? top_experts[lane] : (kNumExperts - 1);
-        float const score_norm = (lane < kTopK) ? smem_score_sigmoid[expert_idx] : 0.f;
-        // Match noAuxTcKernels.cu: the warp reduction itself is fp32, then
-        // the double scaling factor and double literal promote the final
-        // division expression before the OutputT cast.
-        float const red_norm = cg::reduce(warp, score_norm, cg::plus<float>{});
-        double const final_score_d = (double) score_norm * (double) routed_scaling_factor / ((double) red_norm + 1e-20);
-        float const final_score = static_cast<float>(final_score_d);
-
-        if (lane < kTopK)
-        {
-            smem_topk_i[lane] = expert_idx;
-            if (blockIdx.y == 0)
-            {
-                int64_t out_off = static_cast<int64_t>(token) * kTopK + lane;
-                topk_weights[out_off] = final_score;
-                topk_indices[out_off] = expert_idx;
-            }
-        }
     }
     __syncthreads();
 
@@ -1169,16 +1178,16 @@ static CUtensorMap make_packed_fused_expert_up_tmap(void* base_ptr, int num_tile
     cuuint64_t global_dim[3] = {
         static_cast<cuuint64_t>(kPackedTmaInnerBytes),
         static_cast<cuuint64_t>(kPackedTmaRows),
-        static_cast<cuuint64_t>(num_tiles),
+        static_cast<cuuint64_t>(num_tiles * kPackedTmaSubslabs),
     };
     cuuint64_t global_stride[2] = {
         static_cast<cuuint64_t>(kPackedTmaInnerBytes),
-        static_cast<cuuint64_t>(kTileBytes),
+        static_cast<cuuint64_t>(kSubslabBytes),
     };
     cuuint32_t box_dim[3] = {
         static_cast<cuuint32_t>(kPackedTmaInnerBytes),
         static_cast<cuuint32_t>(kPackedTmaRows),
-        1u,
+        static_cast<cuuint32_t>(kPackedTmaSubslabs),
     };
     cuuint32_t elem_stride[3] = {1u, 1u, 1u};
 
