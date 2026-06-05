@@ -227,6 +227,17 @@ __device__ __forceinline__ void fence_proxy_async_shared()
     asm volatile("fence.proxy.async.shared::cta;\n" :::);
 }
 
+__device__ __forceinline__ void gate_up_pair_bar_sync(int pair_idx)
+{
+    switch (pair_idx)
+    {
+    case 0: asm volatile("bar.sync 2, 64;\n" ::: "memory"); break;
+    case 1: asm volatile("bar.sync 3, 64;\n" ::: "memory"); break;
+    case 2: asm volatile("bar.sync 4, 64;\n" ::: "memory"); break;
+    default: asm volatile("bar.sync 5, 64;\n" ::: "memory"); break;
+    }
+}
+
 // -------------------------------------------------------------------------
 // Packed-tile consumer addressing: 6 stacked sub-slabs (k_sixth dim outer,
 // then m_tile, then k_sub_in_sixth, then lane). SWIZZLE_NONE.
@@ -1032,8 +1043,6 @@ __global__ __launch_bounds__(384, DSV3_FUSED_EXPERT_UP_LB_BLOCKS_PER_SM) void ds
         }
     }
 
-    __syncthreads();
-
     // ===== Phase 5: SiLU*x writer =====
     if (is_gate_worker && (lane & 3) == 0)
     {
@@ -1049,15 +1058,21 @@ __global__ __launch_bounds__(384, DSV3_FUSED_EXPERT_UP_LB_BLOCKS_PER_SM) void ds
         smem_up_acc[my_m_up * 16 + row_top] = d_up[0];
         smem_up_acc[my_m_up * 16 + row_bot] = d_up[2];
     }
-    __syncthreads();
 
-    if (tidx < kCtaOutRows)
+    if (is_gate_worker || is_up_worker)
     {
-        float const g = smem_gate_acc[tidx];
-        float const u = smem_up_acc[tidx];
+        int const pair_m = is_gate_worker ? my_m_gate : my_m_up;
+        gate_up_pair_bar_sync(pair_m);
+    }
+
+    if (is_gate_worker && lane < 16)
+    {
+        int const local_row = lane;
+        int const global_row = row_stripe_start + my_m_gate * 16 + local_row;
+        float const g = smem_gate_acc[my_m_gate * 16 + local_row];
+        float const u = smem_up_acc[my_m_gate * 16 + local_row];
         float const silu_g = g * sigmoid_accurate(g);
         float const h = silu_g * u;
-        int const global_row = row_stripe_start + tidx;
         int64_t const out_off = static_cast<int64_t>(token) * kSlotsPerToken * kInterPerTp
             + static_cast<int64_t>(expert_slot) * kInterPerTp + global_row;
         // dsv3_fused_expert_down consumes this handoff as fp16.
