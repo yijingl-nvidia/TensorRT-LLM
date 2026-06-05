@@ -241,15 +241,13 @@ __device__ __forceinline__ int fused_expert_up_lane_offset(int m_tile, int k_sub
 //
 // Per-K-block-scaled variant: the 24 K-subs split into 6 K-blocks of 4 K-subs
 // each (one per 128-col fp8-scale m-block). Each block's accumulator is
-// scaled by `per_block_scale[kb] * act_block_scale[kb]` and reduced into
-// `d_out[]`. The per-K-block activation scale (dequant) is supplied per
-// K-block (6 fp32 per K-iter) - there is NO global act_scale_val anymore
-// because activation quant is now per-128-col-K-block (TRTLLM 1x128 scheme).
+// scaled by `block_scale[kb]` and reduced into `d_out[]`. Each block scale is
+// the product of the per-block activation dequant scale and per-block weight
+// dequant scale.
 //
 __device__ __forceinline__ void compute_mma_kiter_fused_expert_up(__nv_fp8_e4m3 const* __restrict__ smem_tile,
     __nv_fp8_e4m3 const* __restrict__ smem_act_fp8, int k_iter, int my_m, int lane,
-    float const (&per_block_scale)[kWeightScaleKBlocksPerKIter],
-    float const (&act_block_scale)[kWeightScaleKBlocksPerKIter], float (&d_out)[4])
+    float const (&block_scale)[kWeightScaleKBlocksPerKIter], float (&d_out)[4])
 {
 #pragma unroll
     for (int kb = 0; kb < kWeightScaleKBlocksPerKIter; ++kb)
@@ -297,14 +295,10 @@ __device__ __forceinline__ void compute_mma_kiter_fused_expert_up(__nv_fp8_e4m3 
                 : "r"(a_frag[0]), "r"(a_frag[1]), "r"(a_frag[2]), "r"(a_frag[3]), "r"(b_frag[0]), "r"(b_frag[1]));
         }
 
-        // Fold this 128-col K-block's accumulator into the per-K-iter sum.
-        // Per-K-block activation scale + per-K-block weight scale - both
-        // are dequant scales (mul to convert fp8 -> fp32 magnitude).
-        float const fs_kb = per_block_scale[kb] * act_block_scale[kb];
 #pragma unroll
         for (int i = 0; i < 4; ++i)
         {
-            d_out[i] += c_frag[i] * fs_kb;
+            d_out[i] += c_frag[i] * block_scale[kb];
         }
     }
 }
@@ -937,7 +931,6 @@ __global__ __launch_bounds__(384, DSV3_FUSED_EXPERT_UP_LB_BLOCKS_PER_SM) void ds
             // Also load the corresponding activation dequant scales produced by
             // the in-kernel 1x128 quant during Phase 1.
             float gate_block_scales[kWeightScaleKBlocksPerKIter];
-            float act_block_scales[kWeightScaleKBlocksPerKIter];
             float const* const gate_block_scale_base = raw_scale_ptr<kInterPerTpParam, true>(
                 shared_gate_up_scale, routed_w3_w1_scale, my_expert, sub_row, k);
 #pragma unroll
@@ -945,15 +938,14 @@ __global__ __launch_bounds__(384, DSV3_FUSED_EXPERT_UP_LB_BLOCKS_PER_SM) void ds
             {
                 float const gate_scale = lane == 0 ? __ldg(gate_block_scale_base + kb) : 0.f;
                 float const act_scale = lane == 0 ? smem_act_block_scales[k * kWeightScaleKBlocksPerKIter + kb] : 0.f;
-                gate_block_scales[kb] = __shfl_sync(0xffffffff, gate_scale, 0);
-                act_block_scales[kb] = __shfl_sync(0xffffffff, act_scale, 0);
+                gate_block_scales[kb] = __shfl_sync(0xffffffff, gate_scale * act_scale, 0);
             }
             if constexpr (kUsePackedTmaFullEmptyPipeline)
             {
                 mbarrier_wait_parity(smem_tma_full_gate + current_stage, static_cast<uint32_t>(current_phase));
             }
             compute_mma_kiter_fused_expert_up(smem_gate_tiles + current_stage * kTileBytes, smem_act_fp8, k, my_m_gate,
-                lane, gate_block_scales, act_block_scales, d_gate);
+                lane, gate_block_scales, d_gate);
             if constexpr (kUsePackedTmaFullEmptyPipeline)
             {
                 if (lane == 0)
@@ -965,7 +957,6 @@ __global__ __launch_bounds__(384, DSV3_FUSED_EXPERT_UP_LB_BLOCKS_PER_SM) void ds
         if (is_up_worker)
         {
             float up_block_scales[kWeightScaleKBlocksPerKIter];
-            float act_block_scales[kWeightScaleKBlocksPerKIter];
             float const* const up_block_scale_base = raw_scale_ptr<kInterPerTpParam, false>(
                 shared_gate_up_scale, routed_w3_w1_scale, my_expert, sub_row, k);
 #pragma unroll
@@ -973,15 +964,14 @@ __global__ __launch_bounds__(384, DSV3_FUSED_EXPERT_UP_LB_BLOCKS_PER_SM) void ds
             {
                 float const up_scale = lane == 0 ? __ldg(up_block_scale_base + kb) : 0.f;
                 float const act_scale = lane == 0 ? smem_act_block_scales[k * kWeightScaleKBlocksPerKIter + kb] : 0.f;
-                up_block_scales[kb] = __shfl_sync(0xffffffff, up_scale, 0);
-                act_block_scales[kb] = __shfl_sync(0xffffffff, act_scale, 0);
+                up_block_scales[kb] = __shfl_sync(0xffffffff, up_scale * act_scale, 0);
             }
             if constexpr (kUsePackedTmaFullEmptyPipeline)
             {
                 mbarrier_wait_parity(smem_tma_full_up + current_stage, static_cast<uint32_t>(current_phase));
             }
-            compute_mma_kiter_fused_expert_up(smem_up_tiles + current_stage * kTileBytes, smem_act_fp8, k, my_m_up,
-                lane, up_block_scales, act_block_scales, d_up);
+            compute_mma_kiter_fused_expert_up(
+                smem_up_tiles + current_stage * kTileBytes, smem_act_fp8, k, my_m_up, lane, up_block_scales, d_up);
             if constexpr (kUsePackedTmaFullEmptyPipeline)
             {
                 if (lane == 0)
