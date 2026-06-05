@@ -187,6 +187,12 @@ __device__ __forceinline__ void mbarrier_arrive_expect_tx(uint64_t* mbar, uint32
     asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;\n" ::"r"(addr), "r"(bytes));
 }
 
+__device__ __forceinline__ void mbarrier_arrive(uint64_t* mbar)
+{
+    uint32_t const addr = cvt_smem_addr(mbar);
+    asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];\n" ::"r"(addr));
+}
+
 __device__ __forceinline__ void mbarrier_wait_parity(uint64_t* mbar, uint32_t phase)
 {
     uint32_t const addr = cvt_smem_addr(mbar);
@@ -543,6 +549,7 @@ __global__ __launch_bounds__(384, DSV3_FUSED_EXPERT_UP_LB_BLOCKS_PER_SM) void ds
     constexpr int kWeightStages = kUsePackedWeights ? kPackedWeightStagesParam : kStages;
     constexpr bool kDoubleBufferedWeights = kUsePackedWeights && (kWeightStages == kPackedStagesDouble);
     constexpr bool kUsePackedTmaWeights = kUsePackedWeights && (kPackedWeightLoadModeParam == kPackedLoadTma);
+    constexpr bool kUsePackedTmaFullEmptyPipeline = kUsePackedTmaWeights && kDoubleBufferedWeights;
 
     int const token = blockIdx.x;
     int const cta_y = blockIdx.y;
@@ -605,10 +612,12 @@ __global__ __launch_bounds__(384, DSV3_FUSED_EXPERT_UP_LB_BLOCKS_PER_SM) void ds
     rs_base = align_up_128(rs_base);
 
     rs_base = (rs_base + 15u) & ~uintptr_t(15);
-    uint64_t* const smem_tma_mbar = reinterpret_cast<uint64_t*>(rs_base);
+    uint64_t* const smem_tma_full_gate = reinterpret_cast<uint64_t*>(rs_base);
+    uint64_t* const smem_tma_full_up = smem_tma_full_gate + kWeightStages;
+    uint64_t* const smem_tma_empty = smem_tma_full_up + kWeightStages;
     if constexpr (kUsePackedTmaWeights)
     {
-        rs_base += sizeof(uint64_t) * 2 * kWeightStages;
+        rs_base += sizeof(uint64_t) * (kUsePackedTmaFullEmptyPipeline ? 3 : 2) * kWeightStages;
     }
 
     auto block = cg::this_thread_block();
@@ -727,9 +736,26 @@ __global__ __launch_bounds__(384, DSV3_FUSED_EXPERT_UP_LB_BLOCKS_PER_SM) void ds
 
     if constexpr (kUsePackedTmaWeights)
     {
-        if (tidx < 2 * kWeightStages)
+        if constexpr (kUsePackedTmaFullEmptyPipeline)
         {
-            mbarrier_init(&smem_tma_mbar[tidx], 1);
+            if (tidx == 0)
+            {
+#pragma unroll
+                for (int s = 0; s < kWeightStages; ++s)
+                {
+                    mbarrier_init(&smem_tma_full_gate[s], 1);
+                    mbarrier_init(&smem_tma_full_up[s], 1);
+                    mbarrier_init(&smem_tma_empty[s], kNumGateWorkers + kNumUpWorkers);
+                }
+            }
+        }
+        else
+        {
+            if (tidx < 2 * kWeightStages)
+            {
+                uint64_t* const smem_tma_mbar = smem_tma_full_gate;
+                mbarrier_init(&smem_tma_mbar[tidx], 1);
+            }
         }
         if (tidx == 0)
         {
@@ -740,28 +766,47 @@ __global__ __launch_bounds__(384, DSV3_FUSED_EXPERT_UP_LB_BLOCKS_PER_SM) void ds
 
     if constexpr (kDoubleBufferedWeights)
     {
-        // Prime stage 0 before entering the loop; later iterations preload the next K tile into the other stage.
+        // Prime stages before entering the loop; later iterations preload into empty stages.
         if constexpr (kUsePackedTmaWeights)
         {
-            if (tidx == 0)
+            if constexpr (kUsePackedTmaFullEmptyPipeline)
             {
-                issue_packed_weight_tma_fused_expert_up<kInterPerTpParam, true>(
-                    smem_gate_tiles, &shared_gate_up_tma, &routed_w3_w1_tma, my_expert, sub_row, 0, smem_tma_mbar);
+                if (tidx == 0)
+                {
+#pragma unroll
+                    for (int s = 0; s < kWeightStages; ++s)
+                    {
+                        issue_packed_weight_tma_fused_expert_up<kInterPerTpParam, true>(
+                            smem_gate_tiles + s * kTileBytes, &shared_gate_up_tma, &routed_w3_w1_tma, my_expert,
+                            sub_row, s, smem_tma_full_gate + s);
+                        issue_packed_weight_tma_fused_expert_up<kInterPerTpParam, false>(smem_up_tiles + s * kTileBytes,
+                            &shared_gate_up_tma, &routed_w3_w1_tma, my_expert, sub_row, s, smem_tma_full_up + s);
+                    }
+                }
             }
-            if (tidx == 1)
+            else
             {
-                issue_packed_weight_tma_fused_expert_up<kInterPerTpParam, false>(smem_up_tiles, &shared_gate_up_tma,
-                    &routed_w3_w1_tma, my_expert, sub_row, 0, smem_tma_mbar + kWeightStages);
-            }
-            if (tidx == 0)
-            {
-                mbarrier_wait_parity(smem_tma_mbar, tma_gate_phase[0]);
-                tma_gate_phase[0] ^= 1u;
-            }
-            if (tidx == 1)
-            {
-                mbarrier_wait_parity(smem_tma_mbar + kWeightStages, tma_up_phase[0]);
-                tma_up_phase[0] ^= 1u;
+                uint64_t* const smem_tma_mbar = smem_tma_full_gate;
+                if (tidx == 0)
+                {
+                    issue_packed_weight_tma_fused_expert_up<kInterPerTpParam, true>(
+                        smem_gate_tiles, &shared_gate_up_tma, &routed_w3_w1_tma, my_expert, sub_row, 0, smem_tma_mbar);
+                }
+                if (tidx == 1)
+                {
+                    issue_packed_weight_tma_fused_expert_up<kInterPerTpParam, false>(smem_up_tiles, &shared_gate_up_tma,
+                        &routed_w3_w1_tma, my_expert, sub_row, 0, smem_tma_mbar + kWeightStages);
+                }
+                if (tidx == 0)
+                {
+                    mbarrier_wait_parity(smem_tma_mbar, tma_gate_phase[0]);
+                    tma_gate_phase[0] ^= 1u;
+                }
+                if (tidx == 1)
+                {
+                    mbarrier_wait_parity(smem_tma_mbar + kWeightStages, tma_up_phase[0]);
+                    tma_up_phase[0] ^= 1u;
+                }
             }
         }
         else
@@ -773,7 +818,10 @@ __global__ __launch_bounds__(384, DSV3_FUSED_EXPERT_UP_LB_BLOCKS_PER_SM) void ds
             asm volatile("cp.async.commit_group;\n" :::);
             asm volatile("cp.async.wait_all;\n" :::);
         }
-        __syncthreads();
+        if constexpr (!kUsePackedTmaFullEmptyPipeline)
+        {
+            __syncthreads();
+        }
     }
 
     // ---- fused expert up K-loop - per-K-BLOCK scaling (6 scales per K-iter, applied
@@ -782,15 +830,35 @@ __global__ __launch_bounds__(384, DSV3_FUSED_EXPERT_UP_LB_BLOCKS_PER_SM) void ds
     {
         int constexpr kRawStage = 0;
         int const current_stage = kDoubleBufferedWeights ? (k & 1) : kRawStage;
+        int const current_phase = kUsePackedTmaFullEmptyPipeline ? ((k / kWeightStages) & 1) : 0;
 
         if constexpr (kDoubleBufferedWeights)
         {
-            if (k + 1 < kNumKIter)
+            if constexpr (kUsePackedTmaFullEmptyPipeline)
+            {
+                int const k_load = k + kWeightStages;
+                if (k_load < kNumKIter && tidx == 0)
+                {
+                    int const load_stage = k_load % kWeightStages;
+                    int const load_phase = (k_load / kWeightStages) & 1;
+                    uint32_t const wait_phase = static_cast<uint32_t>(load_phase ^ 1);
+                    mbarrier_wait_parity(smem_tma_empty + load_stage, wait_phase);
+
+                    issue_packed_weight_tma_fused_expert_up<kInterPerTpParam, true>(
+                        smem_gate_tiles + load_stage * kTileBytes, &shared_gate_up_tma, &routed_w3_w1_tma, my_expert,
+                        sub_row, k_load, smem_tma_full_gate + load_stage);
+                    issue_packed_weight_tma_fused_expert_up<kInterPerTpParam, false>(
+                        smem_up_tiles + load_stage * kTileBytes, &shared_gate_up_tma, &routed_w3_w1_tma, my_expert,
+                        sub_row, k_load, smem_tma_full_up + load_stage);
+                }
+            }
+            else if (k + 1 < kNumKIter)
             {
                 int const preload_stage = (k + 1) & 1;
                 // Keep this prefetch ahead of MMA so copy latency overlaps with the current K tile.
                 if constexpr (kUsePackedTmaWeights)
                 {
+                    uint64_t* const smem_tma_mbar = smem_tma_full_gate;
                     if (tidx == 0)
                     {
                         issue_packed_weight_tma_fused_expert_up<kInterPerTpParam, true>(
@@ -821,6 +889,7 @@ __global__ __launch_bounds__(384, DSV3_FUSED_EXPERT_UP_LB_BLOCKS_PER_SM) void ds
         {
             if constexpr (kUsePackedTmaWeights)
             {
+                uint64_t* const smem_tma_mbar = smem_tma_full_gate;
                 if (tidx == 0)
                 {
                     issue_packed_weight_tma_fused_expert_up<kInterPerTpParam, true>(
@@ -879,8 +948,19 @@ __global__ __launch_bounds__(384, DSV3_FUSED_EXPERT_UP_LB_BLOCKS_PER_SM) void ds
                 gate_block_scales[kb] = __shfl_sync(0xffffffff, gate_scale, 0);
                 act_block_scales[kb] = __shfl_sync(0xffffffff, act_scale, 0);
             }
+            if constexpr (kUsePackedTmaFullEmptyPipeline)
+            {
+                mbarrier_wait_parity(smem_tma_full_gate + current_stage, static_cast<uint32_t>(current_phase));
+            }
             compute_mma_kiter_fused_expert_up(smem_gate_tiles + current_stage * kTileBytes, smem_act_fp8, k, my_m_gate,
                 lane, gate_block_scales, act_block_scales, d_gate);
+            if constexpr (kUsePackedTmaFullEmptyPipeline)
+            {
+                if (lane == 0)
+                {
+                    mbarrier_arrive(smem_tma_empty + current_stage);
+                }
+            }
         }
         if (is_up_worker)
         {
@@ -896,16 +976,32 @@ __global__ __launch_bounds__(384, DSV3_FUSED_EXPERT_UP_LB_BLOCKS_PER_SM) void ds
                 up_block_scales[kb] = __shfl_sync(0xffffffff, up_scale, 0);
                 act_block_scales[kb] = __shfl_sync(0xffffffff, act_scale, 0);
             }
+            if constexpr (kUsePackedTmaFullEmptyPipeline)
+            {
+                mbarrier_wait_parity(smem_tma_full_up + current_stage, static_cast<uint32_t>(current_phase));
+            }
             compute_mma_kiter_fused_expert_up(smem_up_tiles + current_stage * kTileBytes, smem_act_fp8, k, my_m_up,
                 lane, up_block_scales, act_block_scales, d_up);
+            if constexpr (kUsePackedTmaFullEmptyPipeline)
+            {
+                if (lane == 0)
+                {
+                    mbarrier_arrive(smem_tma_empty + current_stage);
+                }
+            }
         }
-        if constexpr (kDoubleBufferedWeights)
+        if constexpr (kUsePackedTmaFullEmptyPipeline)
+        {
+            // Stage readiness and ownership are handled by full/empty barriers.
+        }
+        else if constexpr (kDoubleBufferedWeights)
         {
             if (k + 1 < kNumKIter)
             {
                 int const preload_stage = (k + 1) & 1;
                 if constexpr (kUsePackedTmaWeights)
                 {
+                    uint64_t* const smem_tma_mbar = smem_tma_full_gate;
                     if (tidx == 0)
                     {
                         mbarrier_wait_parity(smem_tma_mbar + preload_stage, tma_gate_phase[preload_stage]);
@@ -923,8 +1019,12 @@ __global__ __launch_bounds__(384, DSV3_FUSED_EXPERT_UP_LB_BLOCKS_PER_SM) void ds
                     asm volatile("cp.async.wait_all;\n" :::);
                 }
             }
+            __syncthreads();
         }
-        __syncthreads();
+        else
+        {
+            __syncthreads();
+        }
     }
 
     __syncthreads();
@@ -994,6 +1094,7 @@ static inline size_t fused_expert_up_smem_bytes()
     static_assert(kPackedWeightLoadModeParam == kPackedLoadCpAsync || kPackedWeightLoadModeParam == kPackedLoadTma);
     constexpr int kWeightStages = kUsePackedWeights ? kPackedWeightStagesParam : kStages;
     constexpr bool kUsePackedTmaWeights = kUsePackedWeights && (kPackedWeightLoadModeParam == kPackedLoadTma);
+    constexpr bool kUsePackedTmaFullEmptyPipeline = kUsePackedTmaWeights && (kWeightStages == kPackedStagesDouble);
     size_t bytes = 0;
     bytes += static_cast<size_t>(kWeightStages) * kTileBytes;
     bytes += static_cast<size_t>(kWeightStages) * kTileBytes;
@@ -1021,7 +1122,7 @@ static inline size_t fused_expert_up_smem_bytes()
     bytes = (bytes + 15u) & ~size_t(15);
     if constexpr (kUsePackedTmaWeights)
     {
-        bytes += sizeof(uint64_t) * 2 * kWeightStages;
+        bytes += sizeof(uint64_t) * (kUsePackedTmaFullEmptyPipeline ? 3 : 2) * kWeightStages;
         bytes = (bytes + 15u) & ~size_t(15);
     }
     return bytes;
