@@ -16,6 +16,11 @@
 #   TRTLLM_DEEPSEEKV3_FUSED_MOE_TEST_PHASE=profile \
 #     scripts/test_dsv3_fused_expert_up_dev_in_session.sh
 #
+#   scripts/test_dsv3_fused_expert_up_dev_in_session.sh --nsys \
+#     -q tests/unittest/_torch/models/test_modeling_deepseekv3_fused_moe.py::test_deepseekv3_fused_moe_profile_phase[0] -s -rs
+#
+#   scripts/test_dsv3_fused_expert_up_dev_in_session.sh --nsys-query
+#
 #   scripts/test_dsv3_fused_expert_up_dev_in_session.sh \
 #     -q tests/unittest/_torch/models/test_modeling_deepseekv3_fused_moe.py::test_deepseekv3_fused_moe_profile_phase -s
 
@@ -69,6 +74,11 @@ join_shell_words() {
 report_duration() {
     local status="$?"
     local end_epoch elapsed
+    local task_name="dsv3_fused_expert_up_dev pytest"
+
+    if [ "${RUN_NSYS_QUERY:-0}" -eq 1 ] && [ "${RUN_NSYS:-0}" -eq 0 ]; then
+        task_name="dsv3_fused_expert_up_dev nsys query"
+    fi
 
     end_epoch="$(date +%s)"
     elapsed=$((end_epoch - RUN_START_EPOCH))
@@ -76,11 +86,11 @@ report_duration() {
     echo ""
     echo "================================================================="
     if [ "$status" -eq 0 ]; then
-        echo "  dsv3_fused_expert_up_dev pytest OK"
+        echo "  ${task_name} OK"
     else
-        echo "  dsv3_fused_expert_up_dev pytest FAILED (exit $status)"
+        echo "  ${task_name} FAILED (exit $status)"
     fi
-    echo "  Test duration: $(format_duration "$elapsed")"
+    echo "  Duration: $(format_duration "$elapsed")"
     echo "================================================================="
 }
 
@@ -109,11 +119,49 @@ fi
 # shellcheck source=/dev/null
 source "$SESSION_ENV_FILE"
 
+RUN_NSYS=0
+RUN_NSYS_QUERY=0
+NSYS_REPORT_VALUE="${TRTLLM_DEEPSEEKV3_FUSED_MOE_TEST_NSYS_REPORT:-}"
+PYTEST_ARGS=()
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --nsys)
+            RUN_NSYS=1
+            shift
+            ;;
+        --nsys-query)
+            RUN_NSYS_QUERY=1
+            shift
+            ;;
+        --nsys-report)
+            [ "$#" -ge 2 ] || {
+                echo "ERROR: --nsys-report requires a report path" >&2
+                exit 2
+            }
+            NSYS_REPORT_VALUE="$2"
+            shift 2
+            ;;
+        --)
+            shift
+            PYTEST_ARGS+=("$@")
+            break
+            ;;
+        *)
+            PYTEST_ARGS+=("$1")
+            shift
+            ;;
+    esac
+done
+
 BUILD_DIR="${DSV3_FUSED_EXPERT_UP_DEV_BUILD_DIR:-${SRC_DIR}/cpp/build/dsv3_fused_expert_up_dev}"
 OUT_SO_DEFAULT="${DSV3_FUSED_EXPERT_UP_DEV_OUTPUT_SO:-${BUILD_DIR}/libdsv3_fused_expert_up_dev.so}"
 EXTRA_OP_LIBRARY_VALUE="${TRTLLM_DEEPSEEKV3_FUSED_MOE_TEST_EXTRA_OP_LIBRARY:-$OUT_SO_DEFAULT}"
 FUSED_EXPERT_UP_OP_VALUE="${TRTLLM_DEEPSEEKV3_FUSED_MOE_TEST_FUSED_EXPERT_UP_OP:-dsv3_fused_expert_up_dev}"
-TEST_PHASE_VALUE="${TRTLLM_DEEPSEEKV3_FUSED_MOE_TEST_PHASE:-both}"
+TEST_PHASE_DEFAULT="both"
+if [ "$RUN_NSYS" -eq 1 ]; then
+    TEST_PHASE_DEFAULT="profile"
+fi
+TEST_PHASE_VALUE="${TRTLLM_DEEPSEEKV3_FUSED_MOE_TEST_PHASE:-$TEST_PHASE_DEFAULT}"
 MAX_TOKENS_VALUE="${TRTLLM_DEEPSEEKV3_FUSED_MOE_TEST_MAX_FUSED_KERNEL_NUM_TOKENS:-4}"
 PROFILE_WARMUP_VALUE="${TRTLLM_DEEPSEEKV3_FUSED_MOE_TEST_PROFILE_WARMUP_ITERS:-20}"
 PROFILE_ITERS_VALUE="${TRTLLM_DEEPSEEKV3_FUSED_MOE_TEST_PROFILE_ITERS:-100}"
@@ -124,11 +172,11 @@ OUT_ROOT="${STORAGE_DIR:-/scratch/fsw/portfolios/coreai/projects/coreai_mlperf_i
 RUN_DIR="${OUT_ROOT}/trtllm/fused_up_dev_test_$(date +%Y%m%d_%H%M%S)${SESSION_NAME:+_session${SESSION_NAME}}"
 mkdir -p "$RUN_DIR"
 LOG="${RUN_DIR}/test_dsv3_fused_expert_up_dev.log"
+NSYS_OUTPUT_DIR="${TRTLLM_DEEPSEEKV3_FUSED_MOE_TEST_NSYS_OUTPUT_DIR:-${OUT_ROOT}/trtllm/nsys_fused_up_dev_$(date +%Y%m%d_%H%M%S)${SESSION_NAME:+_session${SESSION_NAME}}}"
+NSYS_OUTPUT_BASENAME="${TRTLLM_DEEPSEEKV3_FUSED_MOE_TEST_NSYS_OUTPUT_BASENAME:-fused_up_profile}"
 
-if [ "$#" -eq 0 ]; then
+if [ "${#PYTEST_ARGS[@]}" -eq 0 ]; then
     PYTEST_ARGS=(-q tests/unittest/_torch/models/test_modeling_deepseekv3_fused_moe.py -s -rs)
-else
-    PYTEST_ARGS=("$@")
 fi
 
 PYTEST_ARGS_Q="$(join_shell_words "${PYTEST_ARGS[@]}")"
@@ -140,6 +188,49 @@ MAX_TOKENS_Q="$(shell_quote "$MAX_TOKENS_VALUE")"
 PROFILE_WARMUP_Q="$(shell_quote "$PROFILE_WARMUP_VALUE")"
 PROFILE_ITERS_Q="$(shell_quote "$PROFILE_ITERS_VALUE")"
 DEBUG_OUTPUT_DIR_Q="$(shell_quote "$DEBUG_OUTPUT_DIR_VALUE")"
+NSYS_OUTPUT_DIR_Q="$(shell_quote "$NSYS_OUTPUT_DIR")"
+NSYS_OUTPUT_Q="$(shell_quote "${NSYS_OUTPUT_DIR}/${NSYS_OUTPUT_BASENAME}")"
+
+find_latest_nsys_report() {
+    local search_root="${OUT_ROOT}/trtllm"
+    [ -d "$search_root" ] || return 1
+    find "$search_root" -path '*/fused_up_profile*.nsys-rep' -printf '%T@ %p\n' 2>/dev/null \
+        | sort -n | tail -1 | cut -d' ' -f2-
+}
+
+run_nsys_query() {
+    local report="$1"
+    local report_q
+    report_q="$(shell_quote "$report")"
+
+    "$EXEC" -- bash -c "
+        set -euo pipefail
+        REPORT=${report_q}
+        echo \"=================================================================\"
+        echo \"  Nsight Systems fused expert-up kernel summary\"
+        echo \"  Report: \$REPORT\"
+        echo \"=================================================================\"
+        set +e
+        stats_output=\"\$(nsys stats --force-export=true -r cuda_gpu_kern_sum,cuda_kern_exec_sum \"\$REPORT\" 2>&1)\"
+        stats_status=\"\$?\"
+        set -e
+        printf '%s\n' \"\$stats_output\" | grep -E \
+            'CUDA GPU Kernel Summary|CUDA Kernel Launch & Exec Time Summary|Time \\(%\\)|PID[[:space:]]+TID|dsv3_fused_expert_up_kernel|Processing|Generating SQLite|NOTICE' || true
+        exit \"\$stats_status\"
+    "
+}
+
+if [ "$RUN_NSYS_QUERY" -eq 1 ] && [ "$RUN_NSYS" -eq 0 ]; then
+    if [ -z "$NSYS_REPORT_VALUE" ]; then
+        NSYS_REPORT_VALUE="$(find_latest_nsys_report || true)"
+    fi
+    [ -n "$NSYS_REPORT_VALUE" ] && [ -f "$NSYS_REPORT_VALUE" ] || {
+        echo "ERROR: no Nsight Systems report found. Run with --nsys first or pass --nsys-report <path>." >&2
+        exit 1
+    }
+    run_nsys_query "$NSYS_REPORT_VALUE"
+    exit 0
+fi
 
 echo "================================================================="
 echo "  dsv3_fused_expert_up_dev pytest"
@@ -156,11 +247,31 @@ echo "  max tokens    : $MAX_TOKENS_VALUE"
 echo "  profile warmup: $PROFILE_WARMUP_VALUE"
 echo "  profile iters : $PROFILE_ITERS_VALUE"
 echo "  debug output  : $DEBUG_OUTPUT_DIR_VALUE"
+echo "  nsys          : $RUN_NSYS"
+if [ "$RUN_NSYS" -eq 1 ]; then
+    echo "  nsys output   : ${NSYS_OUTPUT_DIR}/${NSYS_OUTPUT_BASENAME}.nsys-rep"
+fi
 echo "  pytest args   : ${PYTEST_ARGS[*]}"
 echo "  log           : $LOG"
 echo "================================================================="
 
-INNER_CMD="
+if [ "$RUN_NSYS" -eq 1 ]; then
+    INNER_CMD="
+    set -euo pipefail
+    cd ${SRC_DIR_Q}
+    mkdir -p ${NSYS_OUTPUT_DIR_Q}
+    export TRTLLM_DEEPSEEKV3_FUSED_MOE_TEST_EXTRA_OP_LIBRARY=${EXTRA_OP_LIBRARY_Q}
+    export TRTLLM_DEEPSEEKV3_FUSED_MOE_TEST_FUSED_EXPERT_UP_OP=${FUSED_EXPERT_UP_OP_Q}
+    export TRTLLM_DEEPSEEKV3_FUSED_MOE_TEST_PHASE=${TEST_PHASE_Q}
+    export TRTLLM_DEEPSEEKV3_FUSED_MOE_TEST_MAX_FUSED_KERNEL_NUM_TOKENS=${MAX_TOKENS_Q}
+    export TRTLLM_DEEPSEEKV3_FUSED_MOE_TEST_PROFILE_WARMUP_ITERS=${PROFILE_WARMUP_Q}
+    export TRTLLM_DEEPSEEKV3_FUSED_MOE_TEST_PROFILE_ITERS=${PROFILE_ITERS_Q}
+    export TRTLLM_DEEPSEEKV3_FUSED_MOE_TEST_DEBUG_OUTPUT_DIR=${DEBUG_OUTPUT_DIR_Q}
+    nsys profile --force-overwrite=true --sample=none --trace=cuda,nvtx --output=${NSYS_OUTPUT_Q} \
+        --capture-range=none pytest ${PYTEST_ARGS_Q}
+"
+else
+    INNER_CMD="
     set -euo pipefail
     cd ${SRC_DIR_Q}
     export TRTLLM_DEEPSEEKV3_FUSED_MOE_TEST_EXTRA_OP_LIBRARY=${EXTRA_OP_LIBRARY_Q}
@@ -172,6 +283,7 @@ INNER_CMD="
     export TRTLLM_DEEPSEEKV3_FUSED_MOE_TEST_DEBUG_OUTPUT_DIR=${DEBUG_OUTPUT_DIR_Q}
     pytest ${PYTEST_ARGS_Q}
 "
+fi
 
 set +e
 "$EXEC" -- bash -c "$INNER_CMD" 2>&1 | tee "$LOG"
@@ -214,6 +326,19 @@ case "$(printf '%s' "$TEST_PHASE_VALUE" | tr '[:upper:]' '[:lower:]')" in
         echo "================================================================="
         ;;
 esac
+
+if [ "$RUN_NSYS" -eq 1 ]; then
+    NSYS_REPORT_VALUE="${NSYS_OUTPUT_DIR}/${NSYS_OUTPUT_BASENAME}.nsys-rep"
+    echo ""
+    echo "================================================================="
+    echo "  Nsight Systems report"
+    echo "  Report: $NSYS_REPORT_VALUE"
+    echo "================================================================="
+fi
+
+if [ "$RUN_NSYS_QUERY" -eq 1 ]; then
+    run_nsys_query "$NSYS_REPORT_VALUE"
+fi
 
 echo ""
 echo "================================================================="
