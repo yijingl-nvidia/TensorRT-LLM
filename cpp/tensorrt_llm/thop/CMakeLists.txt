@@ -93,6 +93,7 @@ add_library(
   noAuxTcOp.cpp
   dsv3FusedExpertUpOp.cpp
   ../kernels/dsv3FusedKernels/dsv3FusedExpertUp.cu
+  ../kernels/dsv3FusedKernels/dsv3FusedExpertUpFp8Mma.cu
   dsv3FusedExpertDownOp.cpp
   ../kernels/dsv3FusedKernels/dsv3FusedExpertDown.cu
   fusedCatFp4Op.cpp
