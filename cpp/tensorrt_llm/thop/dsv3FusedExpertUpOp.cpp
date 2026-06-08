@@ -33,7 +33,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> dsv3_fused_expert_up(tor
     torch::Tensor hidden_in, torch::Tensor bias, torch::Tensor expert_gate_up_weight,
     torch::Tensor expert_gate_up_scale, double routed_scaling_factor);
 
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> dsv3_fused_expert_up_fp8_mma(torch::Tensor scores,
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> dsv3_fused_expert_up_fp16_mma(torch::Tensor scores,
     torch::Tensor hidden_in, torch::Tensor bias, torch::Tensor expert_gate_up_weight,
     torch::Tensor expert_gate_up_scale, double routed_scaling_factor);
 } // namespace dsv3_fused_expert
@@ -50,10 +50,10 @@ std::tuple<th::Tensor, th::Tensor, th::Tensor> dsv3_fused_expert_up(th::Tensor s
         std::move(expert_gate_up_weight), std::move(expert_gate_up_scale), routed_scaling_factor);
 }
 
-std::tuple<th::Tensor, th::Tensor, th::Tensor> dsv3_fused_expert_up_fp8_mma(th::Tensor scores, th::Tensor hidden_in,
+std::tuple<th::Tensor, th::Tensor, th::Tensor> dsv3_fused_expert_up_fp16_mma(th::Tensor scores, th::Tensor hidden_in,
     th::Tensor bias, th::Tensor expert_gate_up_weight, th::Tensor expert_gate_up_scale, double routed_scaling_factor)
 {
-    return dsv3_fused_expert::dsv3_fused_expert_up_fp8_mma(std::move(scores), std::move(hidden_in), std::move(bias),
+    return dsv3_fused_expert::dsv3_fused_expert_up_fp16_mma(std::move(scores), std::move(hidden_in), std::move(bias),
         std::move(expert_gate_up_weight), std::move(expert_gate_up_scale), routed_scaling_factor);
 }
 
@@ -68,7 +68,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "Tensor expert_gate_up_weight, Tensor expert_gate_up_scale, float routed_scaling_factor) -> "
         "(Tensor topk_values, Tensor topk_indices, Tensor hidden_out)");
     m.def(
-        "dsv3_fused_expert_up_fp8_mma(Tensor scores, Tensor hidden_in, Tensor bias, "
+        "dsv3_fused_expert_up_fp16_mma(Tensor scores, Tensor hidden_in, Tensor bias, "
         "Tensor expert_gate_up_weight, Tensor expert_gate_up_scale, float routed_scaling_factor) -> "
         "(Tensor topk_values, Tensor topk_indices, Tensor hidden_out)");
 }
@@ -76,5 +76,5 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
     m.impl("dsv3_fused_expert_up", &tensorrt_llm::torch_ext::dsv3_fused_expert_up);
-    m.impl("dsv3_fused_expert_up_fp8_mma", &tensorrt_llm::torch_ext::dsv3_fused_expert_up_fp8_mma);
+    m.impl("dsv3_fused_expert_up_fp16_mma", &tensorrt_llm::torch_ext::dsv3_fused_expert_up_fp16_mma);
 }

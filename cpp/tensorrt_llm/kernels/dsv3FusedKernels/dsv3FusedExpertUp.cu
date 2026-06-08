@@ -15,13 +15,13 @@
  * limitations under the License.
  */
 
-// DeepSeek-V3 fused expert-up kernel.
+// DeepSeek-V3 fused expert-up FP8-MMA kernel.
 //
 // For each decode token (M <= 4), this kernel consumes router logits and bf16
-// hidden states, applies the DeepSeek-V3 no-aux top-k routing rule, and computes
-// shared/routed gate-up projections with FP8 weights unpacked into FP16 HMMA.
-// The output is the routed top-k metadata and fp16 expert slots consumed by
-// dsv3_fused_expert_down.
+// hidden states, applies the DeepSeek-V3 no-aux top-k routing rule, quantizes
+// activations per 128 columns, and computes shared/routed gate-up projections
+// with FP8 MMA. The output is the routed top-k metadata and fp16 expert slots
+// consumed by dsv3_fused_expert_down.
 //
 // The deployed path uses packed weights. The raw-weight launcher remains for
 // diagnostics and shape comparison, but Python inference calls the packed op.
@@ -60,6 +60,7 @@ constexpr int kTopK = 8;
 constexpr int kSlotsPerToken = kSharedExpert / kNumExperts + kTopK; // 1 + 8 = 9
 constexpr int kThreadsPerCta = 384;
 constexpr int kWarpSize = 32;
+constexpr int kNumWarps = kThreadsPerCta / kWarpSize;
 constexpr int kMaxNumExpertsUnit = 128;
 constexpr int kNumExpertWarps = (kNumExperts - 1) / kMaxNumExpertsUnit + 1;
 static_assert(kNumExpertWarps == 2);
@@ -121,12 +122,9 @@ constexpr int kKSubsPerIter = kKTile / 32;  // 24
 constexpr int kWeightScaleKBlocks = 48; // original 128-col K-blocks (kHidden / 128)
 constexpr int kWeightScaleKBlocksPerKIter = kWeightScaleKBlocks / kNumKIter; // 6
 
-constexpr int kWorkerWarpBase = 0;
+constexpr int kWorkerWarpBase = 4;
 constexpr int kNumWorkers = 8;
 constexpr int kRowsPerWorker = 8;
-constexpr int kTmaProducerWarp = kWorkerWarpBase + kNumWorkers;
-constexpr int kTmaProducerThread = kTmaProducerWarp * kWarpSize;
-static_assert(kTmaProducerWarp == 8);
 
 constexpr int kTileBytes = kCtaOutRows * kKTile; // 49152 (48 KiB)
 
@@ -139,12 +137,12 @@ constexpr int kPackedLoadCpAsync = 0;
 constexpr int kPackedLoadTma = 1;
 
 constexpr float kInvalidScore = -INFINITY;
+constexpr float kFp8Max = 448.f;
+constexpr float kInvFp8Max = 1.f / kFp8Max;
 
 constexpr int kActBytes = kHidden * 2;                               // 12288
 constexpr int kActCpAsyncs = kActBytes / 16;                         // 768
 constexpr int kActCpAsyncsPerThread = kActCpAsyncs / kThreadsPerCta; // 2
-constexpr int kActConvertThreads = kThreadsPerCta - kNumExpertWarps * kWarpSize;
-static_assert(kActConvertThreads > 0);
 
 // K-major slab offset constants. The packed tile stacks 6 sub-slabs along Z
 // (k_sixth axis) so each box load stays within the TMA SWIZZLE_NONE 256-byte
@@ -249,45 +247,16 @@ __device__ __forceinline__ int fused_expert_up_combined_lane_offset(int m_tile, 
         + lane * kLaneBytes;
 }
 
-__device__ __forceinline__ uint32_t fp8_pair_to_half_pair(uint32_t packed, int lo_byte_idx)
-{
-    __nv_fp8x2_storage_t const fp8_pair = static_cast<__nv_fp8x2_storage_t>((packed >> (lo_byte_idx * 8)) & 0xffffu);
-
-    union
-    {
-        __half2_raw half2;
-        uint32_t u32;
-    } out;
-
-    out.half2 = __nv_cvt_fp8x2_to_halfraw2(fp8_pair, __NV_E4M3);
-    return out.u32;
-}
-
-__device__ __forceinline__ void hmma_m16n8k16_f16(
-    float (&d_frag)[4], uint32_t const (&a_frag)[4], uint32_t const (&b_frag)[2])
-{
-    asm volatile(
-        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
-        "{%0, %1, %2, %3}, "
-        "{%4, %5, %6, %7}, "
-        "{%8, %9}, "
-        "{%0, %1, %2, %3};\n"
-        : "+f"(d_frag[0]), "+f"(d_frag[1]), "+f"(d_frag[2]), "+f"(d_frag[3])
-        : "r"(a_frag[0]), "r"(a_frag[1]), "r"(a_frag[2]), "r"(a_frag[3]), "r"(b_frag[0]), "r"(b_frag[1]));
-}
-
-// Compute MMA for ONE K-iter (kKTile = 768 cols => 48 m16n8k16 HMMAs per fragment).
+// Compute MMA for ONE K-iter (kKTile = 768 cols => 24 m16n8k32 MMAs per fragment).
 //
 // The 16-row MMA tile is physically packed as 8 gate rows followed by 8 up
 // rows for the same output-row stripe. The top half and bottom half therefore
-// use different weight dequant scales. Activations are converted once from
-// BF16 to FP16 in shared memory before the K-loop, so no activation
-// quant/dequant scale is applied.
+// use different weight dequant scales, while sharing the same activation scale.
 //
 __device__ __forceinline__ void compute_mma_kiter_fused_expert_up(__nv_fp8_e4m3 const* __restrict__ smem_tile,
-    __half const* __restrict__ smem_act_fp16, int k_iter, int my_m, int lane,
-    float const (&gate_weight_scale)[kWeightScaleKBlocksPerKIter],
-    float const (&up_weight_scale)[kWeightScaleKBlocksPerKIter], float (&d_out)[4])
+    __nv_fp8_e4m3 const* __restrict__ smem_act_fp8, int k_iter, int my_m, int lane,
+    float const (&gate_block_scale)[kWeightScaleKBlocksPerKIter],
+    float const (&up_block_scale)[kWeightScaleKBlocksPerKIter], float (&d_out)[4])
 {
 #pragma unroll
     for (int kb = 0; kb < kWeightScaleKBlocksPerKIter; ++kb)
@@ -300,47 +269,46 @@ __device__ __forceinline__ void compute_mma_kiter_fused_expert_up(__nv_fp8_e4m3 
             // Per-lane base - natural K-major layout, 16 contiguous bytes/lane.
             __nv_fp8_e4m3 const* lane_base = smem_tile + fused_expert_up_combined_lane_offset(my_m, k_sub, lane);
 
-            // 2 x LDS.64 fetch gate/up chunks for K cols [0..15] and [16..31].
-            // Each chunk is four FP8 weights for one gate/up row. We unpack the
-            // selected half into FP16 register pairs immediately before HMMA.
-            uint32_t a_fp8[4];
-            lds64_b32x2(a_fp8[0], a_fp8[1], lane_base);     // gate low, up low
-            lds64_b32x2(a_fp8[2], a_fp8[3], lane_base + 8); // gate high, up high
+            // 2 x LDS.64 fetch the 4 b32 A-frag chunks. ptxas typically merges
+            // these into a single LDS.128 in the SASS.
+            uint32_t a_frag[4];
+            lds64_b32x2(a_frag[0], a_frag[1], lane_base);     // chunks 0+1
+            lds64_b32x2(a_frag[2], a_frag[3], lane_base + 8); // chunks 2+3
 
-#pragma unroll
-            for (int half_k = 0; half_k < 2; ++half_k)
+            // B-fragment (activations). Lanes 0..3 hold the K-contiguous 16
+            // bytes/half-K-sub; other lanes hold zeros. Unchanged from v34.
+            uint32_t b_frag[2];
+            if (lane < 4)
             {
-                uint32_t a_frag[4];
-                int const gate_chunk_idx = half_k * 2;
-                int const up_chunk_idx = gate_chunk_idx + 1;
-                a_frag[0] = fp8_pair_to_half_pair(a_fp8[gate_chunk_idx], 0);
-                a_frag[1] = fp8_pair_to_half_pair(a_fp8[up_chunk_idx], 0);
-                a_frag[2] = fp8_pair_to_half_pair(a_fp8[gate_chunk_idx], 2);
-                a_frag[3] = fp8_pair_to_half_pair(a_fp8[up_chunk_idx], 2);
-
-                uint32_t b_frag[2];
-                if (lane < 4)
-                {
-                    int const k_base = k_iter * kKTile + k_sub * 32 + half_k * 16 + (lane & 3) * 4;
-                    __half const* act_ptr = smem_act_fp16 + k_base;
-                    b_frag[0] = *reinterpret_cast<uint32_t const*>(act_ptr);
-                    b_frag[1] = *reinterpret_cast<uint32_t const*>(act_ptr + 2);
-                }
-                else
-                {
-                    b_frag[0] = 0;
-                    b_frag[1] = 0;
-                }
-
-                hmma_m16n8k16_f16(c_frag, a_frag, b_frag);
+                int const k_base = k_iter * kKTile + k_sub * 32 + (lane & 3) * 4;
+                uint32_t b_lo_pair[2];
+                uint32_t b_hi_pair[2];
+                lds64_b32x2(b_lo_pair[0], b_lo_pair[1], smem_act_fp8 + k_base);
+                lds64_b32x2(b_hi_pair[0], b_hi_pair[1], smem_act_fp8 + k_base + 16);
+                b_frag[0] = b_lo_pair[0];
+                b_frag[1] = b_hi_pair[0];
             }
+            else
+            {
+                b_frag[0] = 0;
+                b_frag[1] = 0;
+            }
+
+            asm volatile(
+                "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
+                "{%0, %1, %2, %3}, "
+                "{%4, %5, %6, %7}, "
+                "{%8, %9}, "
+                "{%0, %1, %2, %3};\n"
+                : "+f"(c_frag[0]), "+f"(c_frag[1]), "+f"(c_frag[2]), "+f"(c_frag[3])
+                : "r"(a_frag[0]), "r"(a_frag[1]), "r"(a_frag[2]), "r"(a_frag[3]), "r"(b_frag[0]), "r"(b_frag[1]));
         }
 
 #pragma unroll
         for (int i = 0; i < 2; ++i)
         {
-            d_out[i] += c_frag[i] * gate_weight_scale[kb];
-            d_out[i + 2] += c_frag[i + 2] * up_weight_scale[kb];
+            d_out[i] += c_frag[i] * gate_block_scale[kb];
+            d_out[i + 2] += c_frag[i + 2] * up_block_scale[kb];
         }
     }
 }
@@ -473,6 +441,67 @@ __device__ __forceinline__ void load_raw_weight_tile_fused_expert_up(__nv_fp8_e4
     }
 }
 
+template <int kQuantWarps>
+__device__ __forceinline__ void quant_act_blocks_fused_expert_up(cg::thread_block_tile<kWarpSize> warp,
+    __nv_bfloat16 const* __restrict__ smem_act_bf16, __nv_fp8_e4m3* __restrict__ smem_act_fp8,
+    float* __restrict__ smem_act_block_scales, int q_warp, int lane)
+{
+    constexpr int kQuantRounds = (kWeightScaleKBlocks + kQuantWarps - 1) / kQuantWarps;
+    constexpr int kElemsPerLane128Block = 128 / kWarpSize;
+
+#pragma unroll
+    for (int r = 0; r < kQuantRounds; ++r)
+    {
+        int const kb_global = q_warp + r * kQuantWarps;
+        if (kb_global >= kWeightScaleKBlocks)
+        {
+            break;
+        }
+
+        int const block_off = kb_global * 128; // bf16 element offset
+
+        // Each lane reads 4 contiguous bf16 elements (8 B vector load).
+        __nv_bfloat16 const* lane_src = smem_act_bf16 + block_off + lane * kElemsPerLane128Block;
+        __nv_bfloat162 v01;
+        __nv_bfloat162 v23;
+        v01 = *reinterpret_cast<__nv_bfloat162 const*>(lane_src);
+        v23 = *reinterpret_cast<__nv_bfloat162 const*>(lane_src + 2);
+        float const f0 = __bfloat162float(__low2bfloat16(v01));
+        float const f1 = __bfloat162float(__high2bfloat16(v01));
+        float const f2 = __bfloat162float(__low2bfloat16(v23));
+        float const f3 = __bfloat162float(__high2bfloat16(v23));
+
+        float const lane_max = fmaxf(fmaxf(fabsf(f0), fabsf(f1)), fmaxf(fabsf(f2), fabsf(f3)));
+        float amax = cg::reduce(warp, lane_max, cg::greater<float>{});
+        amax = fmaxf(amax, 1e-10f);
+        float quant_scale = 0.f; // bf16 * quant_scale -> fp8
+
+        if (lane == 0)
+        {
+            quant_scale = kFp8Max / amax;
+            smem_act_block_scales[kb_global] = amax * kInvFp8Max;
+        }
+        quant_scale = __shfl_sync(0xffffffff, quant_scale, 0);
+
+        // Quantize and write 4 fp8 elements per lane.
+        __nv_fp8_e4m3* lane_dst = smem_act_fp8 + block_off + lane * kElemsPerLane128Block;
+        float const q0 = fmaxf(-kFp8Max, fminf(kFp8Max, f0 * quant_scale));
+        float const q1 = fmaxf(-kFp8Max, fminf(kFp8Max, f1 * quant_scale));
+        float const q2 = fmaxf(-kFp8Max, fminf(kFp8Max, f2 * quant_scale));
+        float const q3 = fmaxf(-kFp8Max, fminf(kFp8Max, f3 * quant_scale));
+        __nv_fp8_e4m3 const fp8_0 = __nv_fp8_e4m3(q0);
+        __nv_fp8_e4m3 const fp8_1 = __nv_fp8_e4m3(q1);
+        __nv_fp8_e4m3 const fp8_2 = __nv_fp8_e4m3(q2);
+        __nv_fp8_e4m3 const fp8_3 = __nv_fp8_e4m3(q3);
+        // Pack 4 fp8 = 4 bytes = uint32 store.
+        uint32_t const packed = (static_cast<uint32_t>(static_cast<uint8_t>(fp8_0.__x)) << 0)
+            | (static_cast<uint32_t>(static_cast<uint8_t>(fp8_1.__x)) << 8)
+            | (static_cast<uint32_t>(static_cast<uint8_t>(fp8_2.__x)) << 16)
+            | (static_cast<uint32_t>(static_cast<uint8_t>(fp8_3.__x)) << 24);
+        *reinterpret_cast<uint32_t*>(lane_dst) = packed;
+    }
+}
+
 // -------------------------------------------------------------------------
 // DeepSeek-V3 fused expert-up kernel.
 //
@@ -521,9 +550,13 @@ __global__ __launch_bounds__(384, DSV3_FUSED_EXPERT_UP_LB_BLOCKS_PER_SM) void ds
 
     __nv_bfloat16* const smem_act_bf16
         = reinterpret_cast<__nv_bfloat16*>(smem_weight_tiles + kWeightStages * kCombinedTileBytes);
-    __half* const smem_act_fp16 = reinterpret_cast<__half*>(smem_act_bf16);
+    // In-kernel per-128-col act quant writes fp8 to a SEPARATE buffer
+    // (not aliased over bf16) so multiple warps can read bf16 / write fp8
+    // in parallel without aliasing races. Costs 6 KiB.
+    __nv_fp8_e4m3* const smem_act_fp8 = reinterpret_cast<__nv_fp8_e4m3*>(smem_act_bf16 + kHidden);
+
     auto align_up_128 = [](uintptr_t p) -> uintptr_t { return (p + 127u) & ~uintptr_t(127); };
-    uintptr_t rs_base = align_up_128(reinterpret_cast<uintptr_t>(smem_act_bf16 + kHidden));
+    uintptr_t rs_base = align_up_128(reinterpret_cast<uintptr_t>(smem_act_fp8 + kHidden));
 
     float* const smem_score_sigmoid = reinterpret_cast<float*>(rs_base);
     rs_base += sizeof(float) * kNumExperts;
@@ -543,6 +576,14 @@ __global__ __launch_bounds__(384, DSV3_FUSED_EXPERT_UP_LB_BLOCKS_PER_SM) void ds
 
     int32_t* const smem_topk_i = reinterpret_cast<int32_t*>(rs_base);
     rs_base += sizeof(int32_t) * kTopK;
+    rs_base = align_up_128(rs_base);
+
+    // Per-128-col activation dequant scales (TRTLLM 1x128 quant scheme).
+    // 48 fp32 = one scale per 128-col K-block over kHidden=6144.
+    // Computed in-kernel during Phase 1 (overlapped with top-K) and consumed
+    // in the K-loop fold (replacing the old single per-tensor scalar).
+    float* const smem_act_block_scales = reinterpret_cast<float*>(rs_base);
+    rs_base += sizeof(float) * kWeightScaleKBlocks;
     rs_base = align_up_128(rs_base);
 
     float* const smem_gate_weight_scales = reinterpret_cast<float*>(rs_base);
@@ -620,17 +661,18 @@ __global__ __launch_bounds__(384, DSV3_FUSED_EXPERT_UP_LB_BLOCKS_PER_SM) void ds
             fence_proxy_async_shared();
         }
     }
-    // Wait for activation cp.async completion before non-topK warps convert it
-    // in-place from BF16 to FP16. The CTA sync also publishes the score-prep
-    // writes and any TMA mbarrier initialization.
+    // Wait for activation cp.async completion before quant warps read
+    // smem_act_bf16. The CTA sync also publishes the score-prep writes and any
+    // TMA mbarrier initialization.
     asm volatile("cp.async.wait_all;\n" :::);
     __syncthreads();
 
-    // ===== Phase 1+2: top-K (warps 0..kNumExpertWarps-1). The remaining warps
-    // convert the activation tile to FP16 for HMMA reuse.
+    // ===== Phase 1+2 FUSED: top-K (warps 0..kNumExpertWarps-1)
+    //                       || per-128-col activation FP8 quant (remaining warps)
     // -------------------------------------------------------------------
     float top_scores[kTopK];
     int32_t top_experts[kTopK];
+    constexpr int kQuantWarps = kNumWarps - kNumExpertWarps; // 10
 
     if (warp_idx < kNumExpertWarps)
     {
@@ -654,7 +696,7 @@ __global__ __launch_bounds__(384, DSV3_FUSED_EXPERT_UP_LB_BLOCKS_PER_SM) void ds
         }
 
         // Only the two top-K warps need smem_inter_* published before warp 0
-        // can run stage 2.
+        // can run stage 2; quant warps continue independently.
         asm volatile("bar.sync 1, 64;\n" ::: "memory");
 
         // ----- Top-K stage 2 (warp 0 only). -----
@@ -706,13 +748,8 @@ __global__ __launch_bounds__(384, DSV3_FUSED_EXPERT_UP_LB_BLOCKS_PER_SM) void ds
     }
     else
     {
-        int const convert_tidx = tidx - kNumExpertWarps * kWarpSize;
-#pragma unroll 1
-        for (int elem = convert_tidx; elem < kHidden; elem += kActConvertThreads)
-        {
-            __nv_bfloat16 const v = smem_act_bf16[elem];
-            smem_act_fp16[elem] = __float2half(__bfloat162float(v));
-        }
+        quant_act_blocks_fused_expert_up<kQuantWarps>(
+            warp, smem_act_bf16, smem_act_fp8, smem_act_block_scales, warp_idx - kNumExpertWarps, lane);
     }
     __syncthreads();
 
@@ -776,7 +813,7 @@ __global__ __launch_bounds__(384, DSV3_FUSED_EXPERT_UP_LB_BLOCKS_PER_SM) void ds
             if constexpr (kUsePackedTmaFullEmptyPipeline)
             {
                 int const k_load = k + kWeightStages;
-                if (k_load < kNumKIter && tidx == kTmaProducerThread)
+                if (k_load < kNumKIter && tidx == 0)
                 {
                     int const load_stage = k_load % kWeightStages;
                     int const load_phase = (k_load / kWeightStages) & 1;
@@ -794,7 +831,7 @@ __global__ __launch_bounds__(384, DSV3_FUSED_EXPERT_UP_LB_BLOCKS_PER_SM) void ds
                 // Keep this prefetch ahead of MMA so copy latency overlaps with the current K tile.
                 if constexpr (kUsePackedTmaWeights)
                 {
-                    if (tidx == kTmaProducerThread)
+                    if (tidx == 0)
                     {
                         issue_packed_weight_tma_fused_expert_up<kInterPerTpParam>(
                             smem_weight_tiles + preload_stage * kCombinedTileBytes, &shared_gate_up_tma, packed_expert,
@@ -815,12 +852,12 @@ __global__ __launch_bounds__(384, DSV3_FUSED_EXPERT_UP_LB_BLOCKS_PER_SM) void ds
         {
             if constexpr (kUsePackedTmaWeights)
             {
-                if (tidx == kTmaProducerThread)
+                if (tidx == 0)
                 {
                     issue_packed_weight_tma_fused_expert_up<kInterPerTpParam>(
                         smem_weight_tiles, &shared_gate_up_tma, packed_expert, sub_row, k, smem_tma_full);
                 }
-                if (tidx == kTmaProducerThread)
+                if (tidx == 0)
                 {
                     mbarrier_wait_parity(smem_tma_full, tma_phase[0]);
                     tma_phase[0] ^= 1u;
@@ -844,21 +881,21 @@ __global__ __launch_bounds__(384, DSV3_FUSED_EXPERT_UP_LB_BLOCKS_PER_SM) void ds
 
         if (is_worker)
         {
-            float gate_weight_scales[kWeightScaleKBlocksPerKIter];
-            float up_weight_scales[kWeightScaleKBlocksPerKIter];
+            float gate_block_scales[kWeightScaleKBlocksPerKIter];
+            float up_block_scales[kWeightScaleKBlocksPerKIter];
 #pragma unroll
             for (int kb = 0; kb < kWeightScaleKBlocksPerKIter; ++kb)
             {
                 int const scale_idx = k * kWeightScaleKBlocksPerKIter + kb;
-                gate_weight_scales[kb] = smem_gate_weight_scales[scale_idx];
-                up_weight_scales[kb] = smem_up_weight_scales[scale_idx];
+                gate_block_scales[kb] = smem_gate_weight_scales[scale_idx] * smem_act_block_scales[scale_idx];
+                up_block_scales[kb] = smem_up_weight_scales[scale_idx] * smem_act_block_scales[scale_idx];
             }
             if constexpr (kUsePackedTmaFullEmptyPipeline)
             {
                 mbarrier_wait_parity(smem_tma_full + current_stage, static_cast<uint32_t>(current_phase));
             }
-            compute_mma_kiter_fused_expert_up(smem_weight_tiles + current_stage * kCombinedTileBytes, smem_act_fp16, k,
-                my_m, lane, gate_weight_scales, up_weight_scales, d_pair);
+            compute_mma_kiter_fused_expert_up(smem_weight_tiles + current_stage * kCombinedTileBytes, smem_act_fp8, k,
+                my_m, lane, gate_block_scales, up_block_scales, d_pair);
             if constexpr (kUsePackedTmaFullEmptyPipeline)
             {
                 if (lane == 0)
@@ -878,7 +915,7 @@ __global__ __launch_bounds__(384, DSV3_FUSED_EXPERT_UP_LB_BLOCKS_PER_SM) void ds
                 int const preload_stage = (k + 1) & 1;
                 if constexpr (kUsePackedTmaWeights)
                 {
-                    if (tidx == kTmaProducerThread)
+                    if (tidx == 0)
                     {
                         mbarrier_wait_parity(smem_tma_full + preload_stage, tma_phase[preload_stage]);
                         tma_phase[preload_stage] ^= 1u;
@@ -919,13 +956,14 @@ template <bool kUsePackedWeights, int kPackedWeightStagesParam = kPackedStagesDe
 static inline size_t fused_expert_up_smem_bytes()
 {
     auto align_up_128 = [](size_t p) -> size_t { return (p + 127u) & ~size_t(127); };
-    static_assert(kPackedWeightStagesParam == kPackedStagesSingle || kPackedWeightStagesParam == kPackedStagesDouble);
     static_assert(kPackedWeightLoadModeParam == kPackedLoadCpAsync || kPackedWeightLoadModeParam == kPackedLoadTma);
     constexpr int kWeightStages = kUsePackedWeights ? kPackedWeightStagesParam : kStages;
     constexpr bool kUsePackedTmaWeights = kUsePackedWeights && (kPackedWeightLoadModeParam == kPackedLoadTma);
     size_t bytes = 0;
     bytes += static_cast<size_t>(kWeightStages) * kCombinedTileBytes;
     bytes += static_cast<size_t>(kHidden) * sizeof(__nv_bfloat16);
+    // Separate fp8 act buffer (no longer aliased over bf16). +6 KiB.
+    bytes += static_cast<size_t>(kHidden) * sizeof(__nv_fp8_e4m3);
     bytes = align_up_128(bytes);
     bytes += sizeof(float) * kNumExperts;
     bytes = align_up_128(bytes);
@@ -936,6 +974,9 @@ static inline size_t fused_expert_up_smem_bytes()
     bytes += sizeof(int32_t) * kNumInterTopK;
     bytes = align_up_128(bytes);
     bytes += sizeof(int32_t) * kTopK;
+    bytes = align_up_128(bytes);
+    // smem_act_block_scales[48]: per-128-col activation dequant scales.
+    bytes += sizeof(float) * kWeightScaleKBlocks;
     bytes = align_up_128(bytes);
     bytes += sizeof(float) * kWeightScaleKBlocks;
     bytes = align_up_128(bytes);

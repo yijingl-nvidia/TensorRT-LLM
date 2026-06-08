@@ -75,7 +75,7 @@ _EXTRA_OP_LIBRARIES_LOADED = False
 # Historical dumped GLM-5 multi-stream-baseline-vs-PyTorch max abs thresholds
 # by rank should remain the practical target for future kernel work.
 # Current accepted fused-kernel max abs thresholds by rank are intentionally
-# tight to the FP16-HMMA fused expert-up implementation on the dumped GLM-5 data:
+# tight to the default FP8-MMA fused expert-up implementation on the dumped GLM-5 data:
 # [9.30e-05, 8.30e-05, 1.23e-04, 9.50e-05,
 #  1.00e-04, 8.10e-05, 8.90e-05, 5.50e-04].
 
