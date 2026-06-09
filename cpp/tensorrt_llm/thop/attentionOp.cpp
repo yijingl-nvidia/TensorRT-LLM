@@ -71,7 +71,73 @@ public:
     virtual int64_t getWorkspaceSize(AttentionOp const& op, int const num_tokens, int const max_attention_window_size,
         int const num_gen_tokens, int const max_blocks_per_sequence, int const ctx_total_kv_len = 0) const
         = 0;
-    // typically, we use single qkv input, but for context MLA, we use separate qkv inputs
+
+    // Abstract method to run the attention kernel
+
+    // Core Control
+    // - op: AttentionOp, a cached, stateful kernel launcher/config object. Runner::run() supplies the
+    //   per-batch tensors and lengths, but also patches a few runtime fields on op where the lower-level API
+    //   expects state to live.
+    // - is_context: true launches prefill/context via enqueueContext(); false launches decode/generation via
+    //   enqueueGeneration or mlaGeneration.
+    // - seq_offset: starting sequence row in per-sequence arrays. Generation starts after context rows.
+    // - num_seqs: number of sequence/beam rows for this phase.
+    // - token_offset: starting token row in token-major tensors qkv_or_q and output.
+    // - num_tokens: number of token rows processed in this phase.
+    // - predicted_tokens_per_seq: number of tokens predicted per sequence.
+    //
+    // Main Buffers
+    // - workspace: byte scratch buffer sized earlier by runner->getWorkspaceSize(...).
+    // - output: attention output. Runner::run() offsets it by token_offset into context_buf.
+    // - output_sf: optional scale-factor output for fused NVFP4 output; required when op.mFuseFp4Quant.
+    // - qkv_or_q: primary input. Usually fused QKV for non-MLA context, or Q for generation/MLA. It also
+    //   determines the current CUDA stream.
+    // - k, v: optional separate K/V tensors. Required for context MLA non-sparse paths and
+    //   SageAttention separate-QKV context.
+    //
+    // Length And Cache Metadata
+    // - sequence_length: device-side per-sequence KV-cache lengths, offset by seq_offset.
+    // - host_past_key_value_lengths: host past-KV lengths; used for max past length and generation params.
+    // - total_kv_len: aggregate KV length for this phase, context or generation.
+    // - context_lengths: device prompt/context lengths, offset by seq_offset.
+    // - host_context_lengths: host prompt lengths; used to compute max_context_q_len.
+    // - kv_cache_block_offsets: paged KV block table; used to select block offsets for this layer/pool/phase.
+    // - host_kv_cache_pool_pointers: host tensor containing raw KV-cache pool addresses.
+    // - host_kv_cache_pool_mapping: maps layer_idx to (pool_index, layer_idx_in_cache_pool).
+    // - cache_indirection: beam-search cache indirection table; only used for beam_width > 1.
+    //
+    // Quantization And RoPE
+    // - kv_scale_orig_quant, kv_scale_quant_orig: KV-cache quant/dequant scales.
+    // - out_scale: FP8 output scale, or NVFP4 scale-factor global scale depending on output mode.
+    // - rotary_inv_freq, rotary_cos_sin: RoPE lookup/cache inputs, used only when op.isRoPE().
+    // - mrope_rotary_cos_sin: context MRoPE cos/sin table.
+    // - mrope_position_deltas: generation MRoPE position deltas.
+    // - attention_sinks: optional float [num_heads_q] attention sink values.
+    //
+    // MLA-Specific
+    // - latent_cache: MLA latent KV cache, required for generation MLA, optional in some context reuse/chunked cases.
+    // - q_pe: MLA positional Q component, shape checked as 3D with contiguous last dimension.
+    // - block_ids_per_seq: FlashMLA generation block IDs, required when op.mUseGenFlashMLA.
+    // - cu_q_seqlens, cu_kv_seqlens: cumulative sequence lengths for generation MLA/FMHA scheduling.
+    // - fmha_scheduler_counter: FMHA tile scheduler counter.
+    // - mla_bmm1_scale, mla_bmm2_scale: MLA quantized BMM scale buffers.
+    // - quant_q_buffer: temporary quantized Q buffer.
+    // - quant_scale_qkv: QKV quantization scale; paired with quant_q_buffer to request fused FP8-Q-in-RoPE.
+    // - flash_mla_tile_scheduler_metadata, flash_mla_num_splits: optional precomputed FlashMLA scheduler metadata.
+    //
+    // Sparse, Spec-Decoding, Helix, etc.
+    // - helix_tensor_params: two optionals: helix_position_offsets and helix_is_inactive_rank.
+    // - softmax_stats_tensor: optional float [num_tokens, num_heads, 2] buffer for softmax max/LSE stats.
+    // - spec_decoding_tensor_params: generation-only speculative decoding tensors; 3 tensors normally, 6 on
+    // SM100-family paths.
+    // - spec_decoding_tensor_params: generation-only speculative decoding tensors; 3 tensors normally, 6 on
+    // SM100-family paths.
+    // - sparse_kv_indices, sparse_kv_offsets: sparse KV selection metadata.
+    // - sparse_attn_indices, sparse_attn_offsets: sparse attention metadata.
+    // - sparse_attn_indices_block_size: logical block size for sparse attention indices.
+    // - num_sparse_topk: sparse top-k count.
+    // - sparse_mla_topk_lens: DeepSeek V4 dynamic sparse MLA per-token top-k lengths.
+    // - compressed_kv_cache_pool_ptr: raw pointer to compressed sparse MLA KV pool; used with sparse_mla_topk_lens.
     virtual void run(AttentionOp& op, bool const is_context, int32_t const seq_offset, int32_t const num_seqs,
         int32_t const token_offset, int32_t const num_tokens, int32_t const predicted_tokens_per_seq,
         torch::Tensor workspace, torch::Tensor output, torch::optional<torch::Tensor> output_sf, torch::Tensor qkv_or_q,

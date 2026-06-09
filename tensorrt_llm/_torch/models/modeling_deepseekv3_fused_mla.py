@@ -14,18 +14,17 @@
 # limitations under the License.
 #
 
-import functools
 import math
 import os
 import weakref
-from typing import List, Optional, cast
+from typing import List, Optional
 
 import torch
 from torch import nn
 from transformers import PretrainedConfig
 
 import tensorrt_llm.quantization.utils.fp8_utils as fp8_utils
-from tensorrt_llm._utils import get_sm_version, is_sm_100f, nvtx_range, nvtx_range_debug
+from tensorrt_llm._utils import get_sm_version, is_sm_100f
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
@@ -35,19 +34,9 @@ from ..attention_backend import (
     AttentionForwardArgs,
     AttentionInputType,
     AttentionMetadata,
-    TrtllmAttention,
     TrtllmAttentionMetadata,
 )
-from ..attention_backend.interface import (
-    AttentionBackend,
-    PositionalEmbeddingParams,
-    PredefinedAttentionMask,
-    RopeParams,
-)
-from ..attention_backend.sparse.dsa import (
-    DSAtrtllmAttentionMetadata,
-    transform_local_topk_and_prepare_pool_view,
-)
+from ..attention_backend.interface import AttentionBackend, PositionalEmbeddingParams, RopeParams
 from ..attention_backend.utils import create_attention
 from ..distributed import AllReduceParams
 from ..model_config import ModelConfig
@@ -57,19 +46,7 @@ from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
 from ..modules.rotary_embedding import RotaryEmbedding
 from ..peft.lora.layer import LoraLayer
-from ..utils import (
-    get_model_extra_attrs,
-    is_torch_compiling,
-    maybe_compiled_cat,
-    maybe_compiled_copy_,
-)
-
-# Import FlashMLA sparse attention kernel
-try:
-    from tensorrt_llm.flash_mla import flash_mla_sparse_fwd
-except ImportError:
-    flash_mla_sparse_fwd = None
-
+from ..utils import get_model_extra_attrs
 
 _FUSED_MLA_MODE_ENV = "TRTLLM_DEEPSEEKV3_FUSED_MLA_MODE"
 FUSED_MLA_MODE_BASELINE = "baseline"
@@ -543,8 +520,6 @@ class FusedMLA(nn.Module):
             rope_append=True,
         )
 
-        self.softmax_scale = 1.0 / (math.sqrt(self.qk_head_dim) * q_scaling)
-
         self.aux_stream = aux_stream
         self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
 
@@ -558,49 +533,6 @@ class FusedMLA(nn.Module):
                 is_neox=pos_embd_params.is_neox,
             )
 
-        # Short-sequence MHA optimization for DSA models:
-        # For short prefill sequences, use MHA (kv_b_proj expansion + standard
-        # attention) instead of the absorption path, which has overhead from
-        # extra BMMs and larger head_dim (kv_lora_rank + qk_rope_head_dim).
-        # Only active when rope_fusion is True (DSA with TrtllmAttention).
-        _threshold_str = os.environ.get("TRTLLM_MLA_SHORT_SEQ_MHA_THRESHOLD", "0")
-        try:
-            self.short_seq_mha_threshold = int(_threshold_str)
-        except ValueError as err:
-            raise ValueError(
-                f"TRTLLM_MLA_SHORT_SEQ_MHA_THRESHOLD must be an integer, got '{_threshold_str}'"
-            ) from err
-
-        # MHA attention backend: used by non-DSA (standard MLA) and optionally
-        # by DSA for the short-seq path (dense attention, no sparse config).
-        _short_seq_mha = (
-            self.is_dsa and self.short_seq_mha_threshold > 0 and not self.apply_rotary_emb
-        )
-        if _short_seq_mha:
-            self.mha = create_attention(
-                config.attn_backend,
-                self.layer_idx,
-                self.num_heads_tp,
-                head_dim=self.qk_head_dim,
-                num_kv_heads=self.num_key_value_heads_tp,
-                pos_embd_params=pos_embd_params,
-                quant_config=quant_config,
-                q_scaling=q_scaling,
-                is_mla_enable=True,
-                q_lora_rank=self.q_lora_rank,
-                kv_lora_rank=self.kv_lora_rank,
-                qk_nope_head_dim=self.qk_nope_head_dim,
-                qk_rope_head_dim=self.qk_rope_head_dim,
-                v_head_dim=self.v_head_dim,
-                predicted_tokens_per_seq=self.predicted_tokens_per_seq,
-                skip_create_weights_in_init=config.skip_create_weights_in_init,
-                sparse_attention_config=(
-                    None if _short_seq_mha else config.sparse_attention_config
-                ),
-            )
-        else:
-            self.mha = None
-
         self.llama_4_scaling = False
         if hasattr(config.pretrained_config, "llama_4_scaling"):
             self.llama_4_scaling = True
@@ -613,12 +545,8 @@ class FusedMLA(nn.Module):
             self.create_weights()
 
     def create_weights(self):
-        # self.mha/mqa has no weights but has states that are related to
+        # self.mqa has no weights but has states that are related to
         # quant_config, which could be modified after __init__.
-        # self.mha is non-None for non-DSA models (standard MHA) and for DSA
-        # models when the short-seq MHA optimization is active.
-        if self.mha is not None:
-            self.mha.update_quant_config(self.quant_config)
         self.mqa.update_quant_config(self.quant_config)
 
         # Although we use FP8 MLA for context/generation phase, the output is still in BF16
@@ -729,8 +657,8 @@ class FusedMLA(nn.Module):
 
     def _is_fused_q_fp8_quant_enabled(self, num_generations: int = 0) -> bool:
         # Context-only batches: the fused path leaves a placeholder bf16 q_buf
-        # that forward_generation_sparse_mla would read uninitialized, so
-        # mixed/gen batches must take the legacy unfused path.
+        # that generation would read uninitialized, so mixed/gen batches must
+        # take the legacy unfused path.
         # `TRTLLM_DISABLE_FUSED_Q_FP8_QUANT=1` is an opt-out kill switch for
         # debugging numerical drift between fused (skips bf16 round-trip) and
         # legacy (bf16 store -> reload -> FP8) Q-quant paths. Keep it disabled
@@ -819,93 +747,8 @@ class FusedMLA(nn.Module):
             output (torch.Tensor): The output tensor to write results into.
             latent_cache_gen (Optional[torch.Tensor]): The latent cache used in generation.
         """
-        # split q, k, v into context and gen batches
-        num_contexts = attn_metadata.num_contexts
-        num_generations = attn_metadata.num_generations
-        num_ctx_tokens = attn_metadata.num_ctx_tokens
-        num_tokens = attn_metadata.num_tokens
-
-        hidden_states = hidden_states[:num_tokens, ...]
-        if position_ids is not None:
-            position_ids = position_ids[..., :num_tokens]
-
-        if self.is_lite:
-            compressed_kv, k_pe = self.kv_a_proj_with_mqa(hidden_states).split(
-                [self.kv_lora_rank, self.qk_rope_head_dim], -1
-            )
-            compressed_kv = self.kv_a_layernorm(compressed_kv)
-            q = hidden_states
-        else:
-            q, compressed_kv, k_pe = self.kv_a_proj_with_mqa(hidden_states).split(
-                [self.q_lora_rank, self.kv_lora_rank, self.qk_rope_head_dim], -1
-            )
-
-            q, compressed_kv = maybe_execute_in_parallel(
-                lambda: self.q_a_layernorm(q),
-                lambda: self.kv_a_layernorm(compressed_kv),
-                self.ln_events[0],
-                self.ln_events[1],
-                self.aux_stream,
-            )
-
-        q, latent_cache = maybe_execute_in_parallel(
-            lambda: self.q_b_proj(q),
-            lambda: torch.concat([compressed_kv, k_pe], dim=-1),
-            self.ln_events[0],
-            self.ln_events[1],
-            self.aux_stream,
-        )
-
-        assert q.shape[0] == num_tokens, (
-            f"Expect q.shape[0] to be {num_tokens}, but got {q.shape[0]}"
-        )
-
         assert output is not None, "output must be provided"
-
-        if num_contexts > 0:
-            q_ctx = q[:num_ctx_tokens, ...]
-            compressed_kv_ctx = compressed_kv[:num_ctx_tokens, ...]
-            k_pe_ctx = k_pe[:num_ctx_tokens, ...]
-            latent_cache_ctx = latent_cache[:num_ctx_tokens, ...]
-            if self.apply_rotary_emb:
-                assert position_ids is not None
-                k_pe_ctx = self.apply_rope(q_ctx, k_pe_ctx, position_ids)
-
-            if self.llama_4_scaling:
-                q_ctx = self._attention_scaling(q_ctx, position_ids[..., :num_ctx_tokens])
-
-            self.forward_context(
-                q_ctx,
-                compressed_kv_ctx,
-                k_pe_ctx,
-                position_ids,
-                attn_metadata,
-                output[:num_ctx_tokens, :],
-                latent_cache_ctx,
-            )
-
-        if num_generations > 0:
-            q_gen = q[num_ctx_tokens:, ...]
-            compressed_kv_gen = compressed_kv[num_ctx_tokens:, ...]
-            k_pe_gen = k_pe[num_ctx_tokens:, ...]
-            if latent_cache_gen is None:
-                latent_cache_gen = latent_cache[num_ctx_tokens:, ...]
-            if self.apply_rotary_emb:
-                assert position_ids is not None
-                k_pe_gen = self.apply_rope(q_gen, k_pe_gen, position_ids)
-
-            if self.llama_4_scaling:
-                q_gen = self._attention_scaling(q_gen, position_ids[..., num_ctx_tokens:])
-
-            self.forward_absorption_generation(
-                q_gen,
-                compressed_kv_gen,
-                k_pe_gen,
-                attn_metadata,
-                output[num_ctx_tokens:num_tokens, :],
-                position_ids=position_ids,
-                latent_cache=latent_cache_gen,
-            )
+        self.forward_impl_with_dsa(position_ids, hidden_states, attn_metadata, output)
 
     def forward_impl_with_dsa(
         self,
@@ -949,20 +792,17 @@ class FusedMLA(nn.Module):
     ) -> List[torch.Tensor]:
         """Token-wise projections for DSA MLA (CUDA-graph-capturable Op 1).
 
-        Runs kv_a_proj, layernorms, q_b_proj, and conditionally
-        indexer.pre_indexer_proj().
+        Runs kv_a_proj, layernorms, q_b_proj, and indexer.pre_indexer_proj().
 
         IMPORTANT: This method must NOT slice tensors by num_tokens or
         access batch-specific metadata, so that all operations are
         unconditionally straight-line for CUDA graph capture.  Slicing
         to num_tokens happens in forward_dsa_attn (Op 2, outside graph).
 
-        Returns [q, compressed_kv, k_pe, latent_cache] when short-MHA
-        handles all tokens (eager only), or
-        [q, compressed_kv, k_pe, latent_cache, q_fp8, k_fp8, k_scale,
-        weights, q_scale] when the indexer runs.  q_scale is unused on the
-        FP8 path but always present so CUDA graph capture sees a stable
-        9-tensor shape regardless of indexer dtype.
+        Returns [q, compressed_kv, k_pe, latent_cache, q_fp8, k_fp8,
+        k_scale, weights, q_scale]. q_scale is unused on the FP8 path but
+        always present so CUDA graph capture sees a stable 9-tensor shape
+        regardless of indexer dtype.
         """
         assert self.mqa is not None, "DSA is only supported in MQA mode"
 
@@ -981,13 +821,6 @@ class FusedMLA(nn.Module):
         latent_cache = torch.concat([compressed_kv, k_pe], dim=-1)
 
         q = self.q_b_proj(q)
-
-        use_short_mha_for_ctx = self._should_use_short_mha(attn_metadata, position_ids)
-
-        # Skip the indexer when the short MHA path handles all context
-        # tokens and there are no generation tokens.
-        if use_short_mha_for_ctx and attn_metadata.num_generations == 0:
-            return [q, compressed_kv, k_pe, latent_cache]
 
         # pre_indexer_proj is the CUDA-graph-safe portion: pure token-wise
         # compute (cublas_mm, rope, FP4/FP8 quantize, weight scaling) with no
@@ -1013,8 +846,7 @@ class FusedMLA(nn.Module):
     ) -> None:
         """Batch-structure-dependent attention for DSA MLA (Op 2, not graph-captured).
 
-        indexer_intermediates is [q_fp8, k_fp8, k_scale, weights, q_scale]
-        when the indexer ran in Op 1, or [] when short-MHA handled all tokens.
+        indexer_intermediates is [q_fp8, k_fp8, k_scale, weights, q_scale].
 
         All num_tokens slicing happens here (not in Op 1) because
         num_tokens comes from batch-specific metadata and must not be
@@ -1034,33 +866,25 @@ class FusedMLA(nn.Module):
         if position_ids is not None:
             position_ids = position_ids[..., :num_tokens]
 
-        use_short_mha_for_ctx = num_contexts > 0 and self._should_use_short_mha(
-            attn_metadata, position_ids
+        q_fp8, k_fp8, k_scale, weights, q_scale = indexer_intermediates
+        # Slice indexer intermediates to actual num_tokens (they were
+        # computed on the full padded tensor in Op 1).
+        q_fp8 = q_fp8[:num_tokens, ...]
+        k_fp8 = k_fp8[:num_tokens, ...]
+        k_scale = k_scale[:num_tokens, ...]
+        weights = weights[:num_tokens, ...]
+        q_scale = q_scale[:num_tokens, ...]
+        topk_indices = self.mqa.indexer.sparse_attn_indexer(
+            attn_metadata,
+            q,  # only used for shape/device in buffer allocation
+            q_fp8,
+            k_fp8,
+            k_scale,
+            weights,
+            q_scale=q_scale,
         )
 
-        if use_short_mha_for_ctx and num_generations == 0:
-            topk_indices = None
-        else:
-            q_fp8, k_fp8, k_scale, weights, q_scale = indexer_intermediates
-            # Slice indexer intermediates to actual num_tokens (they were
-            # computed on the full padded tensor in Op 1).
-            q_fp8 = q_fp8[:num_tokens, ...]
-            k_fp8 = k_fp8[:num_tokens, ...]
-            k_scale = k_scale[:num_tokens, ...]
-            weights = weights[:num_tokens, ...]
-            q_scale = q_scale[:num_tokens, ...]
-            topk_indices = self.mqa.indexer.sparse_attn_indexer(
-                attn_metadata,
-                q,  # only used for shape/device in buffer allocation
-                q_fp8,
-                k_fp8,
-                k_scale,
-                weights,
-                q_scale=q_scale,
-            )
-
         assert output is not None, "output must be provided"
-        sm_version = get_sm_version()
 
         if num_contexts > 0:
             q_ctx = q[:num_ctx_tokens, ...]
@@ -1075,40 +899,20 @@ class FusedMLA(nn.Module):
             topk_indices_ctx = (
                 topk_indices[:num_ctx_tokens, :] if topk_indices is not None else None
             )
-            if use_short_mha_for_ctx:
-                assert position_ids is not None
-                self.forward_context(
-                    q_ctx,
-                    compressed_kv_ctx,
-                    k_pe_ctx,
-                    position_ids,
-                    attn_metadata,
-                    context_output,
-                    latent_cache_ctx,
-                )
-            elif sm_version >= 100:
-                self.forward_absorption_context(
-                    q_ctx,
-                    compressed_kv_ctx,
-                    k_pe_ctx,
-                    attn_metadata,
-                    context_output,
-                    position_ids=position_ids,
-                    latent_cache=latent_cache_ctx,
-                    topk_indices=topk_indices_ctx,
-                )
-            else:
-                self.forward_sparse_mla_kvcache_bf16(
-                    q_ctx,
-                    latent_cache_ctx,
-                    attn_metadata,
-                    context_output,
-                    topk_indices_ctx,
-                    is_generation=False,
-                )
+            self.forward_absorption_context(
+                q_ctx,
+                compressed_kv_ctx,
+                k_pe_ctx,
+                attn_metadata,
+                context_output,
+                position_ids=position_ids,
+                latent_cache=latent_cache_ctx,
+                topk_indices=topk_indices_ctx,
+            )
 
         if num_generations > 0:
             q_gen = q[num_ctx_tokens:, ...]
+            compressed_kv_gen = compressed_kv[num_ctx_tokens:, ...]
             k_pe_gen = k_pe[num_ctx_tokens:, ...]
             latent_cache_gen = latent_cache[num_ctx_tokens:, ...]
             if self.apply_rotary_emb:
@@ -1117,336 +921,16 @@ class FusedMLA(nn.Module):
 
             generation_output = output[num_ctx_tokens:num_tokens, :]
             topk_indices_gen = topk_indices[num_ctx_tokens:num_tokens, :]
-            if sm_version >= 100:
-                gen_num_tokens = q_gen.shape[0]
-                q_nope_gen, q_pe_gen = q_gen.view([-1, self.num_heads_tp, self.qk_head_dim]).split(
-                    [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
-                )
-
-                num_seqs = attn_metadata.kv_lens_cuda_runtime.size(0)
-                cu_q_seqlens = torch.empty(num_seqs + 1, dtype=torch.int32, device=q_gen.device)
-                cu_kv_seqlens = torch.empty(num_seqs + 1, dtype=torch.int32, device=q_gen.device)
-                fmha_scheduler_counter = torch.empty(1, dtype=torch.uint32, device=q_gen.device)
-                has_fp8_kv_cache = (
-                    self.mqa.has_fp8_kv_cache if hasattr(self.mqa, "has_fp8_kv_cache") else False
-                )
-
-                mla_bmm1_scale = None
-                mla_bmm2_scale = None
-                quant_q_buffer = None
-                if has_fp8_kv_cache:
-                    mla_bmm1_scale = torch.empty(2, dtype=torch.float32, device=q_gen.device)
-                    mla_bmm2_scale = torch.empty(1, dtype=torch.float32, device=q_gen.device)
-                    quant_q_buffer = torch.empty(
-                        gen_num_tokens,
-                        self.num_heads_tp,
-                        self.kv_lora_rank + self.qk_rope_head_dim,
-                        dtype=torch.uint8,
-                        device=q_gen.device,
-                    )
-
-                fused_q = torch.empty(
-                    [
-                        gen_num_tokens,
-                        self.num_heads_tp,
-                        self.kv_lora_rank + self.qk_rope_head_dim,
-                    ],
-                    dtype=q_gen.dtype,
-                    device=q_gen.device,
-                )
-
-                rope_stream = self.aux_stream if not has_fp8_kv_cache else None
-                if self.k_b_proj_trans.dtype == torch.bfloat16:
-                    q_nope_t = q_nope_gen.transpose(0, 1)
-                    q_nope_out = fused_q[..., : self.kv_lora_rank].transpose(0, 1)
-                    maybe_execute_in_parallel(
-                        lambda: self._bmm_bf16_out(
-                            q_nope_t,
-                            self.k_b_proj_trans,
-                            self.k_b_proj_trans.transpose(1, 2),
-                            q_nope_out,
-                        ),
-                        lambda: self.mqa.mla_rope_generation(
-                            fused_q,
-                            q_pe_gen,
-                            latent_cache_gen,
-                            attn_metadata,
-                            cu_q_seqlens,
-                            cu_kv_seqlens,
-                            fmha_scheduler_counter,
-                            mla_bmm1_scale,
-                            mla_bmm2_scale,
-                            quant_q_buffer,
-                        ),
-                        self.ln_events[0],
-                        self.ln_events[1],
-                        rope_stream,
-                    )
-                elif self.k_b_proj_trans.dtype == torch.float8_e4m3fn:
-                    q_nope_out = fused_q[..., : self.kv_lora_rank].transpose(0, 1)
-
-                    if rope_stream is None:
-                        if is_sm_100f() and not self.use_cute_dsl_blockscaling_bmm:
-                            torch.bmm(
-                                q_nope_gen.transpose(0, 1),
-                                self.k_b_proj_trans_dequant.transpose(1, 2),
-                                out=q_nope_out,
-                            )
-                        else:
-                            fp8_block_scaling_bmm_out(
-                                q_nope_gen,
-                                self.k_b_proj_trans,
-                                self.k_b_proj_trans_scale,
-                                q_nope_out,
-                                self.k_b_proj_trans_dequant,
-                                self.use_cute_dsl_blockscaling_bmm,
-                            )
-                        self.mqa.mla_rope_generation(
-                            fused_q,
-                            q_pe_gen,
-                            latent_cache_gen,
-                            attn_metadata,
-                            cu_q_seqlens,
-                            cu_kv_seqlens,
-                            fmha_scheduler_counter,
-                            mla_bmm1_scale,
-                            mla_bmm2_scale,
-                            quant_q_buffer,
-                        )
-                    else:
-                        maybe_execute_in_parallel(
-                            lambda: torch.bmm(
-                                q_nope_gen.transpose(0, 1),
-                                self.k_b_proj_trans_dequant.transpose(1, 2),
-                                out=q_nope_out,
-                            )
-                            if is_sm_100f() and not self.use_cute_dsl_blockscaling_bmm
-                            else fp8_block_scaling_bmm_out(
-                                q_nope_gen,
-                                self.k_b_proj_trans,
-                                self.k_b_proj_trans_scale,
-                                q_nope_out,
-                                self.k_b_proj_trans_dequant,
-                                self.use_cute_dsl_blockscaling_bmm,
-                            ),
-                            lambda: self.mqa.mla_rope_generation(
-                                fused_q,
-                                q_pe_gen,
-                                latent_cache_gen,
-                                attn_metadata,
-                                cu_q_seqlens,
-                                cu_kv_seqlens,
-                                fmha_scheduler_counter,
-                                mla_bmm1_scale,
-                                mla_bmm2_scale,
-                                quant_q_buffer,
-                            ),
-                            self.ln_events[0],
-                            self.ln_events[1],
-                            rope_stream,
-                        )
-                else:
-                    raise NotImplementedError(
-                        f"Missing bmm impl for dtype: {self.k_b_proj_trans.dtype}."
-                    )
-
-                fused_q = fused_q.view(
-                    [
-                        gen_num_tokens,
-                        self.num_heads_tp * (self.kv_lora_rank + self.qk_rope_head_dim),
-                    ]
-                )
-
-                generation_position_ids = None
-                position_ids_lifetime = generation_position_ids
-                latent_attn_output = fused_q.new_empty(
-                    (gen_num_tokens, self.num_heads_tp * self.kv_lora_rank)
-                )
-                if self.mapping.has_cp_helix():
-                    softmax_stats = torch.empty(
-                        (fused_q.shape[0], self.num_heads_tp, 2),
-                        device=fused_q.device,
-                        dtype=torch.float32,
-                    )
-                    partial_o = self.mqa.forward(
-                        fused_q,
-                        None,
-                        None,
-                        attn_metadata,
-                        forward_args=AttentionForwardArgs(
-                            attention_input_type=AttentionInputType.generation_only,
-                            out_scale=self.out_scale,
-                            output=latent_attn_output,
-                            latent_cache=latent_cache_gen,
-                            q_pe=q_pe_gen,
-                            topk_indices=topk_indices_gen,
-                            is_generation=True,
-                            cu_q_seqlens=cu_q_seqlens,
-                            cu_kv_seqlens=cu_kv_seqlens,
-                            fmha_scheduler_counter=fmha_scheduler_counter,
-                            mla_bmm1_scale=mla_bmm1_scale,
-                            mla_bmm2_scale=mla_bmm2_scale,
-                            quant_q_buffer=quant_q_buffer,
-                            softmax_stats_tensor=softmax_stats,
-                        ),
-                    )
-                    kv_lora_rank = partial_o.shape[-1] // self.num_heads_tp
-                    assert self.kv_lora_rank == kv_lora_rank
-                    attn_out_latent = _helix_post_process(
-                        partial_o,
-                        softmax_stats,
-                        self.mapping,
-                        self.num_heads_tp_cp,
-                        kv_lora_rank,
-                        self.aux_stream,
-                        self.ln_events,
-                    )
-                else:
-                    attn_out_latent = self.mqa.forward(
-                        fused_q,
-                        None,
-                        None,
-                        attn_metadata,
-                        forward_args=AttentionForwardArgs(
-                            attention_input_type=AttentionInputType.generation_only,
-                            out_scale=self.out_scale,
-                            output=latent_attn_output,
-                            latent_cache=latent_cache_gen,
-                            q_pe=q_pe_gen,
-                            topk_indices=topk_indices_gen,
-                            is_generation=True,
-                            cu_q_seqlens=cu_q_seqlens,
-                            cu_kv_seqlens=cu_kv_seqlens,
-                            fmha_scheduler_counter=fmha_scheduler_counter,
-                            mla_bmm1_scale=mla_bmm1_scale,
-                            mla_bmm2_scale=mla_bmm2_scale,
-                            quant_q_buffer=quant_q_buffer,
-                        ),
-                    )
-                _ = position_ids_lifetime
-                fused_q = None
-
-                assert (
-                    attn_out_latent.shape[0] == q_gen.shape[0]
-                    and attn_out_latent.shape[1] == self.num_heads_tp_cp * self.kv_lora_rank
-                )
-
-                attn_out_latent = attn_out_latent.view(
-                    [-1, self.num_heads_tp_cp, self.kv_lora_rank]
-                )
-                attn_output = generation_output.view(
-                    [gen_num_tokens, self.num_heads_tp_cp, self.v_head_dim]
-                )
-
-                if self.v_b_proj.dtype == torch.bfloat16:
-                    self._bmm_bf16_out(
-                        attn_out_latent.transpose(0, 1),
-                        self.v_b_proj,
-                        self.v_b_proj.transpose(1, 2),
-                        attn_output.transpose(0, 1),
-                    )
-                elif self.v_b_proj.dtype == torch.float8_e4m3fn:
-                    attn_output_t = attn_output.transpose(0, 1)
-                    if is_sm_100f() and not self.use_cute_dsl_blockscaling_bmm:
-                        torch.bmm(
-                            attn_out_latent.transpose(0, 1),
-                            self.v_b_proj_dequant.transpose(1, 2),
-                            out=attn_output_t,
-                        )
-                    else:
-                        fp8_block_scaling_bmm_out(
-                            attn_out_latent,
-                            self.v_b_proj,
-                            self.v_b_proj_scale,
-                            attn_output_t,
-                            self.v_b_proj_dequant,
-                            self.use_cute_dsl_blockscaling_bmm,
-                        )
-                else:
-                    raise NotImplementedError(f"Missing bmm impl for dtype: {self.v_b_proj.dtype}.")
-            else:
-                self.forward_sparse_mla_kvcache_bf16(
-                    q_gen,
-                    latent_cache_gen,
-                    attn_metadata,
-                    generation_output,
-                    topk_indices_gen,
-                    is_generation=True,
-                )
-
-    def forward_context_default(
-        self,
-        q: torch.Tensor,
-        compressed_kv: torch.Tensor,
-        k_pe: torch.Tensor,
-        position_ids: torch.Tensor,
-        attn_metadata: AttentionMetadata,
-        output: torch.Tensor,
-        latent_cache: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """Dense MHA context path: expand KV via kv_b_proj and run attention.
-
-        Used by non-DSA models and as the short-seq MHA fallback for DSA models.
-        """
-        kv = self.kv_b_proj(compressed_kv)
-        k_nope, v = kv.split(
-            [self.num_heads_tp * self.qk_nope_head_dim, self.num_heads_tp * self.v_head_dim],
-            -1,
-        )
-
-        k = torch.empty_like(q).view(-1, self.num_heads_tp, self.qk_head_dim)
-        maybe_compiled_copy_(
-            k[..., : self.qk_nope_head_dim],
-            k_nope.view(-1, self.num_heads_tp, self.qk_nope_head_dim),
-        )
-        # When rope_fusion=True (apply_rotary_emb=False), the rope portion
-        # of k is left uninitialized here; the fused attention kernel
-        # handles k_pe RoPE via latent_cache instead.
-        if self.apply_rotary_emb:
-            k[..., self.qk_nope_head_dim :] = k_pe.view(-1, 1, self.qk_rope_head_dim)
-        k = k.view(-1, self.num_heads_tp * self.qk_head_dim)
-
-        attn_output = self.mha.forward(
-            q,
-            k,
-            v,
-            attn_metadata,
-            forward_args=AttentionForwardArgs(
-                attention_input_type=AttentionInputType.context_only,
-                latent_cache=latent_cache,
-                out_scale=self.out_scale,
-                output=output,
-            ),
-        )
-
-        return attn_output
-
-    def _should_use_short_mha(
-        self, attn_metadata: AttentionMetadata, position_ids: Optional[torch.Tensor]
-    ) -> bool:
-        """Check if the short-seq MHA optimization should be used for context.
-
-        Uses max_ctx_kv_len (max total KV length per context sequence,
-        including cached tokens) when available, to correctly account for
-        chunked context where the full attention span exceeds the threshold
-        even if the new token count is small.  Falls back to num_ctx_tokens
-        (total new context tokens) when max_ctx_kv_len is not set.
-
-        Disabled under torch compile so that the split DSA custom ops
-        (mla_dsa_proj / mla_dsa_attn_inplace) have unconditionally
-        straight-line control flow for CUDA graph capture.
-        """
-        if is_torch_compiling():
-            return False
-        if not (
-            self.short_seq_mha_threshold > 0
-            and not self.apply_rotary_emb
-            and self.mapping.cp_size == 1
-            and position_ids is not None
-        ):
-            return False
-        effective_len = getattr(attn_metadata, "max_ctx_kv_len", attn_metadata.num_ctx_tokens)
-        return effective_len <= self.short_seq_mha_threshold
+            self.forward_absorption_generation(
+                q_gen,
+                compressed_kv_gen,
+                k_pe_gen,
+                attn_metadata,
+                generation_output,
+                position_ids=position_ids,
+                latent_cache=latent_cache_gen,
+                topk_indices=topk_indices_gen,
+            )
 
     def forward_context_sparse_mla(
         self,
@@ -1461,13 +945,6 @@ class FusedMLA(nn.Module):
     ) -> torch.Tensor:
         """Run context-phase attention for DSA models.
 
-        Dispatches to the short-seq MHA path (forward_context) when the max
-        per-sequence KV length (including cached tokens) is within the
-        threshold, or falls through to the absorption/sparse MLA path
-        otherwise.  forward_context() further dispatches to the appropriate
-        handler (forward_context_default, forward_context_with_cached_kv, or
-        forward_context_with_chunked_prefill) based on cached-KV state.
-
         Args:
             q: Query tensor, shape [num_ctx_tokens, num_heads * qk_head_dim].
             compressed_kv: Latent KV, shape [num_ctx_tokens, kv_lora_rank].
@@ -1475,36 +952,19 @@ class FusedMLA(nn.Module):
             attn_metadata: Attention metadata for the current batch.
             output: Pre-allocated output tensor, written in-place.
             latent_cache: Concatenated [compressed_kv, k_pe] for KV cache.
-            topk_indices: Sparse routing indices from the indexer (None when
-                the short-seq MHA path is used).
-            position_ids: Token position IDs (required for short-seq MHA).
+            topk_indices: Sparse routing indices from the indexer.
+            position_ids: Token position IDs.
         """
-        # Short-sequence MHA: bypass absorption path for short prefills,
-        # using kv_b_proj expansion + standard attention instead.
-        # See __init__ comment for rationale. topk_indices is not used
-        # because dense attention is faster than sparse routing at this scale.
-        # forward_context() handles cached tokens by dispatching to
-        # forward_context_with_cached_kv or forward_context_with_chunked_prefill.
-        if self._should_use_short_mha(attn_metadata, position_ids):
-            return self.forward_context(
-                q, compressed_kv, k_pe, position_ids, attn_metadata, output, latent_cache
-            )
-
-        if get_sm_version() >= 100:
-            return self.forward_absorption_context(
-                q,
-                compressed_kv,
-                k_pe,
-                attn_metadata,
-                output,
-                position_ids=position_ids,
-                latent_cache=latent_cache,
-                topk_indices=topk_indices,
-            )
-        else:
-            return self.forward_sparse_mla_kvcache_bf16(
-                q, latent_cache, attn_metadata, output, topk_indices, is_generation=False
-            )
+        return self.forward_absorption_context(
+            q,
+            compressed_kv,
+            k_pe,
+            attn_metadata,
+            output,
+            position_ids=position_ids,
+            latent_cache=latent_cache,
+            topk_indices=topk_indices,
+        )
 
     def forward_generation_sparse_mla(
         self,
@@ -1517,333 +977,15 @@ class FusedMLA(nn.Module):
         latent_cache: Optional[torch.Tensor] = None,
         topk_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if get_sm_version() >= 100:
-            return self.forward_absorption_generation(
-                q,
-                compressed_kv,
-                k_pe,
-                attn_metadata,
-                output,
-                position_ids=position_ids,
-                latent_cache=latent_cache,
-                topk_indices=topk_indices,
-            )
-        else:
-            return self.forward_sparse_mla_kvcache_bf16(
-                q, latent_cache, attn_metadata, output, topk_indices, is_generation=True
-            )
-
-    def forward_context_with_cached_kv(
-        self,
-        q: torch.Tensor,
-        latent_cache: torch.Tensor,
-        attn_metadata: AttentionMetadata,
-        output: torch.Tensor,
-    ) -> torch.Tensor:
-        assert latent_cache is not None
-        trtllm_attention = cast(TrtllmAttention, self.mha)
-
-        # apply RoPE, append compressed_kv + k_pe to paged kv cache and assign q_pe to q
-        trtllm_attention.mla_rope_append_paged_kv_assign_q(q, latent_cache, attn_metadata)
-
-        # copy full_compressed_kv and full_k_pe from paged kv cache
-        full_compressed_kv, full_k_pe = trtllm_attention.load_paged_kv_cache_for_mla(
-            attn_metadata, q.dtype
-        )
-        assert (
-            full_compressed_kv.shape[0]
-            == attn_metadata.num_ctx_cached_tokens + attn_metadata.num_ctx_tokens
-        )
-        assert full_compressed_kv.shape[1] == self.kv_lora_rank
-        assert (
-            full_k_pe.shape[0] == attn_metadata.num_ctx_cached_tokens + attn_metadata.num_ctx_tokens
-        )
-        assert full_k_pe.shape[1] == self.qk_rope_head_dim
-        assert full_compressed_kv.is_contiguous()
-        assert full_k_pe.is_contiguous()
-
-        # compute full_k_nope and full_v from full_compressed_kv
-        full_kv = self.kv_b_proj(full_compressed_kv)
-        full_k_nope, full_v = full_kv.split(
-            [self.num_heads_tp * self.qk_nope_head_dim, self.num_heads_tp * self.v_head_dim],
-            -1,
-        )
-
-        full_k_nope = full_k_nope.view(-1, self.num_heads_tp, self.qk_nope_head_dim)
-        full_k_pe = full_k_pe.view(-1, 1, self.qk_rope_head_dim)
-        full_k = maybe_compiled_cat(
-            (full_k_nope, full_k_pe.expand(-1, self.num_heads_tp, -1)), dim=-1
-        )
-        full_k = full_k.view(-1, self.num_heads_tp * self.qk_head_dim)
-
-        # release pytorch activation memory
-        full_compressed_kv = None
-        full_k_pe = None
-        full_kv = None
-        full_k_nope = None
-
-        # latent_cache must be None to differentiate from normal context phase,
-        # so that we can skip applying RoPE and appending KV cache inside attention op
-        attn_output = self.mha.forward(
+        return self.forward_absorption_generation(
             q,
-            full_k,
-            full_v,
+            compressed_kv,
+            k_pe,
             attn_metadata,
-            forward_args=AttentionForwardArgs(
-                attention_input_type=AttentionInputType.context_only,
-                latent_cache=None,
-                out_scale=self.out_scale,
-                output=output,
-            ),
-        )
-
-        return attn_output
-
-    def forward_context_with_chunked_prefill(
-        self,
-        q: torch.Tensor,
-        compressed_kv: torch.Tensor,
-        latent_cache: torch.Tensor,  # compressed_kv + k_pe [context_tokens, 1, lora_size + rope_size]
-        attn_metadata: TrtllmAttentionMetadata,
-        output: torch.Tensor,
-    ) -> torch.Tensor:
-        trtllm_attention = cast(TrtllmAttention, self.mha)
-        # apply RoPE, append compressed_kv + k_pe to paged kv cache and assign q_pe to q
-        trtllm_attention.mla_rope_append_paged_kv_assign_q(q, latent_cache, attn_metadata)
-
-        # determine the number of loop
-        # currently we assume that the chunk size is the same as the max_num_tokens
-        chunked_loop_num = attn_metadata.chunked_loop_num
-
-        # [total_token_q, num_heads, 2] -> [total_token_q, num_heads] float2
-        self.softmax_stats_tensor = torch.empty(
-            (attn_metadata.num_ctx_tokens, self.num_heads_tp, 2),
-            dtype=torch.float,
-            device="cuda",
-        )
-        self.temp_softmax_stats_tensor = torch.empty(
-            (attn_metadata.num_ctx_tokens, self.num_heads_tp, 2),
-            dtype=torch.float,
-            device="cuda",
-        )
-
-        attn_output = output
-        temp_attn_output = q.new_empty(
-            (q.size(0), self.num_heads_tp * self.v_head_dim), dtype=q.dtype
-        )
-
-        # use fake cached_cu_seq_len for chunked loop
-        origin_kv_lens_cuda_runtime = attn_metadata.kv_lens_cuda_runtime
-        origin_kv_lens_runtime = attn_metadata.kv_lens_runtime
-        origin_ctx_total_kv_len = attn_metadata.host_total_kv_lens[0]
-
-        for loop_idx in range(chunked_loop_num):
-            # {b, chunked_unit_size, h, kv_lora_rank + qk_rope_head_dim} zero padded
-            # fetch `loop_idx` chunk from kv cache
-            temp_cu_chunked_seq_len = attn_metadata.cu_chunked_seq_len[loop_idx]
-            total_ctx_chunked_tokens = attn_metadata.host_cu_chunked_seq_len[
-                loop_idx, attn_metadata.num_contexts
-            ]
-            chunked_global_offset = attn_metadata.chunked_global_offset[loop_idx]
-            chunked_max_seq_len = attn_metadata.max_chunk_len_per_loop[loop_idx]
-            chunked_compressed_kv, chunked_k_pe = trtllm_attention.load_chunked_kv_cache_for_mla(
-                metadata=attn_metadata,
-                num_ctx_cached_tokens=total_ctx_chunked_tokens,
-                cu_chunked_seq_len=temp_cu_chunked_seq_len,
-                chunked_global_offset=chunked_global_offset,
-                chunked_max_seq_len=chunked_max_seq_len,
-                out_dtype=q.dtype,
-            )
-
-            # up proj to uncompressed kv
-            # [tokens, 2, h, kv_dim], without rope_dim
-            chunked_kv = self.kv_b_proj(chunked_compressed_kv)
-            chunked_k_nope, chunked_v = chunked_kv.split(
-                [self.num_heads_tp * self.qk_nope_head_dim, self.num_heads_tp * self.v_head_dim],
-                -1,
-            )
-
-            chunked_k_nope = chunked_k_nope.view(-1, self.num_heads_tp, self.qk_nope_head_dim)
-            chunked_k_pe = chunked_k_pe.view(-1, 1, self.qk_rope_head_dim)
-            chunked_k = maybe_compiled_cat(
-                (chunked_k_nope, chunked_k_pe.expand(-1, self.num_heads_tp, -1)), dim=-1
-            )
-            chunked_k = chunked_k.view(-1, self.num_heads_tp * self.qk_head_dim)
-
-            # release pytorch activation memory
-            chunked_compressed_kv = None
-            chunked_k_pe = None
-            chunked_kv = None
-            chunked_k_nope = None
-
-            # copy chunked_seq_len to replace kv_lens_runtime
-            attn_metadata.kv_lens_runtime = attn_metadata.host_chunked_seq_len[loop_idx]
-            attn_metadata.kv_lens_cuda_runtime = attn_metadata.chunked_seq_len[loop_idx]
-            attn_metadata.host_total_kv_lens[0] = total_ctx_chunked_tokens
-
-            # do not apply mask for attention within loop
-            # latent_cache must be None to differentiate from normal context phase,
-            # so that we can skip applying RoPE and appending KV cache inside attention op
-            temp_attn_output = self.mha.forward(
-                q,
-                chunked_k,
-                chunked_v,
-                attn_metadata,
-                forward_args=AttentionForwardArgs(
-                    attention_input_type=AttentionInputType.context_only,
-                    latent_cache=None,
-                    out_scale=self.out_scale,
-                    attention_mask=PredefinedAttentionMask.FULL,
-                    softmax_stats_tensor=self.temp_softmax_stats_tensor,
-                    chunked_prefill_buffer_batch_size=attn_metadata.runtime_features.chunked_prefill_buffer_batch_size,
-                    output=temp_attn_output,
-                ),
-            )
-            # merge attn result
-            temp_merge_op = attn_metadata.merge_op_tensor[loop_idx]
-            trtllm_attention.merge_attention_for_mla(
-                attn_output,
-                temp_attn_output,
-                self.softmax_stats_tensor,
-                self.temp_softmax_stats_tensor,
-                temp_merge_op,
-                attn_metadata,
-            )
-
-        # deal with the uncached kv
-        kv = self.kv_b_proj(compressed_kv)
-        _, k_pe = latent_cache.view([-1, self.kv_lora_rank + self.qk_rope_head_dim]).split(
-            [self.kv_lora_rank, self.qk_rope_head_dim], -1
-        )
-        # final round of attention
-
-        k_nope, v = kv.split(
-            [self.num_heads_tp * self.qk_nope_head_dim, self.num_heads_tp * self.v_head_dim],
-            -1,
-        )
-
-        k_nope = k_nope.view(-1, self.num_heads_tp, self.qk_nope_head_dim)
-        k_pe = k_pe.view(-1, 1, self.qk_rope_head_dim)
-        k = maybe_compiled_cat((k_nope, k_pe.expand(-1, self.num_heads_tp, -1)), dim=-1)
-        k = k.view(-1, self.num_heads_tp * self.qk_head_dim)
-
-        # copy q_lens to replace kv_lens_runtime
-        attn_metadata.kv_lens_runtime = attn_metadata.prompt_lens_cpu_runtime
-        attn_metadata.kv_lens_cuda_runtime = attn_metadata.prompt_lens_cuda_runtime
-        attn_metadata.host_total_kv_lens[0] = (
-            attn_metadata.prompt_lens_cpu_runtime[: attn_metadata.num_contexts].sum().item()
-        )
-
-        # latent_cache must be None to differentiate from normal context phase,
-        # so that we can skip applying RoPE and appending KV cache inside attention op
-        temp_attn_output = self.mha.forward(
-            q,
-            k,
-            v,
-            attn_metadata,
-            forward_args=AttentionForwardArgs(
-                attention_input_type=AttentionInputType.context_only,
-                latent_cache=None,
-                out_scale=self.out_scale,
-                softmax_stats_tensor=self.temp_softmax_stats_tensor,
-                chunked_prefill_buffer_batch_size=attn_metadata.runtime_features.chunked_prefill_buffer_batch_size,
-                output=temp_attn_output,
-            ),
-        )
-        temp_merge_op = attn_metadata.merge_op_tensor[chunked_loop_num]
-        trtllm_attention.merge_attention_for_mla(
-            attn_output,
-            temp_attn_output,
-            self.softmax_stats_tensor,
-            self.temp_softmax_stats_tensor,
-            temp_merge_op,
-            attn_metadata,
-        )
-        # copy back kv_lens_runtime and kv_lens_cuda_runtime
-        attn_metadata.kv_lens_runtime = origin_kv_lens_runtime
-        attn_metadata.kv_lens_cuda_runtime = origin_kv_lens_cuda_runtime
-        attn_metadata.host_total_kv_lens[0] = origin_ctx_total_kv_len
-
-        return attn_output
-
-    @staticmethod
-    @functools.cache
-    def cached_warmup_forward_context_with_chunked_prefill(
-        num_heads_tp, qk_nope_head_dim, qk_rope_head_dim, kv_lora_rank, v_head_dim, dtype, device
-    ):
-        """Warmup torch.compile for cat operations with different tensor layouts.
-
-        Tensors are marked with torch._dynamo.maybe_mark_dynamic(..., 0) on the
-        num_tokens dimension, so for num_tokens != 1 a single warmup run is
-        enough and the compiled kernel generalizes across varying num_tokens at
-        runtime. num_tokens=1 still triggers recompile (torch.compile specializes
-        for it), so it is warmed up separately. Do not use torch.compile with
-        dynamic=True here because it completely ignores tensor layout/stride
-        information, resulting in significantly degraded performance.
-        """
-
-        def warmup(num_tokens):
-            chunked_k_nope = k_nope = torch.empty(
-                num_tokens,
-                num_heads_tp * (qk_nope_head_dim + v_head_dim),
-                dtype=dtype,
-                device=device,
-            )[:, : num_heads_tp * qk_nope_head_dim].view(num_tokens, num_heads_tp, qk_nope_head_dim)
-            chunked_k_pe = torch.empty(
-                num_tokens, 1, qk_rope_head_dim, dtype=dtype, device=device
-            ).expand(-1, num_heads_tp, -1)
-            k_pe = torch.empty(
-                num_tokens, 1, kv_lora_rank + qk_rope_head_dim, dtype=dtype, device=device
-            )[:, :, -qk_rope_head_dim:].expand(-1, num_heads_tp, -1)
-            torch._dynamo.maybe_mark_dynamic(chunked_k_nope, 0)
-            torch._dynamo.maybe_mark_dynamic(chunked_k_pe, 0)
-            torch._dynamo.maybe_mark_dynamic(k_pe, 0)
-            maybe_compiled_cat((chunked_k_nope, chunked_k_pe), dim=-1)
-            maybe_compiled_cat((k_nope, k_pe), dim=-1)
-
-        # With dim 0 (num_tokens) marked dynamic, one warmup suffices for all
-        # num_tokens != 1 at runtime.
-        warmup(2)
-
-        # num_tokens=1 still triggers recompile; warm it separately.
-        warmup(1)
-
-    def forward_context(
-        self,
-        q: torch.Tensor,
-        compressed_kv: torch.Tensor,
-        k_pe: torch.Tensor,
-        position_ids: torch.Tensor,
-        attn_metadata: AttentionMetadata,
-        output: torch.Tensor,
-        latent_cache: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        if isinstance(self.mha, TrtllmAttention):
-            assert isinstance(attn_metadata, TrtllmAttentionMetadata)
-            trtllm_attention = cast(TrtllmAttention, self.mha)
-            if trtllm_attention.is_chunked_prefill_mla_context_for_warmup(attn_metadata):
-                self.cached_warmup_forward_context_with_chunked_prefill(
-                    self.num_heads_tp,
-                    self.qk_nope_head_dim,
-                    self.qk_rope_head_dim,
-                    self.kv_lora_rank,
-                    self.v_head_dim,
-                    q.dtype,
-                    q.device,
-                )
-            if (
-                trtllm_attention.is_chunked_prefill_for_mla_context(attn_metadata)
-                and get_sm_version() >= 100
-            ):
-                return self.forward_context_with_chunked_prefill(
-                    q, compressed_kv, latent_cache, attn_metadata, output
-                )
-            elif trtllm_attention.has_cached_kv_for_mla_context(
-                attn_metadata
-            ) or trtllm_attention.is_chunked_prefill_for_mla_context(attn_metadata):
-                return self.forward_context_with_cached_kv(q, latent_cache, attn_metadata, output)
-        return self.forward_context_default(
-            q, compressed_kv, k_pe, position_ids, attn_metadata, output, latent_cache
+            output,
+            position_ids=position_ids,
+            latent_cache=latent_cache,
+            topk_indices=topk_indices,
         )
 
     def _bmm_bf16_out(self, a, b_no_transpose, b_transposed, output):
@@ -1930,7 +1072,6 @@ class FusedMLA(nn.Module):
                 self.ln_events[1],
                 rope_stream,
             )
-
         elif self.k_b_proj_trans.dtype == torch.float8_e4m3fn:
             # [num_heads, num_tokens, self.kv_lora_rank]
             q_nope_out = fused_q[..., : self.kv_lora_rank].transpose(0, 1)
@@ -2300,153 +1441,6 @@ class FusedMLA(nn.Module):
 
         return output
 
-    @nvtx_range("forward_sparse_mla_kvcache_bf16")
-    def forward_sparse_mla_kvcache_bf16(
-        self,
-        q: torch.Tensor,
-        latent_cache: torch.Tensor,
-        attn_metadata: DSAtrtllmAttentionMetadata,
-        output: torch.Tensor,
-        topk_indices: torch.Tensor,
-        is_generation: bool = False,
-    ) -> torch.Tensor:
-        """
-        Forward sparse MLA (DSA) for BF16 KV cache for both context and generation phases using FlashMLA kernels
-
-        To form the input for FlashMLA kernel and adapt our KV cache manager, we need to:
-        1. Append current tokens to paged cache and apply rope to q/k via mla_rope_append_paged_kv_assign_q
-        2. Load full kv cache from paged memory (with k rope applied)
-        3. Call FlashMLA sparse attention kernel for sparse prefill/decode
-        """
-        assert isinstance(attn_metadata, DSAtrtllmAttentionMetadata), (
-            "DSA requires DSAtrtllmAttentionMetadata"
-        )
-        # Append current tokens to paged cache and apply RoPE to q
-        # This writes latent_cache to paged KV and modifies q in-place
-        trtllm_attention = self.mqa
-        with nvtx_range_debug(f"mla_rope_append_paged_kv_assign_q_is_generation={is_generation}"):
-            trtllm_attention.mla_rope_append_paged_kv_assign_q(
-                q, latent_cache, attn_metadata, is_generation=is_generation
-            )
-
-        num_tokens = q.shape[0]
-        q_nope, q_rope = q.view(-1, self.num_heads_tp, self.qk_head_dim).split(
-            [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
-        )
-        q_nope_out = torch.empty(
-            [num_tokens, self.num_heads_tp, (self.kv_lora_rank)],
-            dtype=q.dtype,
-            device=q.device,
-        )
-
-        if self.k_b_proj_trans.dtype == torch.bfloat16:
-            # [num_heads, num_tokens, self.qk_nope_head_dim]
-            q_nope_t = q_nope.transpose(0, 1)
-            # [num_heads, num_tokens, self.kv_lora_rank]
-            q_nope_out = q_nope_out.transpose(0, 1)
-
-            # [num_heads, num_tokens, self.qk_nope_head_dim] x [num_heads, kv_lora_rank, qk_nope_head_dim]
-            # -> [num_heads, num_tokens, kv_lora_rank] -> [num_tokens, num_heads, kv_lora_rank]
-            # The output of bmm is written directly into fused_q
-            self._bmm_bf16_out(
-                q_nope_t, self.k_b_proj_trans, self.k_b_proj_trans.transpose(1, 2), q_nope_out
-            )
-        elif self.k_b_proj_trans.dtype == torch.float8_e4m3fn:
-            # [num_heads, num_tokens, self.kv_lora_rank]
-            q_nope_out = q_nope_out.transpose(0, 1)
-
-            fp8_block_scaling_bmm_out(
-                q_nope,
-                self.k_b_proj_trans,
-                self.k_b_proj_trans_scale,
-                q_nope_out,
-                self.k_b_proj_trans_dequant,
-                self.use_cute_dsl_blockscaling_bmm,
-            )
-        else:
-            raise NotImplementedError(f"Missing bmm impl for dtype: {self.k_b_proj_trans.dtype}.")
-
-        q_nope_out = q_nope_out.transpose(0, 1)
-        q_concat = torch.cat([q_nope_out, q_rope], dim=-1)
-
-        sm_version = get_sm_version()
-        # FlashMLA sparse kernel (bf16) requires num_heads=128 on sm100 or multiple of 64 on sm90
-        if sm_version >= 100:
-            padding = 128
-            assert self.num_heads_tp <= padding, (
-                f"SM100 FlashMLA sparse kernel requires exactly {padding} heads, "
-                f"got {self.num_heads_tp}. Padding from values > {padding} is not supported."
-            )
-        else:  # SM90
-            padding = ((self.num_heads_tp + 63) // 64) * 64  # multiple of 64
-
-        if self.num_heads_tp != padding:
-            logger.warning_once(
-                f"Padding num_heads from {self.num_heads_tp} to {padding} "
-                f"due to FlashMLA sparse attention kernel requirement",
-                key="sparse_mla_padding_warning",
-            )
-
-            # Create padded tensor with zeros for extra heads
-            q_padded = q_concat.new_empty((num_tokens, padding, q_concat.shape[2]))
-            q_padded[:, : self.num_heads_tp, :] = q_concat
-            q_concat = q_padded
-
-        # Convert indices and return all-layer KV pool
-        # Note: underlying pool is layer-interleaved:
-        # [num_blocks, num_layers, kv_factor, tokens_per_block, num_kv_heads, head_dim]
-        # to avoid reshape(copy) per-layer KV cache, we return all-layer KV pool w/ topk indices adjusted
-        # by stride_factor=num_layers*tokens_per_block
-        topk_indices_pool, kv_cache_pool = transform_local_topk_and_prepare_pool_view(
-            topk_indices,
-            attn_metadata,
-            layer_idx=self.layer_idx,
-            is_generation=is_generation,
-        )
-        topk_indices_pool = topk_indices_pool.view(num_tokens, 1, -1)
-        if flash_mla_sparse_fwd is not None:
-            attn_out_latent = flash_mla_sparse_fwd(
-                q_concat, kv_cache_pool, topk_indices_pool, self.softmax_scale
-            )[0]
-        else:
-            raise RuntimeError(
-                "flash_mla_sparse_fwd not available. Please ensure FlashMLA module is built."
-            )
-
-        # [seq, num_heads, kv_lora_rank], account for padding
-        attn_out_latent = attn_out_latent[:, : self.num_heads_tp, :]
-        attn_out_latent = attn_out_latent.view([-1, self.num_heads_tp, self.kv_lora_rank])
-        if self.num_heads_tp != padding:
-            attn_out_latent = attn_out_latent.contiguous()
-
-        assert (
-            attn_out_latent.shape[0] == q.shape[0] and attn_out_latent.shape[1] == self.num_heads_tp
-        )
-
-        attn_output = output.view([num_tokens, self.num_heads_tp, self.v_head_dim])
-
-        if self.v_b_proj.dtype == torch.bfloat16:
-            # [num_heads, seq, kv_lora_rank] x [num_heads, kv_lora_rank, v_head_dim]
-            # -> [num_heads, seq, v_head_dim]
-            self._bmm_bf16_out(
-                attn_out_latent.transpose(0, 1),
-                self.v_b_proj,
-                self.v_b_proj.transpose(1, 2),
-                attn_output.transpose(0, 1),
-            )
-        elif self.v_b_proj.dtype == torch.float8_e4m3fn:
-            fp8_block_scaling_bmm_out(
-                attn_out_latent,
-                self.v_b_proj,
-                self.v_b_proj_scale,
-                attn_output.transpose(0, 1),
-                self.v_b_proj_dequant,
-                self.use_cute_dsl_blockscaling_bmm,
-            )
-        else:
-            raise NotImplementedError(f"Missing bmm impl for dtype: {self.v_b_proj.dtype}.")
-        return output
-
     def forward(
         self,
         position_ids: Optional[torch.Tensor],
@@ -2477,15 +1471,10 @@ class FusedMLA(nn.Module):
 
         q = self.q_b_proj(q)
 
-        use_short_mha_for_ctx = self._should_use_short_mha(attn_metadata, position_ids)
-
-        if use_short_mha_for_ctx and attn_metadata.num_generations == 0:
-            indexer_intermediates = []
-        else:
-            q_fp8, k_fp8, k_scale, weights, q_scale = self.mqa.indexer.pre_indexer_proj(
-                qr, hidden_states, position_ids
-            )
-            indexer_intermediates = [q_fp8, k_fp8, k_scale, weights, q_scale]
+        q_fp8, k_fp8, k_scale, weights, q_scale = self.mqa.indexer.pre_indexer_proj(
+            qr, hidden_states, position_ids
+        )
+        indexer_intermediates = [q_fp8, k_fp8, k_scale, weights, q_scale]
 
         self.forward_dsa_attn(
             q,
@@ -2647,18 +1636,14 @@ def mla_dsa_proj(
 ) -> List[torch.Tensor]:
     """Token-wise projections for DSA MLA (CUDA-graph-capturable).
 
-    Runs kv_a_proj, layernorms, q_b_proj, and conditionally
-    indexer.pre_indexer_proj (FP8/FP4 quantize, weight scaling).  Does NOT
+    Runs kv_a_proj, layernorms, q_b_proj, and indexer.pre_indexer_proj
+    (FP8/FP4 quantize, weight scaling).  Does NOT
     update the indexer k cache — that happens in Op 2 (mla_dsa_attn_inplace)
     because the scatter kernel accesses batch-specific metadata.
 
-    Returns [q, compressed_kv, k_pe, latent_cache] when the short-MHA path
-    handles all tokens, or [q, compressed_kv, k_pe, latent_cache, q_fp8,
-    k_fp8, k_scale, weights, q_scale] when the indexer runs.  Under torch
-    compile, _should_use_short_mha returns False so the result is always
-    length 9, keeping control flow straight-line for CUDA graph capture.
-    The trailing q_scale is only consumed by the FP4 dispatch; the FP8
-    path ignores it in forward_dsa_attn.
+    Returns [q, compressed_kv, k_pe, latent_cache, q_fp8, k_fp8, k_scale,
+    weights, q_scale]. The trailing q_scale is only consumed by the FP4
+    dispatch; the FP8 path ignores it in forward_dsa_attn.
     """
     metadata, mla_layer = _extract_fused_mla_extra_attrs(layer_idx)
     return mla_layer.forward_dsa_proj(position_ids, hidden_states, metadata)
@@ -2677,9 +1662,8 @@ def mla_dsa_attn_inplace(
 ) -> None:
     """Batch-structure-dependent attention dispatch for DSA MLA.
 
-    indexer_intermediates is [q_fp8, k_fp8, k_scale, weights, q_scale] when
-    the indexer ran in Op 1, or [] when short-MHA handled all tokens. The
-    trailing q_scale is only consumed by the FP4 dispatch; the FP8 path
+    indexer_intermediates is [q_fp8, k_fp8, k_scale, weights, q_scale].
+    The trailing q_scale is only consumed by the FP4 dispatch; the FP8 path
     ignores it. Runs sparse_attn_indexer then dispatches context/generation
     attention. This op is excluded from CUDA graph capture.
     """
