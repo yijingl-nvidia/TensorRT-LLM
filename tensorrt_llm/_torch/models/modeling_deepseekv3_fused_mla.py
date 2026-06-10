@@ -39,7 +39,6 @@ from ..modules.attention import _helix_post_process, fp8_block_scaling_bmm_out
 from ..modules.linear import Linear, TensorParallelMode, WeightsLoadingConfig
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
-from ..modules.rotary_embedding import RotaryEmbedding
 from ..peft.lora.layer import LoraLayer
 
 _FUSED_MLA_MODE_ENV = "TRTLLM_DEEPSEEKV3_FUSED_MLA_MODE"
@@ -549,15 +548,11 @@ class FusedMLA(nn.Module):
         self.aux_stream = aux_stream
         self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
 
-        self.rope_fusion = self.mqa.support_fused_rope()
         self.rotary_emb = None
-        self.apply_rotary_emb = not self.rope_fusion
-        if self.apply_rotary_emb:
-            self.rotary_emb = RotaryEmbedding(
-                pos_embd_params.rope,
-                head_dim=self.qk_rope_head_dim,
-                is_neox=pos_embd_params.is_neox,
-            )
+        # self.apply_rotary_emb should be False in our case
+        # when it is True in base MLA class, it will set
+        # self.rotary_emb = RotaryEmbedding()
+        self.apply_rotary_emb = False
 
         self.llama_4_scaling = False
         if hasattr(config.pretrained_config, "llama_4_scaling"):
@@ -666,20 +661,6 @@ class FusedMLA(nn.Module):
             self.k_b_proj_trans_scale = None
             self.v_b_proj_scale = None
             self.o_a_proj_scale = None
-
-    def apply_rope(
-        self,
-        q: torch.Tensor,
-        k_pe: torch.Tensor,
-        position_ids: torch.Tensor,
-    ) -> torch.Tensor:
-        q = q.view(-1, self.num_heads_tp, self.qk_head_dim)
-        q_pe = q[..., self.qk_nope_head_dim :].reshape(
-            -1, self.num_heads_tp * self.qk_rope_head_dim
-        )
-        q_pe, k_pe = self.rotary_emb(position_ids, [q_pe, k_pe])
-        q[..., self.qk_nope_head_dim :] = q_pe.view(-1, self.num_heads_tp, self.qk_rope_head_dim)
-        return k_pe
 
     def _is_fused_q_fp8_quant_enabled(self, num_generations: int = 0) -> bool:
         # Context-only batches: the fused path leaves a placeholder bf16 q_buf
@@ -810,11 +791,7 @@ class FusedMLA(nn.Module):
 
         if num_contexts > 0:
             q_ctx = q[:num_ctx_tokens, ...]
-            k_pe_ctx = k_pe[:num_ctx_tokens, ...]
             latent_cache_ctx = latent_cache[:num_ctx_tokens, ...]
-            if self.apply_rotary_emb:
-                assert position_ids is not None
-                k_pe_ctx = self.apply_rope(q_ctx, k_pe_ctx, position_ids)
 
             context_output = output[:num_ctx_tokens, :]
             topk_indices_ctx = (
@@ -831,19 +808,12 @@ class FusedMLA(nn.Module):
 
         if num_generations > 0:
             q_gen = q[num_ctx_tokens:, ...]
-            compressed_kv_gen = compressed_kv[num_ctx_tokens:, ...]
-            k_pe_gen = k_pe[num_ctx_tokens:, ...]
             latent_cache_gen = latent_cache[num_ctx_tokens:, ...]
-            if self.apply_rotary_emb:
-                assert position_ids is not None
-                k_pe_gen = self.apply_rope(q_gen, k_pe_gen, position_ids)
 
             generation_output = output[num_ctx_tokens:num_tokens, :]
             topk_indices_gen = topk_indices[num_ctx_tokens:num_tokens, :]
             self.forward_absorption_generation(
                 q_gen,
-                compressed_kv_gen,
-                k_pe_gen,
                 attn_metadata,
                 generation_output,
                 position_ids=position_ids,
@@ -861,8 +831,6 @@ class FusedMLA(nn.Module):
     def forward_absorption_generation(
         self,
         q: torch.Tensor,
-        compressed_kv: torch.Tensor,
-        k_pe: torch.Tensor,
         attn_metadata: AttentionMetadata,
         output: torch.Tensor,
         position_ids: Optional[torch.Tensor] = None,
@@ -1061,8 +1029,6 @@ class FusedMLA(nn.Module):
         else:
             raise NotImplementedError(f"Missing bmm impl for dtype: {self.k_b_proj_trans.dtype}.")
 
-        if self.apply_rotary_emb:
-            fused_q[..., self.kv_lora_rank :] = q_pe
         fused_q = fused_q.view(
             [num_tokens, self.num_heads_tp * (self.kv_lora_rank + self.qk_rope_head_dim)]
         )
@@ -1163,6 +1129,35 @@ class FusedMLA(nn.Module):
         all_reduce_params: Optional[AllReduceParams] = None,
         # latent_cache_gen: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        """Run fused MLA for a DeepSeekV3/GLM DSA attention layer.
+
+        KV-cache interface used by the DSA/TRTLLM kernels:
+
+        - `attn_metadata.kv_cache_manager.kv_cache_pool_pointers` is a CPU
+          tensor containing raw primary/secondary KV-cache pool addresses. It
+          is normally `torch.int64` with shape `[num_pools, 2]`. When the
+          KV-cache format has separate block-scale pools, it is stacked as
+          `[num_pools, 2, 2]` where the last dimension is data vs scale
+          pointer. For the GLM-5 FP8 MLA path, the cache data pool stores the
+          compressed latent KV vector of size `kv_lora_rank + qk_rope_head_dim`
+          with `num_kv_heads = 1` and `CacheType.SELFKONLY`.
+
+        - `attn_metadata.kv_cache_manager.kv_cache_pool_mapping` is a CPU
+          `torch.int32` tensor with shape `[num_local_layers, 2]`. For each
+          local layer it stores `[pool_index, layer_index_within_pool]`; the
+          THOP paged-cache helper uses this row with `self.layer_idx` to pick
+          the base pool pointer and layer offset for the current layer.
+
+        - `attn_metadata.kv_cache_block_offsets` is a CUDA `torch.int32`
+          tensor with shape
+          `[num_attention_op_pools, max_num_sequences, 2, max_blocks_per_seq]`.
+          `TrtllmAttentionMetadata.prepare()` fills it from the C++ KV cache
+          manager for the active request IDs every forward step. For the
+          batch-size-1, MTP=3 GLM-5 serving case, `max_num_sequences` is the
+          engine capacity; the runtime slice actually consumed by kernels is
+          determined by `attn_metadata.num_seqs` and the context/generation
+          counts for the current step.
+        """
         attn_output = hidden_states.new_empty(
             [hidden_states.shape[0], self.o_proj.in_features], dtype=hidden_states.dtype
         )
