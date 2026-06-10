@@ -30,12 +30,7 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
-from ..attention_backend import (
-    AttentionForwardArgs,
-    AttentionInputType,
-    AttentionMetadata,
-    TrtllmAttentionMetadata,
-)
+from ..attention_backend import AttentionForwardArgs, AttentionInputType, AttentionMetadata
 from ..attention_backend.interface import AttentionBackend, PositionalEmbeddingParams, RopeParams
 from ..attention_backend.utils import create_attention
 from ..distributed import AllReduceParams
@@ -46,7 +41,6 @@ from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
 from ..modules.rotary_embedding import RotaryEmbedding
 from ..peft.lora.layer import LoraLayer
-from ..utils import get_model_extra_attrs
 
 _FUSED_MLA_MODE_ENV = "TRTLLM_DEEPSEEKV3_FUSED_MLA_MODE"
 FUSED_MLA_MODE_BASELINE = "baseline"
@@ -137,94 +131,94 @@ class DeepseekV3Linear(Linear):
 
 class FusedMLA(nn.Module):
     """
-        Multi-head Latent Attention module.
+            Multi-head Latent Attention module.
 
-                                  ┌──────────────────────────────┐
-                                  │   x ∈ ℝ⁶¹⁴⁴   (1 token in)   │
-                                  └───────────────┬──────────────┘
-                                                  │
-                                  x̃ = γ_in ⊙ x / √(⟨x²⟩ + ε)         RMSNorm
-                                                  │
-                                                  ▼
-                                  ┌──────────────────────────────┐
-                                  │   x̃ ∈ ℝ⁶¹⁴⁴                  │
-                                  └───────────────┬──────────────┘
-                                                  │
-                W_qkvia : ℝ⁶¹⁴⁴ ─► ℝ²⁶²⁴ "Combine q_a_proj and kv_a_proj_with_mqa, QKV down-projection"
-                                                  │
-                                                  ▼
-                        ┌──────────────────────────┬─────────────────────┐
-                        ▼                          ▼                     ▼
-                 q_a ∈ ℝ²⁰⁴⁸                c_kv ∈ ℝ⁵¹²             k_pe ∈ ℝ⁶⁴
-                        │                          │                     │
-                  γ_q ⊙·/‖·‖                 γ_kv ⊙·/‖·‖             R_t (RoPE)
-                        │                          │                     │
-                        ▼                          ▼                     ▼
-                  q̇_a ∈ ℝ²⁰⁴⁸                ċ_kv ∈ ℝ⁵¹²           k̂_pe ∈ ℝ⁶⁴
-                        │                          │                     │
-            W_qib:ℝ²⁰⁴⁸─►ℝ²⁰⁴⁸⁽¹⁶³⁸⁴⁾              └──────────┬──────────┘
-              "Q up-projection"                               │
-                        │                                     ▼
-                        ▼                         ┌─────────────────────────┐
-                 q ∈ ℝ⁸⁽⁶⁴⁾ˣ²⁵⁶                   │   c_t = [ċ_kv ‖ k̂_pe]   │
-                        │                         │   ∈ ℝ⁵⁷⁶                │
-                split [192 | 64]                  │                         │
-                        │                         │   write to cache:       │
-                ┌───────┴────────┐                │   cache[seq, pos] := c_t│
-                ▼                ▼                └───────────┬─────────────┘
-         q_nope ∈ ℝ⁸⁽⁶⁴⁾ˣ¹⁹² q_rope ∈ ℝ⁸⁽⁶⁴⁾ˣ⁶⁴               │
-                │                │                            │
-                │         per-h R_t (RoPE)                    │
-                │                │                            │
-                │                ▼                            │
-                │         q̂_rope ∈ ℝ⁸⁽⁶⁴⁾ˣ⁶⁴                  │
-                │                │                            │
-    per head h ∈ {0..7(63)}:     │                            │
-    q̃_h^lat = W_uk,h · q_nope_h  │                            │
-    ∈ ℝ⁵¹²                       │                            │
-    (absorption: k_b_proj,       │                            │
-    K-up folded into Q)          │                            │
-                │                │                            │
-                └────────┬───────┘                            │
-                         ▼                                    │
-                  q̃ ∈ ℝ⁸⁽⁶⁴⁾ˣ⁵⁷⁶                              │
-                  (per-h: [q̃^lat ‖ q̂_rope])                   │
-                         │                                    │
-                         └──────────────────┬─────────────────┘
-                                            ▼
-                           for each past token j ∈ {0..T_kv}:
-                             s_h(j) = ⟨ q̃_h , cache[seq, j] ⟩ / √256
-                                            │
-                                            ▼
-                                 p_h(·) = softmax( s_h(·) )         ∈ ℝ^(T_kv+1)
-                                            │
-                                            ▼
-                               o_h^lat = Σ_j  p_h(j) · cache[seq, j, :512]   ∈ ℝ⁵¹²
-                                            │            └──── V = first 512 of K
-                                            │
-                                            ▼
-                                per head h:   o_h = W_uv,h · o_h^lat  ∈ ℝ²⁵⁶
-                                                      (v_b_proj, V-up, also absorbed)
-                                            │
-                                            ▼
-                                       o ∈ ℝ⁸⁽⁶⁴⁾ˣ²⁵⁶
-                                            │
-                                         flatten
-                                            │
-                                            ▼
-                                    o ∈ ℝ²⁰⁴⁸⁽¹⁶³⁸⁴⁾
-                                            │
-                                 W_o : ℝ²⁰⁴⁸⁽¹⁶³⁸⁴⁾ ─► ℝ⁶¹⁴⁴
-                                            │
-                                            ▼
-                                         y ∈ ℝ⁶¹⁴⁴
-                                            │
-                                Σ_rank  (AllReduce, TP=8)
-                                            │
-                                            ▼
-                             ┌──────────────────────────────┐
-                             │   y_out ∈ ℝ⁶¹⁴⁴  (1 token)   │
-                             └──────────────────────────────┘
+                                      ┌──────────────────────────────┐
+                                      │   x ∈ ℝ⁶¹⁴⁴   (1 token in)   │
+                                      └───────────────┬──────────────┘
+                                                      │
+                                      x̃ = γ_in ⊙ x / √(⟨x²⟩ + ε)         RMSNorm
+                                                      │
+                                                      ▼
+                                      ┌──────────────────────────────┐
+                                      │   x̃ ∈ ℝ⁶¹⁴⁴                  │
+                                      └───────────────┬──────────────┘
+                                                      │
+                    W_qkvia : ℝ⁶¹⁴⁴ ─► ℝ²⁶²⁴ "Combine q_a_proj and kv_a_proj: kv_a_proj_with_mqa, QKV down-projection"
+                                                      │
+                                                      ▼
+                            ┌──────────────────────────┬─────────────────────┐
+                            ▼                          ▼                     ▼
+                     q_a ∈ ℝ²⁰⁴⁸                c_kv ∈ ℝ⁵¹²             k_pe ∈ ℝ⁶⁴
+                            │                          │                     │
+                      γ_q ⊙·/‖·‖                 γ_kv ⊙·/‖·‖             R_t (RoPE)
+                            │                          │                     │
+                            ▼                          ▼                     ▼
+                      q̇_a ∈ ℝ²⁰⁴⁸                ċ_kv ∈ ℝ⁵¹²           k̂_pe ∈ ℝ⁶⁴
+                            │                          │                     │
+                W_qib:ℝ²⁰⁴⁸─►ℝ²⁰⁴⁸⁽¹⁶³⁸⁴⁾              └──────────┬──────────┘
+               "q_b_proj, Q up-projection"                        │
+                            │                                     ▼
+                            ▼                         ┌─────────────────────────┐
+                     q ∈ ℝ⁸⁽⁶⁴⁾ˣ²⁵⁶                   │   c_t = [ċ_kv ‖ k̂_pe]   │
+                            │                         │   ∈ ℝ⁵⁷⁶                │
+                    split [192 | 64]                  │                         │
+                            │                         │   write to cache:       │
+                    ┌───────┴────────┐                │   cache[seq, pos] := c_t│
+                    ▼                ▼                └───────────┬─────────────┘
+             q_nope ∈ ℝ⁸⁽⁶⁴⁾ˣ¹⁹² q_rope ∈ ℝ⁸⁽⁶⁴⁾ˣ⁶⁴               │
+                    │                │                            │
+                    │         per-h R_t (RoPE)                    │
+                    │                │                            │
+                    │                ▼                            │
+                    │         q̂_rope ∈ ℝ⁸⁽⁶⁴⁾ˣ⁶⁴                  │
+                    │                │                            │
+        per head h ∈ {0..7(63)}:     │                            │
+    q̃_h^lat = W_uk,h^T · q_nope_h    │                            │
+        ∈ ℝ⁵¹²                       │                            │
+        (absorption: k_b_proj,       │                            │
+        K-up folded into Q)          │                            │
+                    │                │                            │
+                    └────────┬───────┘                            │
+                             ▼                                    │
+                      q̃ ∈ ℝ⁸⁽⁶⁴⁾ˣ⁵⁷⁶                              │
+                      (per-h: [q̃^lat ‖ q̂_rope])                   │
+                             │                                    │
+                             └──────────────────┬─────────────────┘
+                                                ▼
+                               for each past token j ∈ {0..T_kv}:
+                                 s_h(j) = ⟨ q̃_h , cache[seq, j] ⟩ / √256
+                                                │
+                                                ▼
+                                     p_h(·) = softmax( s_h(·) )         ∈ ℝ^(T_kv+1)
+                                                │
+                                                ▼
+                                   o_h^lat = Σ_j  p_h(j) · cache[seq, j, :512]   ∈ ℝ⁵¹²
+                                                │            └──── V = first 512 of K
+                                                │
+                                                ▼
+                                    per head h:   o_h = W_uv,h · o_h^lat  ∈ ℝ²⁵⁶
+                                                          (v_b_proj, V-up)
+                                                │
+                                                ▼
+                                           o ∈ ℝ⁸⁽⁶⁴⁾ˣ²⁵⁶
+                                                │
+                                             flatten
+                                                │
+                                                ▼
+                                        o ∈ ℝ²⁰⁴⁸⁽¹⁶³⁸⁴⁾
+                                                │
+                                     W_o : ℝ²⁰⁴⁸⁽¹⁶³⁸⁴⁾ ─► ℝ⁶¹⁴⁴
+                                                │
+                                                ▼
+                                             y ∈ ℝ⁶¹⁴⁴
+                                                │
+                                    Σ_rank  (AllReduce, TP=8)
+                                                │
+                                                ▼
+                                 ┌──────────────────────────────┐
+                                 │   y_out ∈ ℝ⁶¹⁴⁴  (1 token)   │
+                                 └──────────────────────────────┘
     """
 
     def __init__(
@@ -276,6 +270,37 @@ class FusedMLA(nn.Module):
             config (ModelConfig): The model configuration.
             num_groups (int): The number of groups.
             o_lora_rank (int): The dimension of the compressed output.
+
+        It loads following weights for inference (shapes are for TP=8 case):
+        - indexer_k_norm_bias: shape=(128,), dtype=torch.float32
+        - indexer_k_norm_weight: shape=(128,), dtype=torch.float32
+        - indexer_softmax_scale: scalar, dtype=float
+        - indexer_weight_scale_factor: scalar, dtype=float
+        - indexer_weights_proj_weight: shape=(32, 6144), dtype=torch.float32
+        - indexer_wk_weight: shape=(128, 6144), dtype=torch.float32
+        - indexer_wq_b_weight: shape=(4096, 2048), dtype=torch.float8_e4m3fn
+        - indexer_wq_b_weight_scale: shape=(32, 16), dtype=torch.float32
+        - k_b_proj_trans: shape=(8, 512, 192), dtype=torch.bfloat16
+            # made by [num_local_heads(8), kv_lora_rank(512), qk_nope_dim(192)]
+            converted from kv_b_proj, which is dtype float8_e4m3fn on disk
+        - kv_a_layernorm_variance_epsilon: scalar, dtype=float
+        - kv_a_layernorm_weight: shape=(512,), dtype=torch.bfloat16
+        - kv_a_proj_with_mqa_weight: shape=(2624, 6144), dtype=torch.float8_e4m3fn
+        - kv_a_proj_with_mqa_weight_scale: shape=(21, 48), dtype=torch.float32
+        - kv_b_proj_weight: shape=(3584, 512), dtype=torch.bfloat16
+            # made by [num_local_heads(8) * qk_nope_dim(192) + num_local_heads*v_dim(256), kv_lora_rank(512)]
+            # dequantized from dtype float8_e4m3fn on disk
+        - o_proj_weight: shape=(6144, 2048), dtype=torch.float8_e4m3fn
+            # 2048 is num_local_heads(8) * v_dim(256)
+        - o_proj_weight_scale: shape=(48, 16), dtype=torch.float32
+        - q_a_layernorm_variance_epsilon: scalar, dtype=float
+        - q_a_layernorm_weight: shape=(2048,), dtype=torch.bfloat16
+        - q_b_proj_weight: shape=(2048, 2048), dtype=torch.float8_e4m3fn
+        - q_b_proj_weight_scale: shape=(16, 16), dtype=torch.float32
+        - softmax_scale: scalar, dtype=float
+
+        Input activation:
+        - hidden_states: shape=(1, 6144), dtype=torch.bfloat16
         """
         super().__init__()
         print(f"FusedMLA::__init__: layer_idx={layer_idx}")
@@ -293,6 +318,7 @@ class FusedMLA(nn.Module):
         self.v_head_dim = v_head_dim
         self.q_lora_rank = q_lora_rank
         self.kv_lora_rank = kv_lora_rank
+        # this is 4 for our MTP=3 case
         self.predicted_tokens_per_seq = predicted_tokens_per_seq
         self.max_position_embeddings = max_position_embeddings
         self.pos_embd_params = pos_embd_params
@@ -729,110 +755,6 @@ class FusedMLA(nn.Module):
         q = (q * attn_scale).to(q.dtype)
         return q
 
-    def forward_impl(
-        self,
-        position_ids: Optional[torch.Tensor],
-        hidden_states: torch.Tensor,
-        attn_metadata: AttentionMetadata,
-        output: torch.Tensor,
-        latent_cache_gen: Optional[torch.Tensor] = None,
-    ) -> None:
-        """
-        Forward pass for the MLA module. Writes result into output tensor in-place.
-
-        Args:
-            position_ids (Optional[torch.IntTensor]): The position IDs.
-            hidden_states (torch.Tensor): The hidden states.
-            attn_metadata (AttentionMetadata): The attention metadata.
-            output (torch.Tensor): The output tensor to write results into.
-            latent_cache_gen (Optional[torch.Tensor]): The latent cache used in generation.
-        """
-        assert output is not None, "output must be provided"
-        self.forward_impl_with_dsa(position_ids, hidden_states, attn_metadata, output)
-
-    def forward_impl_with_dsa(
-        self,
-        position_ids: Optional[torch.Tensor],
-        hidden_states: torch.Tensor,
-        attn_metadata: AttentionMetadata,
-        output: torch.Tensor,
-    ) -> None:
-        """
-        Forward pass for the MLA module with DSA (always in MQA mode).
-        Writes result into output tensor in-place.
-
-        Delegates to forward_dsa_proj (token-wise projections) followed by
-        forward_dsa_attn (batch-dependent attention dispatch).
-
-        Args:
-            position_ids (Optional[torch.IntTensor]): The position IDs.
-            hidden_states (torch.Tensor): The hidden states.
-            attn_metadata (AttentionMetadata): The attention metadata.
-            output (torch.Tensor): The output tensor to write results into.
-        """
-        proj_outputs = self.forward_dsa_proj(position_ids, hidden_states, attn_metadata)
-        q, compressed_kv, k_pe, latent_cache = proj_outputs[:4]
-        indexer_intermediates = proj_outputs[4:]
-        self.forward_dsa_attn(
-            q,
-            compressed_kv,
-            k_pe,
-            latent_cache,
-            indexer_intermediates,
-            position_ids,
-            attn_metadata,
-            output,
-        )
-
-    def forward_dsa_proj(
-        self,
-        position_ids: Optional[torch.Tensor],
-        hidden_states: torch.Tensor,
-        attn_metadata: AttentionMetadata,
-    ) -> List[torch.Tensor]:
-        """Token-wise projections for DSA MLA (CUDA-graph-capturable Op 1).
-
-        Runs kv_a_proj, layernorms, q_b_proj, and indexer.pre_indexer_proj().
-
-        IMPORTANT: This method must NOT slice tensors by num_tokens or
-        access batch-specific metadata, so that all operations are
-        unconditionally straight-line for CUDA graph capture.  Slicing
-        to num_tokens happens in forward_dsa_attn (Op 2, outside graph).
-
-        Returns [q, compressed_kv, k_pe, latent_cache, q_fp8, k_fp8,
-        k_scale, weights, q_scale]. q_scale is unused on the FP8 path but
-        always present so CUDA graph capture sees a stable 9-tensor shape
-        regardless of indexer dtype.
-        """
-        assert self.mqa is not None, "DSA is only supported in MQA mode"
-
-        q, compressed_kv, k_pe = self.kv_a_proj_with_mqa(hidden_states).split(
-            [self.q_lora_rank, self.kv_lora_rank, self.qk_rope_head_dim], -1
-        )
-
-        q, compressed_kv = maybe_execute_in_parallel(
-            lambda: self.q_a_layernorm(q),
-            lambda: self.kv_a_layernorm(compressed_kv),
-            self.ln_events[0],
-            self.ln_events[1],
-            self.aux_stream,
-        )
-        qr = q
-        latent_cache = torch.concat([compressed_kv, k_pe], dim=-1)
-
-        q = self.q_b_proj(q)
-
-        # pre_indexer_proj is the CUDA-graph-safe portion: pure token-wise
-        # compute (cublas_mm, rope, FP4/FP8 quantize, weight scaling) with no
-        # access to batch-specific metadata or the k cache. Returns q_scale
-        # as a 5th element so the FP4 dispatch can forward it to the kernel;
-        # the FP8 path ignores it in forward_dsa_attn.
-        q_fp8, k_fp8, k_scale, weights, q_scale = self.mqa.indexer.pre_indexer_proj(
-            qr, hidden_states, position_ids
-        )
-
-        return [q, compressed_kv, k_pe, latent_cache, q_fp8, k_fp8, k_scale, weights, q_scale]
-
     def forward_dsa_attn(
         self,
         q: torch.Tensor,
@@ -888,7 +810,6 @@ class FusedMLA(nn.Module):
 
         if num_contexts > 0:
             q_ctx = q[:num_ctx_tokens, ...]
-            compressed_kv_ctx = compressed_kv[:num_ctx_tokens, ...]
             k_pe_ctx = k_pe[:num_ctx_tokens, ...]
             latent_cache_ctx = latent_cache[:num_ctx_tokens, ...]
             if self.apply_rotary_emb:
@@ -901,8 +822,6 @@ class FusedMLA(nn.Module):
             )
             self.forward_absorption_context(
                 q_ctx,
-                compressed_kv_ctx,
-                k_pe_ctx,
                 attn_metadata,
                 context_output,
                 position_ids=position_ids,
@@ -931,62 +850,6 @@ class FusedMLA(nn.Module):
                 latent_cache=latent_cache_gen,
                 topk_indices=topk_indices_gen,
             )
-
-    def forward_context_sparse_mla(
-        self,
-        q: torch.Tensor,
-        compressed_kv: torch.Tensor,
-        k_pe: torch.Tensor,
-        attn_metadata: AttentionMetadata,
-        output: torch.Tensor,
-        latent_cache: Optional[torch.Tensor] = None,
-        topk_indices: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """Run context-phase attention for DSA models.
-
-        Args:
-            q: Query tensor, shape [num_ctx_tokens, num_heads * qk_head_dim].
-            compressed_kv: Latent KV, shape [num_ctx_tokens, kv_lora_rank].
-            k_pe: RoPE key portion, shape [num_ctx_tokens, qk_rope_head_dim].
-            attn_metadata: Attention metadata for the current batch.
-            output: Pre-allocated output tensor, written in-place.
-            latent_cache: Concatenated [compressed_kv, k_pe] for KV cache.
-            topk_indices: Sparse routing indices from the indexer.
-            position_ids: Token position IDs.
-        """
-        return self.forward_absorption_context(
-            q,
-            compressed_kv,
-            k_pe,
-            attn_metadata,
-            output,
-            position_ids=position_ids,
-            latent_cache=latent_cache,
-            topk_indices=topk_indices,
-        )
-
-    def forward_generation_sparse_mla(
-        self,
-        q: torch.Tensor,
-        compressed_kv: torch.Tensor,
-        k_pe: torch.Tensor,
-        attn_metadata: AttentionMetadata,
-        output: torch.Tensor,
-        position_ids: Optional[torch.Tensor] = None,
-        latent_cache: Optional[torch.Tensor] = None,
-        topk_indices: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        return self.forward_absorption_generation(
-            q,
-            compressed_kv,
-            k_pe,
-            attn_metadata,
-            output,
-            position_ids=position_ids,
-            latent_cache=latent_cache,
-            topk_indices=topk_indices,
-        )
 
     def _bmm_bf16_out(self, a, b_no_transpose, b_transposed, output):
         """BMM with optional CuTe DSL bf16 acceleration on Blackwell."""
@@ -1043,101 +906,35 @@ class FusedMLA(nn.Module):
         )
 
         rope_stream = self.aux_stream if not has_fp8_kv_cache else None
-        if self.k_b_proj_trans.dtype == torch.bfloat16:
-            # [num_heads, num_tokens, self.qk_nope_head_dim]
-            q_nope_t = q_nope.transpose(0, 1)
-            # [num_heads, num_tokens, self.kv_lora_rank]
-            q_nope_out = fused_q[..., : self.kv_lora_rank].transpose(0, 1)
+        assert self.k_b_proj_trans.dtype == torch.bfloat16
+        # [num_heads, num_tokens, self.qk_nope_head_dim]
+        q_nope_t = q_nope.transpose(0, 1)
+        # [num_heads, num_tokens, self.kv_lora_rank]
+        q_nope_out = fused_q[..., : self.kv_lora_rank].transpose(0, 1)
 
-            # [num_heads, num_tokens, self.qk_nope_head_dim] x [num_heads, kv_lora_rank, qk_nope_head_dim]
-            # -> [num_heads, num_tokens, kv_lora_rank] -> [num_tokens, num_heads, kv_lora_rank]
-            # The output of bmm is written directly into fused_q
-            maybe_execute_in_parallel(
-                lambda: self._bmm_bf16_out(
-                    q_nope_t, self.k_b_proj_trans, self.k_b_proj_trans.transpose(1, 2), q_nope_out
-                ),
-                lambda: self.mqa.mla_rope_generation(
-                    fused_q,
-                    q_pe,
-                    latent_cache,
-                    attn_metadata,
-                    cu_q_seqlens,
-                    cu_kv_seqlens,
-                    fmha_scheduler_counter,
-                    mla_bmm1_scale,
-                    mla_bmm2_scale,
-                    quant_q_buffer,
-                ),
-                self.ln_events[0],
-                self.ln_events[1],
-                rope_stream,
-            )
-        elif self.k_b_proj_trans.dtype == torch.float8_e4m3fn:
-            # [num_heads, num_tokens, self.kv_lora_rank]
-            q_nope_out = fused_q[..., : self.kv_lora_rank].transpose(0, 1)
-
-            if rope_stream is None:
-                if is_sm_100f() and not self.use_cute_dsl_blockscaling_bmm:
-                    torch.bmm(
-                        q_nope.transpose(0, 1),
-                        self.k_b_proj_trans_dequant.transpose(1, 2),
-                        out=q_nope_out,
-                    )
-                else:
-                    fp8_block_scaling_bmm_out(
-                        q_nope,
-                        self.k_b_proj_trans,
-                        self.k_b_proj_trans_scale,
-                        q_nope_out,
-                        self.k_b_proj_trans_dequant,
-                        self.use_cute_dsl_blockscaling_bmm,
-                    )
-                self.mqa.mla_rope_generation(
-                    fused_q,
-                    q_pe,
-                    latent_cache,
-                    attn_metadata,
-                    cu_q_seqlens,
-                    cu_kv_seqlens,
-                    fmha_scheduler_counter,
-                    mla_bmm1_scale,
-                    mla_bmm2_scale,
-                    quant_q_buffer,
-                )
-            else:
-                maybe_execute_in_parallel(
-                    lambda: torch.bmm(
-                        q_nope.transpose(0, 1),
-                        self.k_b_proj_trans_dequant.transpose(1, 2),
-                        out=q_nope_out,
-                    )
-                    if is_sm_100f() and not self.use_cute_dsl_blockscaling_bmm
-                    else fp8_block_scaling_bmm_out(
-                        q_nope,
-                        self.k_b_proj_trans,
-                        self.k_b_proj_trans_scale,
-                        q_nope_out,
-                        self.k_b_proj_trans_dequant,
-                        self.use_cute_dsl_blockscaling_bmm,
-                    ),
-                    lambda: self.mqa.mla_rope_generation(
-                        fused_q,
-                        q_pe,
-                        latent_cache,
-                        attn_metadata,
-                        cu_q_seqlens,
-                        cu_kv_seqlens,
-                        fmha_scheduler_counter,
-                        mla_bmm1_scale,
-                        mla_bmm2_scale,
-                        quant_q_buffer,
-                    ),
-                    self.ln_events[0],
-                    self.ln_events[1],
-                    rope_stream,
-                )
-        else:
-            raise NotImplementedError(f"Missing bmm impl for dtype: {self.k_b_proj_trans.dtype}.")
+        # [num_heads, num_tokens, self.qk_nope_head_dim] x [num_heads, kv_lora_rank, qk_nope_head_dim]
+        # -> [num_heads, num_tokens, kv_lora_rank] -> [num_tokens, num_heads, kv_lora_rank]
+        # The output of bmm is written directly into fused_q
+        maybe_execute_in_parallel(
+            lambda: self._bmm_bf16_out(
+                q_nope_t, self.k_b_proj_trans, self.k_b_proj_trans.transpose(1, 2), q_nope_out
+            ),
+            lambda: self.mqa.mla_rope_generation(
+                fused_q,
+                q_pe,
+                latent_cache,
+                attn_metadata,
+                cu_q_seqlens,
+                cu_kv_seqlens,
+                fmha_scheduler_counter,
+                mla_bmm1_scale,
+                mla_bmm2_scale,
+                quant_q_buffer,
+            ),
+            self.ln_events[0],
+            self.ln_events[1],
+            rope_stream,
+        )
 
         fused_q = fused_q.view(
             [num_tokens, self.num_heads_tp * (self.kv_lora_rank + self.qk_rope_head_dim)]
@@ -1147,67 +944,28 @@ class FusedMLA(nn.Module):
         attention_input_type = AttentionInputType.generation_only
 
         position_ids_lifetime = position_ids
-        if self.mapping.has_cp_helix():
-            softmax_stats = torch.empty(
-                (fused_q.shape[0], self.num_heads_tp, 2),
-                device=fused_q.device,
-                dtype=torch.float32,
-            )
-            partial_o = self.mqa.forward(
-                fused_q,
-                None,
-                None,
-                attn_metadata,
-                forward_args=AttentionForwardArgs(
-                    attention_input_type=attention_input_type,
-                    out_scale=self.out_scale,
-                    output=None,
-                    latent_cache=latent_cache,  # kvcache and k_pe
-                    q_pe=q_pe,  # used by `invokeMLARopeGeneration`
-                    topk_indices=topk_indices,  # used by DSA attention
-                    is_generation=True,  # used by DSA attention
-                    cu_q_seqlens=cu_q_seqlens,  # used by `mlaGeneration`
-                    cu_kv_seqlens=cu_kv_seqlens,  # used by `mlaGeneration`
-                    fmha_scheduler_counter=fmha_scheduler_counter,  # used by `mlaGeneration`
-                    mla_bmm1_scale=mla_bmm1_scale,  # used by `mlaGeneration`
-                    mla_bmm2_scale=mla_bmm2_scale,  # used by `mlaGeneration`
-                    quant_q_buffer=quant_q_buffer,  # used by `mlaGeneration`
-                    softmax_stats_tensor=softmax_stats,
-                ),
-            )
-            kv_lora_rank = partial_o.shape[-1] // self.num_heads_tp
-            assert self.kv_lora_rank == kv_lora_rank
-            attn_out_latent = _helix_post_process(
-                partial_o,
-                softmax_stats,
-                self.mapping,
-                self.num_heads_tp_cp,
-                kv_lora_rank,
-                self.aux_stream,
-                self.ln_events,
-            )
-        else:
-            attn_out_latent = self.mqa.forward(
-                fused_q,
-                None,
-                None,
-                attn_metadata,
-                forward_args=AttentionForwardArgs(
-                    attention_input_type=attention_input_type,
-                    out_scale=self.out_scale,
-                    output=None,
-                    latent_cache=latent_cache,  # kvcache and k_pe
-                    q_pe=q_pe,  # used by `invokeMLARopeGeneration`
-                    topk_indices=topk_indices,  # used by DSA attention
-                    is_generation=True,  # used by DSA attention
-                    cu_q_seqlens=cu_q_seqlens,  # used by `mlaGeneration`
-                    cu_kv_seqlens=cu_kv_seqlens,  # used by `mlaGeneration`
-                    fmha_scheduler_counter=fmha_scheduler_counter,  # used by `mlaGeneration`
-                    mla_bmm1_scale=mla_bmm1_scale,  # used by `mlaGeneration`
-                    mla_bmm2_scale=mla_bmm2_scale,  # used by `mlaGeneration`
-                    quant_q_buffer=quant_q_buffer,  # used by `mlaGeneration`
-                ),
-            )
+
+        attn_out_latent = self.mqa.forward(
+            fused_q,
+            None,
+            None,
+            attn_metadata,
+            forward_args=AttentionForwardArgs(
+                attention_input_type=attention_input_type,
+                out_scale=self.out_scale,
+                output=None,
+                latent_cache=latent_cache,  # kvcache and k_pe
+                q_pe=q_pe,  # used by `invokeMLARopeGeneration`
+                topk_indices=topk_indices,  # used by DSA attention
+                is_generation=True,  # used by DSA attention
+                cu_q_seqlens=cu_q_seqlens,  # used by `mlaGeneration`
+                cu_kv_seqlens=cu_kv_seqlens,  # used by `mlaGeneration`
+                fmha_scheduler_counter=fmha_scheduler_counter,  # used by `mlaGeneration`
+                mla_bmm1_scale=mla_bmm1_scale,  # used by `mlaGeneration`
+                mla_bmm2_scale=mla_bmm2_scale,  # used by `mlaGeneration`
+                quant_q_buffer=quant_q_buffer,  # used by `mlaGeneration`
+            ),
+        )
         _ = position_ids_lifetime
         fused_q = None
 
@@ -1222,48 +980,39 @@ class FusedMLA(nn.Module):
 
         attn_output = output.view([num_tokens, self.num_heads_tp_cp, self.v_head_dim])
 
-        if self.v_b_proj.dtype == torch.bfloat16:
-            # [num_heads, seq, kv_lora_rank] x [num_heads, kv_lora_rank, v_head_dim]
-            # -> [num_heads, seq, v_head_dim]
-            self._bmm_bf16_out(
-                attn_out_latent.transpose(0, 1),
-                self.v_b_proj,
-                self.v_b_proj.transpose(1, 2),
-                attn_output.transpose(0, 1),
-            )
-        elif self.v_b_proj.dtype == torch.float8_e4m3fn:
-            attn_output_t = attn_output.transpose(0, 1)
-            if is_sm_100f() and not self.use_cute_dsl_blockscaling_bmm:
-                torch.bmm(
-                    attn_out_latent.transpose(0, 1),
-                    self.v_b_proj_dequant.transpose(1, 2),
-                    out=attn_output_t,
-                )
-            else:
-                fp8_block_scaling_bmm_out(
-                    attn_out_latent,
-                    self.v_b_proj,
-                    self.v_b_proj_scale,
-                    attn_output_t,
-                    self.v_b_proj_dequant,
-                    self.use_cute_dsl_blockscaling_bmm,
-                )
-        else:
-            raise NotImplementedError(f"Missing bmm impl for dtype: {self.v_b_proj.dtype}.")
+        assert self.v_b_proj.dtype == torch.bfloat16
+        # [num_heads, seq, kv_lora_rank] x [num_heads, kv_lora_rank, v_head_dim]
+        # -> [num_heads, seq, v_head_dim]
+        self._bmm_bf16_out(
+            attn_out_latent.transpose(0, 1),
+            self.v_b_proj,
+            self.v_b_proj.transpose(1, 2),
+            attn_output.transpose(0, 1),
+        )
 
         return output
 
     def forward_absorption_context(
         self,
         q: torch.Tensor,
-        compressed_kv: torch.Tensor,
-        k_pe: torch.Tensor,
         attn_metadata: AttentionMetadata,
         output: torch.Tensor,
         position_ids: Optional[torch.Tensor] = None,
         latent_cache: Optional[torch.Tensor] = None,
         topk_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        """
+        Prefill forward
+
+        - q: Query tensor, shape [num_ctx_tokens, num_heads * qk_head_dim].
+        - attn_metadata: Attention metadata for the current batch.
+        - output: Pre-allocated output tensor, written in-place.
+        - latent_cache: Concatenated [compressed_kv, k_pe] for KV cache.
+            - compressed_kv: Latent KV, shape [num_ctx_tokens, kv_lora_rank].
+            - k_pe: RoPE key portion, shape [num_ctx_tokens, qk_rope_head_dim].
+        - topk_indices: Sparse routing indices from the indexer.
+        - position_ids: Token position IDs.
+        """
         num_tokens = q.shape[0]
 
         q_nope, q_pe = q.view([-1, self.num_heads_tp, self.qk_head_dim]).split(
@@ -1341,59 +1090,24 @@ class FusedMLA(nn.Module):
             quant_scale_qkv = None
 
         position_ids_lifetime = position_ids
-        if self.mapping.has_cp_helix():
-            softmax_stats = torch.empty(
-                (fused_q.shape[0], self.num_heads_tp, 2),
-                device=fused_q.device,
-                dtype=torch.float32,
-            )
-            partial_o = self.mqa.forward(
-                fused_q,
-                None,
-                None,
-                attn_metadata,
-                forward_args=AttentionForwardArgs(
-                    attention_input_type=attention_input_type,
-                    out_scale=self.out_scale,
-                    output=None,
-                    latent_cache=latent_cache,  # kvcache and k_pe
-                    q_pe=q_pe,  # used by applyMLARopeAndAssignQKVKernelOptContext
-                    quant_q_buffer=quant_q_buffer,  # fused-FP8 path only
-                    quant_scale_qkv=quant_scale_qkv,  # fused-FP8 path only
-                    topk_indices=topk_indices,  # used by DSA attention
-                    is_generation=False,  # used by DSA attention
-                    softmax_stats_tensor=softmax_stats,
-                ),
-            )
-            kv_lora_rank = partial_o.shape[-1] // self.num_heads_tp
-            assert self.kv_lora_rank == kv_lora_rank
-            attn_out_latent = _helix_post_process(
-                partial_o,
-                softmax_stats,
-                self.mapping,
-                self.num_heads_tp_cp,
-                kv_lora_rank,
-                self.aux_stream,
-                self.ln_events,
-            )
-        else:
-            attn_out_latent = self.mqa.forward(
-                fused_q,
-                None,
-                None,
-                attn_metadata,
-                forward_args=AttentionForwardArgs(
-                    attention_input_type=attention_input_type,
-                    out_scale=self.out_scale,
-                    output=None,
-                    latent_cache=latent_cache,  # kvcache and k_pe
-                    q_pe=q_pe,  # used by applyMLARopeAndAssignQKVKernelOptContext
-                    quant_q_buffer=quant_q_buffer,  # fused-FP8 path only
-                    quant_scale_qkv=quant_scale_qkv,  # fused-FP8 path only
-                    topk_indices=topk_indices,  # used by DSA attention
-                    is_generation=False,  # used by DSA attention
-                ),
-            )
+
+        attn_out_latent = self.mqa.forward(
+            fused_q,
+            None,
+            None,
+            attn_metadata,
+            forward_args=AttentionForwardArgs(
+                attention_input_type=attention_input_type,
+                out_scale=self.out_scale,
+                output=None,
+                latent_cache=latent_cache,  # kvcache and k_pe
+                q_pe=q_pe,  # used by applyMLARopeAndAssignQKVKernelOptContext
+                quant_q_buffer=quant_q_buffer,  # fused-FP8 path only
+                quant_scale_qkv=quant_scale_qkv,  # fused-FP8 path only
+                topk_indices=topk_indices,  # used by DSA attention
+                is_generation=False,  # used by DSA attention
+            ),
+        )
         _ = position_ids_lifetime
         fused_q = None
         self._fused_quant_q_buffer = None
@@ -1607,67 +1321,3 @@ class DeepseekV32FusedMLA(DeepseekV3FusedMLA):
             skip_create_weights_in_init=model_config.skip_create_weights_in_init,
             use_custom_cublas_mm=True,
         )
-
-
-def _extract_fused_mla_extra_attrs(layer_idx: str):
-    extra_attrs = get_model_extra_attrs()
-    assert extra_attrs is not None, "Model extra attrs is not set"
-
-    metadata_ref = extra_attrs.get("attention_metadata", None)
-    assert metadata_ref is not None, "Attention metadata is not set"
-    metadata = metadata_ref()
-    assert isinstance(metadata, TrtllmAttentionMetadata)
-
-    mla_layers = extra_attrs.get("mla_layers", None)
-    assert mla_layers is not None, "MLA layer is not registered"
-    mla_layer_ref = mla_layers.get(layer_idx, None)
-    assert mla_layer_ref is not None, f"Cannot find fused MLA layer for layer {layer_idx}"
-    mla_layer = mla_layer_ref()
-    assert isinstance(mla_layer, FusedMLA), "MLA layer must be a FusedMLA instance"
-
-    return metadata, mla_layer
-
-
-@torch.library.custom_op("trtllm::fused_mla_dsa_proj", mutates_args=())
-def mla_dsa_proj(
-    hidden_states: torch.Tensor,
-    position_ids: Optional[torch.Tensor],
-    layer_idx: str,
-) -> List[torch.Tensor]:
-    """Token-wise projections for DSA MLA (CUDA-graph-capturable).
-
-    Runs kv_a_proj, layernorms, q_b_proj, and indexer.pre_indexer_proj
-    (FP8/FP4 quantize, weight scaling).  Does NOT
-    update the indexer k cache — that happens in Op 2 (mla_dsa_attn_inplace)
-    because the scatter kernel accesses batch-specific metadata.
-
-    Returns [q, compressed_kv, k_pe, latent_cache, q_fp8, k_fp8, k_scale,
-    weights, q_scale]. The trailing q_scale is only consumed by the FP4
-    dispatch; the FP8 path ignores it in forward_dsa_attn.
-    """
-    metadata, mla_layer = _extract_fused_mla_extra_attrs(layer_idx)
-    return mla_layer.forward_dsa_proj(position_ids, hidden_states, metadata)
-
-
-@torch.library.custom_op("trtllm::fused_mla_dsa_attn_inplace", mutates_args=("output",))
-def mla_dsa_attn_inplace(
-    q: torch.Tensor,
-    compressed_kv: torch.Tensor,
-    k_pe: torch.Tensor,
-    latent_cache: torch.Tensor,
-    indexer_intermediates: List[torch.Tensor],
-    position_ids: Optional[torch.Tensor],
-    layer_idx: str,
-    output: torch.Tensor,
-) -> None:
-    """Batch-structure-dependent attention dispatch for DSA MLA.
-
-    indexer_intermediates is [q_fp8, k_fp8, k_scale, weights, q_scale].
-    The trailing q_scale is only consumed by the FP4 dispatch; the FP8 path
-    ignores it. Runs sparse_attn_indexer then dispatches context/generation
-    attention. This op is excluded from CUDA graph capture.
-    """
-    metadata, mla_layer = _extract_fused_mla_extra_attrs(layer_idx)
-    mla_layer.forward_dsa_attn(
-        q, compressed_kv, k_pe, latent_cache, indexer_intermediates, position_ids, metadata, output
-    )

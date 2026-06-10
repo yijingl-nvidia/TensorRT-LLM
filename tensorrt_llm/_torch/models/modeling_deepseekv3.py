@@ -345,6 +345,7 @@ class DeepseekV3WeightLoader:
             local_v_head_dim = v_head_dim if not is_scale else v_head_dim // 128
             local_kv_lora_rank = kv_lora_rank if not is_scale else kv_lora_rank // 128
 
+            # [num_heads, qk_nope_dim + v_dim, kv_lora_rank]
             kv_b_proj = weights[f"{module_name}.{weight_name}"][:].unflatten(
                 0,
                 [
@@ -354,7 +355,11 @@ class DeepseekV3WeightLoader:
             )
 
             if not self.model_config.mapping.enable_attention_dp:
+                # if not attention dp, tensor parallel (tp) splits kv_b_proj along heads (dim=0)
+                # kv_b_proj: [local_num_heads, qk_nope_dim + v_dim, kv_lora_rank]
                 kv_b_proj = split_matrix_tp(kv_b_proj, tp_size, tp_rank, 0)
+            # k_nope_weight: [local_num_heads, qk_nope_dim, kv_lora_rank]
+            # v_weight: [local_num_heads, v_dim, kv_lora_rank]
             k_nope_weight, v_weight = kv_b_proj.split(
                 [local_qk_nope_head_dim, local_v_head_dim],
                 dim=1,
@@ -362,15 +367,21 @@ class DeepseekV3WeightLoader:
             weight_divisor = 1 if self.model_config.mapping.enable_attention_dp else tp_size
             local_num_heads = num_heads // weight_divisor
 
+            # [num_local_heads, kv_lora_rank, qk_nope_dim]
             k_nope_weight_trans = k_nope_weight.transpose(2, 1).contiguous()
 
-            kv_b_proj = torch.concat([
-                k_nope_weight.reshape(local_num_heads * local_qk_nope_head_dim,
-                                      local_kv_lora_rank),
-                v_weight.reshape(local_num_heads * local_v_head_dim,
-                                 local_kv_lora_rank)
-            ],
-                                     dim=0)
+            # [local_num_heads * qk_nope_dim + local_num_heads * v_dim, kv_lora_rank]
+            kv_b_proj = torch.concat(
+                [
+                    # reshape to [local_num_heads * qk_nope_dim, kv_lora_rank]
+                    k_nope_weight.reshape(
+                        local_num_heads * local_qk_nope_head_dim,
+                        local_kv_lora_rank),
+                    # reshape to [local_num_heads * v_dim, kv_lora_rank]
+                    v_weight.reshape(local_num_heads * local_v_head_dim,
+                                     local_kv_lora_rank)
+                ],
+                dim=0)
 
             return kv_b_proj, k_nope_weight_trans
 
