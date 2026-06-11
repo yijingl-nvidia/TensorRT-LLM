@@ -42,6 +42,7 @@ from ..modules.rms_norm import RMSNorm
 from ..peft.lora.layer import LoraLayer
 
 _FUSED_MLA_MODE_ENV = "TRTLLM_DEEPSEEKV3_FUSED_MLA_MODE"
+_FUSED_MLA_CONTEXT_KERNEL_ENV = "TRTLLM_DEEPSEEKV3_FUSED_MLA_CONTEXT_KERNEL"
 FUSED_MLA_MODE_BASELINE = "baseline"
 FUSED_MLA_MODE_WIP = "wip"
 
@@ -71,6 +72,13 @@ def get_fused_mla_mode() -> str:
             f"Unsupported {_FUSED_MLA_MODE_ENV}={mode!r}; expected one of: {allowed_modes}"
         )
     return mode_aliases[mode]
+
+
+def _is_env_enabled(env_name: str, default: bool = True) -> bool:
+    value = os.environ.get(env_name)
+    if value is None:
+        return default
+    return value.strip().lower() not in {"0", "false", "off", "no"}
 
 
 class DeepseekV3Linear(Linear):
@@ -1029,10 +1037,6 @@ class FusedMLA(nn.Module):
         else:
             raise NotImplementedError(f"Missing bmm impl for dtype: {self.k_b_proj_trans.dtype}.")
 
-        fused_q = fused_q.view(
-            [num_tokens, self.num_heads_tp * (self.kv_lora_rank + self.qk_rope_head_dim)]
-        )
-
         # Use generation_only for generation phase and context_only for context phase in DSA attention
         attention_input_type = AttentionInputType.context_only
 
@@ -1057,23 +1061,59 @@ class FusedMLA(nn.Module):
 
         position_ids_lifetime = position_ids
 
-        attn_out_latent = self.mqa.forward(
-            fused_q,
-            None,
-            None,
-            attn_metadata,
-            forward_args=AttentionForwardArgs(
-                attention_input_type=attention_input_type,
-                out_scale=self.out_scale,
-                output=None,
-                latent_cache=latent_cache,  # kvcache and k_pe
-                q_pe=q_pe,  # used by applyMLARopeAndAssignQKVKernelOptContext
-                quant_q_buffer=quant_q_buffer,  # fused-FP8 path only
-                quant_scale_qkv=quant_scale_qkv,  # fused-FP8 path only
-                topk_indices=topk_indices,  # used by DSA attention
-                is_generation=False,  # used by DSA attention
-            ),
+        use_context_kernel = (
+            _is_env_enabled(_FUSED_MLA_CONTEXT_KERNEL_ENV)
+            and self.num_heads_tp == 8
+            and self.num_heads_tp_cp == self.num_heads_tp
+            and self.kv_lora_rank == 512
+            and self.qk_rope_head_dim == 64
+            and attn_metadata.num_contexts == 1
+            and getattr(attn_metadata, "num_ctx_cached_tokens", 0) == 0
+            and topk_indices is not None
+            and hasattr(attn_metadata, "ctx_cached_token_indptr")
+            and hasattr(attn_metadata, "ctx_kv_indptr")
         )
+
+        if use_context_kernel:
+            self.mqa._ensure_rope_table_size(attn_metadata.max_seq_len)
+            attn_out_latent = torch.ops.trtllm.dsv3_fused_mla_context(
+                fused_q,
+                q_pe,
+                latent_cache,
+                topk_indices,
+                self.mqa.rotary_cos_sin,
+                attn_metadata.ctx_cached_token_indptr,
+                attn_metadata.ctx_kv_indptr,
+                attn_metadata.kv_cache_block_offsets,
+                attn_metadata.kv_cache_manager.kv_cache_pool_pointers,
+                attn_metadata.kv_cache_manager.kv_cache_pool_mapping,
+                self.mqa.kv_scale_orig_quant,
+                self.mqa.get_local_layer_idx(attn_metadata),
+                attn_metadata.kv_cache_manager.tokens_per_block,
+                int(self.mqa.quant_mode),
+                float(self.mqa.q_scaling),
+            )
+        else:
+            fused_q = fused_q.view(
+                [num_tokens, self.num_heads_tp * (self.kv_lora_rank + self.qk_rope_head_dim)]
+            )
+            attn_out_latent = self.mqa.forward(
+                fused_q,
+                None,
+                None,
+                attn_metadata,
+                forward_args=AttentionForwardArgs(
+                    attention_input_type=attention_input_type,
+                    out_scale=self.out_scale,
+                    output=None,
+                    latent_cache=latent_cache,  # kvcache and k_pe
+                    q_pe=q_pe,  # used by applyMLARopeAndAssignQKVKernelOptContext
+                    quant_q_buffer=quant_q_buffer,  # fused-FP8 path only
+                    quant_scale_qkv=quant_scale_qkv,  # fused-FP8 path only
+                    topk_indices=topk_indices,  # used by DSA attention
+                    is_generation=False,  # used by DSA attention
+                ),
+            )
         _ = position_ids_lifetime
         fused_q = None
         self._fused_quant_q_buffer = None

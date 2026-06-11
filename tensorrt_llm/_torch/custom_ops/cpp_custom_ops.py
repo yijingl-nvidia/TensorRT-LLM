@@ -1130,6 +1130,42 @@ def _register_fake():
         # The actual operation modifies fused_q and q_pe in-place
         return None
 
+    @torch.library.register_fake("trtllm::dsv3_fused_mla_context")
+    def _(
+        fused_q: torch.Tensor,
+        q_pe: torch.Tensor,
+        latent_cache: torch.Tensor,
+        topk_indices: torch.Tensor,
+        rotary_cos_sin: torch.Tensor,
+        ctx_cached_token_indptr: torch.Tensor,
+        ctx_kv_indptr: torch.Tensor,
+        kv_cache_block_offsets: torch.Tensor,
+        host_kv_cache_pool_pointers: torch.Tensor,
+        host_kv_cache_pool_mapping: torch.Tensor,
+        kv_scale_orig_quant: Optional[torch.Tensor],
+        layer_idx: int,
+        tokens_per_block: int,
+        quant_mode: int,
+        q_scaling: float,
+    ) -> torch.Tensor:
+        del (
+            q_pe,
+            latent_cache,
+            topk_indices,
+            rotary_cos_sin,
+            ctx_cached_token_indptr,
+            ctx_kv_indptr,
+            kv_cache_block_offsets,
+            host_kv_cache_pool_pointers,
+            host_kv_cache_pool_mapping,
+            kv_scale_orig_quant,
+            layer_idx,
+            tokens_per_block,
+            quant_mode,
+            q_scaling,
+        )
+        return fused_q.new_empty((fused_q.shape[0], fused_q.shape[1] * 512))
+
     @torch.library.register_fake("trtllm::fused_add_rms_norm_quant")
     def _(
         input: torch.Tensor,
