@@ -44,6 +44,11 @@ __device__ __forceinline__ float toFloat(__nv_bfloat16 value)
     return __bfloat162float(value);
 }
 
+__device__ __forceinline__ float toFloat(__nv_fp8_e4m3 value)
+{
+    return static_cast<float>(value);
+}
+
 __device__ __forceinline__ __nv_bfloat16 toBfloat16(float value)
 {
     return __float2bfloat16(value);
@@ -138,8 +143,9 @@ __global__ void preprocessContextKernel(__nv_bfloat16* fusedQ, __nv_bfloat16* la
     }
 }
 
-__global__ void contextAttentionKernel(__nv_bfloat16 const* fusedQ, __nv_bfloat16 const* latentCache,
-    int32_t const* topkIndices, __nv_bfloat16* output, int numTokens, int topK, float scoreScale)
+__global__ void contextAttentionKernel(__nv_bfloat16 const* fusedQ, __nv_fp8_e4m3 const* kvCachePool,
+    int32_t const* topkIndicesPool, __nv_bfloat16* output, float const* kvScaleQuantOrig, int numTokens, int topK,
+    float hostScoreScale)
 {
     extern __shared__ float shared[];
     float* reduce = shared;
@@ -148,31 +154,34 @@ __global__ void contextAttentionKernel(__nv_bfloat16 const* fusedQ, __nv_bfloat1
     int const tokenIdx = static_cast<int>(blockIdx.x);
     int const headIdx = static_cast<int>(blockIdx.y);
     int const tid = threadIdx.x;
+    float const kvDequantScale = kvScaleQuantOrig == nullptr ? 1.0F : kvScaleQuantOrig[0];
+    float const scoreScale = kvDequantScale * kvDequantScale * hostScoreScale;
 
     if (tokenIdx >= numTokens || headIdx >= kLocalHeads)
     {
         return;
     }
 
-    __nv_bfloat16 const* qPtr = fusedQ + (tokenIdx * kLocalHeads + headIdx) * kHeadDim;
     float maxScore = -INFINITY;
 
     for (int topkIdx = 0; topkIdx < topK; ++topkIdx)
     {
-        int const kvIdx = topkIndices[tokenIdx * topK + topkIdx];
+        int const kvIdx = topkIndicesPool[tokenIdx * topK + topkIdx];
         float partial = 0.0F;
-        if (kvIdx >= 0 && kvIdx <= tokenIdx && kvIdx < numTokens)
+        if (kvIdx >= 0)
         {
-            __nv_bfloat16 const* kvPtr = latentCache + kvIdx * kHeadDim;
+            __nv_fp8_e4m3 const* kvPtr = kvCachePool + kvIdx * kHeadDim;
             for (int dim = tid; dim < kHeadDim; dim += blockDim.x)
             {
-                partial += toFloat(qPtr[dim]) * toFloat(kvPtr[dim]);
+                float const qFp8 = static_cast<float>(
+                    __nv_fp8_e4m3(toFloat(fusedQ[(tokenIdx * kLocalHeads + headIdx) * kHeadDim + dim])));
+                partial += qFp8 * toFloat(kvPtr[dim]);
             }
         }
         float const dot = blockReduceSum(partial, reduce);
         if (tid == 0)
         {
-            float const score = (kvIdx >= 0 && kvIdx <= tokenIdx && kvIdx < numTokens) ? dot * scoreScale : -INFINITY;
+            float const score = kvIdx >= 0 ? dot * scoreScale : -INFINITY;
             weights[topkIdx] = score;
             maxScore = fmaxf(maxScore, score);
         }
@@ -199,13 +208,13 @@ __global__ void contextAttentionKernel(__nv_bfloat16 const* fusedQ, __nv_bfloat1
         float acc = 0.0F;
         for (int topkIdx = 0; topkIdx < topK; ++topkIdx)
         {
-            int const kvIdx = topkIndices[tokenIdx * topK + topkIdx];
-            if (kvIdx >= 0 && kvIdx <= tokenIdx && kvIdx < numTokens)
+            int const kvIdx = topkIndicesPool[tokenIdx * topK + topkIdx];
+            if (kvIdx >= 0)
             {
-                acc += weights[topkIdx] * invDenom * toFloat(latentCache[kvIdx * kHeadDim + dim]);
+                acc += weights[topkIdx] * invDenom * toFloat(kvCachePool[kvIdx * kHeadDim + dim]);
             }
         }
-        output[(tokenIdx * kLocalHeads + headIdx) * kKvLoraRank + dim] = toBfloat16(acc);
+        output[(tokenIdx * kLocalHeads + headIdx) * kKvLoraRank + dim] = toBfloat16(acc * kvDequantScale);
     }
 }
 
@@ -215,24 +224,28 @@ namespace dsv3_fused_mla
 {
 
 torch::Tensor dsv3_fused_mla_context_cuda(torch::Tensor fused_q, torch::Tensor q_pe, torch::Tensor latent_cache,
-    torch::Tensor topk_indices, torch::Tensor rotary_cos_sin, torch::Tensor ctx_cached_token_indptr,
-    torch::Tensor ctx_kv_indptr, tensorrt_llm::kernels::KVBlockArray kv_cache,
-    std::optional<torch::Tensor> kv_scale_orig_quant, bool has_fp8_kv_cache, double q_scaling)
+    torch::Tensor topk_indices_pool, torch::Tensor kv_cache_pool, torch::Tensor rotary_cos_sin,
+    torch::Tensor ctx_cached_token_indptr, torch::Tensor ctx_kv_indptr, tensorrt_llm::kernels::KVBlockArray kv_cache,
+    std::optional<torch::Tensor> kv_scale_orig_quant, std::optional<torch::Tensor> kv_scale_quant_orig,
+    bool has_fp8_kv_cache, double q_scaling)
 {
     (void) ctx_kv_indptr;
     c10::cuda::CUDAGuard const deviceGuard{fused_q.device()};
     cudaStream_t stream = at::cuda::getCurrentCUDAStream(fused_q.get_device());
 
     int const numTokens = static_cast<int>(fused_q.size(0));
-    int const topK = static_cast<int>(topk_indices.size(1));
+    int const topK = static_cast<int>(topk_indices_pool.size(1));
     auto output = torch::empty({numTokens, kLocalHeads * kKvLoraRank}, fused_q.options());
 
     float const* kvScaleOrigQuantPtr
         = kv_scale_orig_quant.has_value() ? kv_scale_orig_quant.value().data_ptr<float>() : nullptr;
+    float const* kvScaleQuantOrigPtr
+        = kv_scale_quant_orig.has_value() ? kv_scale_quant_orig.value().data_ptr<float>() : nullptr;
     auto* rotaryCosSinPtr = reinterpret_cast<float2 const*>(rotary_cos_sin.data_ptr());
     auto* fusedQPtr = static_cast<__nv_bfloat16*>(fused_q.data_ptr());
     auto* qPePtr = static_cast<__nv_bfloat16*>(q_pe.data_ptr());
     auto* latentCachePtr = static_cast<__nv_bfloat16*>(latent_cache.data_ptr());
+    auto* kvCachePoolPtr = reinterpret_cast<__nv_fp8_e4m3 const*>(kv_cache_pool.data_ptr());
     auto* outputPtr = static_cast<__nv_bfloat16*>(output.data_ptr());
 
     dim3 preprocessGrid(numTokens, kLocalHeads + 1);
@@ -247,11 +260,11 @@ torch::Tensor dsv3_fused_mla_context_cuda(torch::Tensor fused_q, torch::Tensor q
             rotaryCosSinPtr, ctx_cached_token_indptr.data_ptr<int64_t>(), kv_cache, kvScaleOrigQuantPtr, numTokens);
     }
 
-    float const scoreScale = 1.0F / (static_cast<float>(q_scaling) * sqrtf(256.0F));
+    float const hostScoreScale = 1.0F / (static_cast<float>(q_scaling) * sqrtf(256.0F));
     dim3 attentionGrid(numTokens, kLocalHeads);
     size_t const sharedBytes = (kThreads + std::min(topK, kMaxTopK)) * sizeof(float);
-    contextAttentionKernel<<<attentionGrid, kThreads, sharedBytes, stream>>>(
-        fusedQPtr, latentCachePtr, topk_indices.data_ptr<int32_t>(), outputPtr, numTokens, topK, scoreScale);
+    contextAttentionKernel<<<attentionGrid, kThreads, sharedBytes, stream>>>(fusedQPtr, kvCachePoolPtr,
+        topk_indices_pool.data_ptr<int32_t>(), outputPtr, kvScaleQuantOrigPtr, numTokens, topK, hostScoreScale);
 
     sync_check_cuda_error(stream);
     return output;

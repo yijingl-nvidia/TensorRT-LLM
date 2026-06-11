@@ -32,6 +32,7 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from ..attention_backend import AttentionForwardArgs, AttentionInputType, AttentionMetadata
 from ..attention_backend.interface import AttentionBackend, PositionalEmbeddingParams, RopeParams
+from ..attention_backend.sparse.dsa import transform_local_topk_and_prepare_pool_view
 from ..attention_backend.utils import create_attention
 from ..distributed import AllReduceParams
 from ..model_config import ModelConfig
@@ -1076,22 +1077,66 @@ class FusedMLA(nn.Module):
 
         if use_context_kernel:
             self.mqa._ensure_rope_table_size(attn_metadata.max_seq_len)
+            topk_indices_pool, kv_cache_pool = transform_local_topk_and_prepare_pool_view(
+                topk_indices,
+                attn_metadata,
+                layer_idx=self.mqa.get_local_layer_idx(attn_metadata),
+                is_generation=False,
+            )
+            workspace = (
+                attn_metadata.cuda_graph_workspace
+                if attn_metadata.is_cuda_graph
+                else attn_metadata.workspace
+            )
+            rope_params = self.mqa.rope_params
             attn_out_latent = torch.ops.trtllm.dsv3_fused_mla_context(
                 fused_q,
                 q_pe,
                 latent_cache,
                 topk_indices,
+                topk_indices_pool,
+                kv_cache_pool,
+                workspace,
+                attn_metadata.kv_lens_cuda_runtime,
+                attn_metadata.kv_lens_runtime,
+                attn_metadata.host_total_kv_lens,
+                attn_metadata.prompt_lens_cuda_runtime,
+                attn_metadata.prompt_lens_cpu_runtime,
+                attn_metadata.host_request_types_runtime,
                 self.mqa.rotary_cos_sin,
+                self.mqa.rotary_inv_freq,
+                attn_metadata.cache_indirection,
+                attn_metadata.block_ids_per_seq,
                 attn_metadata.ctx_cached_token_indptr,
                 attn_metadata.ctx_kv_indptr,
                 attn_metadata.kv_cache_block_offsets,
                 attn_metadata.kv_cache_manager.kv_cache_pool_pointers,
                 attn_metadata.kv_cache_manager.kv_cache_pool_mapping,
                 self.mqa.kv_scale_orig_quant,
+                self.mqa.kv_scale_quant_orig,
                 self.mqa.get_local_layer_idx(attn_metadata),
                 attn_metadata.kv_cache_manager.tokens_per_block,
                 int(self.mqa.quant_mode),
                 float(self.mqa.q_scaling),
+                int(self.mqa.position_embedding_type),
+                int(rope_params.dim),
+                float(rope_params.theta),
+                int(rope_params.scale_type),
+                float(rope_params.scale),
+                float(rope_params.short_m_scale),
+                float(rope_params.long_m_scale),
+                int(rope_params.max_positions),
+                int(rope_params.original_max_positions),
+                int(self.mqa.predicted_tokens_per_seq),
+                int(self.q_lora_rank or 0),
+                int(self.qk_nope_head_dim),
+                int(attn_metadata.max_num_requests),
+                int(min(attn_metadata.max_seq_len - 1, attn_metadata.max_num_tokens)),
+                int(attn_metadata.max_seq_len),
+                int(attn_metadata.beam_width),
+                int(attn_metadata.num_contexts),
+                int(attn_metadata.num_ctx_tokens),
+                True,
             )
         else:
             fused_q = fused_q.view(
