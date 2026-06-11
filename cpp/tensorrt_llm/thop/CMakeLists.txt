@@ -94,8 +94,8 @@ add_library(
   dsv3FusedExpertUpOp.cpp
   ../kernels/dsv3FusedKernels/dsv3FusedExpertUp.cu
   ../kernels/dsv3FusedKernels/dsv3FusedExpertUpFp16.cu
-  dsv3FusedMLAContextOp.cpp
-  ../kernels/dsv3FusedKernels/dsv3FusedMLAContext.cu
+  dsv3FusedMLA.cpp
+  ../kernels/dsv3FusedKernels/dsv3FusedMLA.cu
   dsv3FusedExpertDownOp.cpp
   ../kernels/dsv3FusedKernels/dsv3FusedExpertDown.cu
   fusedCatFp4Op.cpp

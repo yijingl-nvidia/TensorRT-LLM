@@ -44,6 +44,7 @@ from ..peft.lora.layer import LoraLayer
 
 _FUSED_MLA_MODE_ENV = "TRTLLM_DEEPSEEKV3_FUSED_MLA_MODE"
 _FUSED_MLA_CONTEXT_KERNEL_ENV = "TRTLLM_DEEPSEEKV3_FUSED_MLA_CONTEXT_KERNEL"
+_FUSED_MLA_GENERATION_KERNEL_ENV = "TRTLLM_DEEPSEEKV3_FUSED_MLA_GENERATION_KERNEL"
 FUSED_MLA_MODE_BASELINE = "baseline"
 FUSED_MLA_MODE_WIP = "wip"
 
@@ -80,6 +81,86 @@ def _is_env_enabled(env_name: str, default: bool = True) -> bool:
     if value is None:
         return default
     return value.strip().lower() not in {"0", "false", "off", "no"}
+
+
+def _dsv3_fused_mla_generation_torch(
+    quant_q_buffer: torch.Tensor,
+    topk_indices: torch.Tensor,
+    topk_indices_pool: torch.Tensor,
+    kv_cache_pool: torch.Tensor,
+    sequence_length: torch.Tensor,
+    mla_bmm1_scale: torch.Tensor,
+    mla_bmm2_scale: torch.Tensor,
+    spec_decoding_packed_mask: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """GLM-5 BS=1 MTP=3 sparse MLA generation reference in PyTorch.
+
+    Shapes are fixed by the target benchmark:
+    - quant_q_buffer: uint8-backed FP8 E4M3 [4, 8, 576].
+    - topk_indices: int32 [4, topK], local KV positions before pool conversion.
+    - topk_indices_pool: int32 [4, topK], with negative padding entries.
+    - kv_cache_pool: FP8 E4M3 [pool_tokens, 1, 576].
+    - sequence_length: int32 [1], total KV length after appending the four decode rows.
+    - spec_decoding_packed_mask: optional int32 [max_requests, 4, 1]. For the
+      current four-row decode group, bit k says whether query row t may attend
+      to current-group row k. Historical KV rows before the group are always
+      valid if selected by topK.
+    - return: BF16 [4, 8 * 512].
+    """
+    num_tokens, num_heads, head_dim = quant_q_buffer.shape
+    assert num_tokens == 4
+    assert num_heads == 8
+    assert head_dim == 576
+    assert kv_cache_pool.shape[1:] == (1, 576)
+
+    current_group_start = sequence_length[0] - num_tokens
+    current_group_offset = topk_indices - current_group_start
+    historical_kv = topk_indices < current_group_start
+    current_group_kv = (current_group_offset >= 0) & (current_group_offset < num_tokens)
+    if spec_decoding_packed_mask is None:
+        current_group_valid = (
+            current_group_offset
+            <= torch.arange(num_tokens, dtype=topk_indices.dtype, device=topk_indices.device)[
+                :, None
+            ]
+        )
+    else:
+        packed_mask = spec_decoding_packed_mask[0, :num_tokens, 0].to(topk_indices.dtype)
+        current_group_bit = torch.bitwise_right_shift(
+            packed_mask[:, None], current_group_offset.clamp(0, 31)
+        )
+        current_group_valid = torch.bitwise_and(current_group_bit, 1).to(torch.bool)
+    valid = (topk_indices_pool >= 0) & (historical_kv | (current_group_kv & current_group_valid))
+    pool_indices = topk_indices_pool.clamp_min(0).to(torch.long)
+
+    q = quant_q_buffer.view(torch.float8_e4m3fn)
+    kv_fp8 = kv_cache_pool[:, 0, :][pool_indices]
+    mm_scale = torch.ones((), dtype=torch.float32, device=quant_q_buffer.device)
+    scores = torch.stack(
+        [
+            torch._scaled_mm(
+                q[token_idx],
+                kv_fp8[token_idx].transpose(0, 1).contiguous(),
+                scale_a=mm_scale,
+                scale_b=mm_scale,
+                out_dtype=torch.float32,
+            )
+            for token_idx in range(num_tokens)
+        ],
+        dim=0,
+    )
+    scores = scores * mla_bmm1_scale[1]
+    scores = scores.masked_fill(~valid[:, None, :], -float("inf"))
+
+    max_scores = scores.max(dim=-1, keepdim=True).values
+    weights = torch.exp2(scores - max_scores)
+    weights = weights.masked_fill(~valid[:, None, :], 0.0)
+    weights = weights / weights.sum(dim=-1, keepdim=True).clamp_min(1.0e-20)
+
+    kv = kv_fp8.to(torch.float32)
+    output = torch.einsum("thk,tkd->thd", weights, kv[..., :512])
+    output = output * mla_bmm2_scale[0]
+    return output.to(torch.bfloat16).reshape(num_tokens, num_heads * 512)
 
 
 class DeepseekV3Linear(Linear):
@@ -913,36 +994,64 @@ class FusedMLA(nn.Module):
             rope_stream,
         )
 
-        fused_q = fused_q.view(
-            [num_tokens, self.num_heads_tp * (self.kv_lora_rank + self.qk_rope_head_dim)]
-        )
-
         # Use generation_only for generation phase and context_only for context phase in DSA attention
         attention_input_type = AttentionInputType.generation_only
 
         position_ids_lifetime = position_ids
 
-        attn_out_latent = self.mqa.forward(
-            fused_q,
-            None,
-            None,
-            attn_metadata,
-            forward_args=AttentionForwardArgs(
-                attention_input_type=attention_input_type,
-                out_scale=self.out_scale,
-                output=None,
-                latent_cache=latent_cache,  # kvcache and k_pe
-                q_pe=q_pe,  # used by `invokeMLARopeGeneration`
-                topk_indices=topk_indices,  # used by DSA attention
-                is_generation=True,  # used by DSA attention
-                cu_q_seqlens=cu_q_seqlens,  # used by `mlaGeneration`
-                cu_kv_seqlens=cu_kv_seqlens,  # used by `mlaGeneration`
-                fmha_scheduler_counter=fmha_scheduler_counter,  # used by `mlaGeneration`
-                mla_bmm1_scale=mla_bmm1_scale,  # used by `mlaGeneration`
-                mla_bmm2_scale=mla_bmm2_scale,  # used by `mlaGeneration`
-                quant_q_buffer=quant_q_buffer,  # used by `mlaGeneration`
-            ),
+        use_generation_kernel = (
+            _is_env_enabled(_FUSED_MLA_GENERATION_KERNEL_ENV)
+            and num_tokens == 4
+            and num_seqs == 1
+            and topk_indices is not None
+            and quant_q_buffer is not None
+            and mla_bmm1_scale is not None
+            and mla_bmm2_scale is not None
         )
+
+        if use_generation_kernel:
+            self.mqa._ensure_rope_table_size(attn_metadata.max_seq_len)
+            topk_indices_pool, kv_cache_pool = transform_local_topk_and_prepare_pool_view(
+                topk_indices,
+                attn_metadata,
+                layer_idx=self.mqa.get_local_layer_idx(attn_metadata),
+                is_generation=True,
+            )
+            attn_out_latent = _dsv3_fused_mla_generation_torch(
+                quant_q_buffer,
+                topk_indices,
+                topk_indices_pool,
+                kv_cache_pool,
+                attn_metadata.kv_lens_cuda_runtime,
+                mla_bmm1_scale,
+                mla_bmm2_scale,
+                attn_metadata.spec_decoding_packed_mask,
+            )
+        else:
+            fused_q = fused_q.view(
+                [num_tokens, self.num_heads_tp * (self.kv_lora_rank + self.qk_rope_head_dim)]
+            )
+            attn_out_latent = self.mqa.forward(
+                fused_q,
+                None,
+                None,
+                attn_metadata,
+                forward_args=AttentionForwardArgs(
+                    attention_input_type=attention_input_type,
+                    out_scale=self.out_scale,
+                    output=None,
+                    latent_cache=latent_cache,  # kvcache and k_pe
+                    q_pe=q_pe,  # used by `invokeMLARopeGeneration`
+                    topk_indices=topk_indices,  # used by DSA attention
+                    is_generation=True,  # used by DSA attention
+                    cu_q_seqlens=cu_q_seqlens,  # used by `mlaGeneration`
+                    cu_kv_seqlens=cu_kv_seqlens,  # used by `mlaGeneration`
+                    fmha_scheduler_counter=fmha_scheduler_counter,  # used by `mlaGeneration`
+                    mla_bmm1_scale=mla_bmm1_scale,  # used by `mlaGeneration`
+                    mla_bmm2_scale=mla_bmm2_scale,  # used by `mlaGeneration`
+                    quant_q_buffer=quant_q_buffer,  # used by `mlaGeneration`
+                ),
+            )
         _ = position_ids_lifetime
         fused_q = None
 
@@ -1062,20 +1171,17 @@ class FusedMLA(nn.Module):
 
         position_ids_lifetime = position_ids
 
-        use_context_kernel = (
-            _is_env_enabled(_FUSED_MLA_CONTEXT_KERNEL_ENV)
-            and self.num_heads_tp == 8
-            and self.num_heads_tp_cp == self.num_heads_tp
-            and self.kv_lora_rank == 512
-            and self.qk_rope_head_dim == 64
-            and attn_metadata.num_contexts == 1
-            and getattr(attn_metadata, "num_ctx_cached_tokens", 0) == 0
-            and topk_indices is not None
-            and hasattr(attn_metadata, "ctx_cached_token_indptr")
-            and hasattr(attn_metadata, "ctx_kv_indptr")
-        )
+        if _is_env_enabled(_FUSED_MLA_CONTEXT_KERNEL_ENV):
+            assert self.num_heads_tp == 8
+            assert self.num_heads_tp_cp == self.num_heads_tp
+            assert self.kv_lora_rank == 512
+            assert self.qk_rope_head_dim == 64
+            assert attn_metadata.num_contexts == 1
+            assert getattr(attn_metadata, "num_ctx_cached_tokens", 0) == 0
+            assert topk_indices is not None
+            assert hasattr(attn_metadata, "ctx_cached_token_indptr")
+            assert hasattr(attn_metadata, "ctx_kv_indptr")
 
-        if use_context_kernel:
             self.mqa._ensure_rope_table_size(attn_metadata.max_seq_len)
             topk_indices_pool, kv_cache_pool = transform_local_topk_and_prepare_pool_view(
                 topk_indices,
