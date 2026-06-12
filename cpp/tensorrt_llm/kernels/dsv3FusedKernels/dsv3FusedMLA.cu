@@ -16,7 +16,7 @@
  */
 
 #include "tensorrt_llm/common/cudaUtils.h"
-#include "tensorrt_llm/kernels/decoderMaskedMultiheadAttentionUtils.h"
+// #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttentionUtils.h"
 #include "tensorrt_llm/kernels/kvCacheUtils.h"
 
 #include <ATen/cuda/CUDAContext.h>
@@ -25,7 +25,7 @@
 #include <cuda_fp8.h>
 #include <torch/extension.h>
 
-#include <cmath>
+// #include <cmath>
 #include <cstdint>
 #include <optional>
 
@@ -438,7 +438,6 @@ namespace dsv3_fused_mla
 // - ctx_cached_token_indptr: INT64 [numContexts + 1]. The current custom path uses one context;
 //   ctx_cached_token_indptr[1] - ctx_cached_token_indptr[0] gives the cached prefix length used for
 //   absolute RoPE and cache positions.
-// - ctx_kv_indptr: currently unused by this simplified CUDA path.
 // - kv_cache: paged TRT-LLM KV cache view. preprocessContextKernel writes the rotated latent KV rows into
 //   this cache.
 // - kv_scale_orig_quant: optional FP32 [1], original-domain to FP8 scale used when storing BF16
@@ -460,11 +459,10 @@ namespace dsv3_fused_mla
 //   softmax-weighted sum of FP8 latent V rows from kv_cache_pool, in original/BF16 units.
 torch::Tensor dsv3_fused_mla_context_cuda(torch::Tensor fused_q, torch::Tensor q_pe, torch::Tensor latent_cache,
     torch::Tensor topk_indices_pool, torch::Tensor kv_cache_pool, torch::Tensor rotary_cos_sin,
-    torch::Tensor ctx_cached_token_indptr, torch::Tensor ctx_kv_indptr, tensorrt_llm::kernels::KVBlockArray kv_cache,
+    torch::Tensor ctx_cached_token_indptr, tensorrt_llm::kernels::KVBlockArray kv_cache,
     std::optional<torch::Tensor> kv_scale_orig_quant, std::optional<torch::Tensor> kv_scale_quant_orig,
     bool has_fp8_kv_cache, double q_scaling)
 {
-    (void) ctx_kv_indptr;
     c10::cuda::CUDAGuard const deviceGuard{fused_q.device()};
     cudaStream_t stream = at::cuda::getCurrentCUDAStream(fused_q.get_device());
 
