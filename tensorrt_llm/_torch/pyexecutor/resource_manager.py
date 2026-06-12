@@ -647,6 +647,10 @@ class KVCacheManager(BaseResourceManager):
                 kwargs['event_manager'] = KVCacheEventManagerCpp(
                     max_kv_event_entries=self.event_buffer_max_size)
 
+        # KVCacheManager cpp is defined by nanobind at
+        # cpp/tensorrt_llm/nanobind/batch_manager/kvCacheManager.cpp
+        # It's actual implementation is at
+        # cpp/tensorrt_llm/batch_manager/kvCacheManager.h/cpp
         self.impl = KVCacheManagerCpp(**kwargs)
         # Warmup baseline for cumulative counters (set by snapshot_warmup_baseline)
         self._warmup_reused_blocks = 0
