@@ -125,12 +125,12 @@ __device__ __forceinline__ float blockReduceSum(float value, float* shared)
 //
 // Side effects:
 // - Q branch mutates fusedQ[token, head, kKvLoraRank:kHeadDim].
-// - KV branch mutates latentCache[token, kKvLoraRank:kHeadDim] and writes latentCache[token, :] to kvCache.
+// - KV branch writes latentCache[token, :] to kvCache with a rotated K RoPE suffix.
 // - The function does not produce a returned tensor; contextAttentionKernel consumes fusedQ and kvCachePool later.
 template <bool kFp8KvCache>
 __global__ void preprocessContextKernel(__nv_bfloat16* fusedQ, __nv_bfloat16* latentCache, __nv_bfloat16 const* qPe,
     float2 const* rotaryCosSin, int64_t const* ctxCachedTokenIndptr, tensorrt_llm::kernels::KVBlockArray kvCache,
-    float const* kvScaleOrigQuant, int numTokens)
+    float const* kvScaleOrigQuant, int64_t qPeStrideToken, int64_t qPeStrideHead, int numTokens)
 {
     // Grid shape is [numTokens, kLocalHeads + 1].
     // - blockIdx.x selects one context token row.
@@ -160,8 +160,9 @@ __global__ void preprocessContextKernel(__nv_bfloat16* fusedQ, __nv_bfloat16* la
             float2 value;
             // dim is the first element of an adjacent RoPE pair in qPe[token, head, dim:dim + 2].
             int const dim = 2 * pairIdx;
-            // qPe is BF16 [numTokens, 8, 64] with contiguous last dimension.
-            int const qPeOffset = (tokenIdx * kLocalHeads + headIdx) * kRopeDim + dim;
+            // qPe is a split view from [numTokens, 8, 256] in the model path, so only the last dimension
+            // is guaranteed contiguous.
+            int64_t const qPeOffset = tokenIdx * qPeStrideToken + headIdx * qPeStrideHead + dim;
             value.x = toFloat(qPe[qPeOffset]);
             value.y = toFloat(qPe[qPeOffset + 1]);
             // rotaryCosSin is indexed by absolute KV position so cached prefixes get the correct phase.
@@ -176,8 +177,23 @@ __global__ void preprocessContextKernel(__nv_bfloat16* fusedQ, __nv_bfloat16* la
         return;
     }
 
-    // KV branch: one block per token rotates the shared latent K RoPE suffix and then writes the complete
-    // [latent KV/V, K RoPE] row into TRT-LLM's paged KV cache.
+    // KV branch: one block per token writes the complete [latent KV/V, K RoPE] row into TRT-LLM's paged KV cache.
+    // Match the trusted MLA context path by leaving latentCache itself unchanged; only the cache receives rotated K.
+    auto* blockPtr = kvCache.getKBlockPtr(/*seqIdx=*/0, tokenIdxInKvCache);
+    for (int dim = threadIdx.x; dim < kKvLoraRank; dim += blockDim.x)
+    {
+        int const cacheOffset = kvCache.getKVLocalIdx(tokenIdxInKvCache, /*headIdx=*/0, kHeadDim, dim);
+        __nv_bfloat16 const value = latentCache[tokenIdx * kHeadDim + dim];
+        if constexpr (kFp8KvCache)
+        {
+            reinterpret_cast<__nv_fp8_e4m3*>(blockPtr)[cacheOffset] = __nv_fp8_e4m3(toFloat(value) * kvScale);
+        }
+        else
+        {
+            reinterpret_cast<__nv_bfloat16*>(blockPtr)[cacheOffset] = value;
+        }
+    }
+
     for (int pairIdx = threadIdx.x; pairIdx < kRopeDim / 2; pairIdx += blockDim.x)
     {
         float2 value;
@@ -188,24 +204,19 @@ __global__ void preprocessContextKernel(__nv_bfloat16* fusedQ, __nv_bfloat16* la
         value.y = toFloat(latentCache[latentOffset + 1]);
         float2 const coef = rotaryCosSin[tokenIdxInKvCache * kRopeDim + pairIdx];
         float2 const rotated = rotaryTransform(value, coef);
-        latentCache[latentOffset] = toBfloat16(rotated.x);
-        latentCache[latentOffset + 1] = toBfloat16(rotated.y);
-    }
-    __syncthreads();
 
-    auto* blockPtr = kvCache.getKBlockPtr(/*seqIdx=*/0, tokenIdxInKvCache);
-    for (int dim = threadIdx.x; dim < kHeadDim; dim += blockDim.x)
-    {
-        // cacheOffset maps [absolute token position, one MLA KV head, dim] into TRT-LLM's paged block layout.
-        int const cacheOffset = kvCache.getKVLocalIdx(tokenIdxInKvCache, /*headIdx=*/0, kHeadDim, dim);
-        __nv_bfloat16 const value = latentCache[tokenIdx * kHeadDim + dim];
+        int const cacheOffset = kvCache.getKVLocalIdx(tokenIdxInKvCache, /*headIdx=*/0, kHeadDim, kKvLoraRank + dim);
+        __nv_bfloat16 const first = toBfloat16(rotated.x);
+        __nv_bfloat16 const second = toBfloat16(rotated.y);
         if constexpr (kFp8KvCache)
         {
-            reinterpret_cast<__nv_fp8_e4m3*>(blockPtr)[cacheOffset] = __nv_fp8_e4m3(toFloat(value) * kvScale);
+            reinterpret_cast<__nv_fp8_e4m3*>(blockPtr)[cacheOffset] = __nv_fp8_e4m3(toFloat(first) * kvScale);
+            reinterpret_cast<__nv_fp8_e4m3*>(blockPtr)[cacheOffset + 1] = __nv_fp8_e4m3(toFloat(second) * kvScale);
         }
         else
         {
-            reinterpret_cast<__nv_bfloat16*>(blockPtr)[cacheOffset] = value;
+            reinterpret_cast<__nv_bfloat16*>(blockPtr)[cacheOffset] = first;
+            reinterpret_cast<__nv_bfloat16*>(blockPtr)[cacheOffset + 1] = second;
         }
     }
 }
@@ -223,8 +234,10 @@ __global__ void preprocessContextKernel(__nv_bfloat16* fusedQ, __nv_bfloat16* la
 // - topkIndicesPool: INT32 [numTokens, topK]. For each query token, contains
 //   global row indices into kvCachePool. Negative entries are padding and are
 //   treated as masked-out KV candidates.
+// - kvScaleOrigQuant: optional FP32 scale mapping original BF16 values to FP8.
+//   Context uses the same scale for Q and KV quantization in the trusted path.
 // - kvScaleQuantOrig: optional FP32 scale mapping FP8 cache values back to
-//   original units. Used twice for QK score scale and once for V dequant.
+//   original units. Used for Q/K score dequant and V output dequant.
 // - numTokens/topK: logical sizes.
 // - hostScoreScale: host-computed attention scale, currently
 //   1 / (q_scaling * sqrt(256)).
@@ -241,8 +254,8 @@ __global__ void preprocessContextKernel(__nv_bfloat16* fusedQ, __nv_bfloat16* la
 // - threadIdx.x cooperates across kHeadDim for QK reductions and across
 //   kKvLoraRank for the final V accumulation.
 __global__ void contextAttentionKernel(__nv_bfloat16 const* fusedQ, __nv_fp8_e4m3 const* kvCachePool,
-    int32_t const* topkIndicesPool, __nv_bfloat16* output, float const* kvScaleQuantOrig, int numTokens, int topK,
-    float hostScoreScale)
+    int32_t const* topkIndicesPool, __nv_bfloat16* output, float const* kvScaleOrigQuant, float const* kvScaleQuantOrig,
+    int numTokens, int topK, float hostScoreScale)
 {
     // One CUDA block computes one (query token, local head) row.
     // Dynamic shared layout:
@@ -255,10 +268,12 @@ __global__ void contextAttentionKernel(__nv_bfloat16 const* fusedQ, __nv_fp8_e4m
     int const tokenIdx = static_cast<int>(blockIdx.x);
     int const headIdx = static_cast<int>(blockIdx.y);
     int const tid = threadIdx.x;
-    // kvDequantScale maps FP8 cache values back to BF16/FP32 units. Context recomputes Q as FP8-rounded BF16
-    // below, so Q and K each contribute one dequant scale to the score.
+    // Match the trusted context FP8-Q path: Q and KV are quantized with kvScaleOrigQuant, then FMHA dequantizes
+    // both operands with kvScaleQuantOrig during BMM1.
+    float const kvQuantScale = kvScaleOrigQuant == nullptr ? 1.0F : kvScaleOrigQuant[0];
     float const kvDequantScale = kvScaleQuantOrig == nullptr ? 1.0F : kvScaleQuantOrig[0];
-    float const scoreScale = kvDequantScale * kvDequantScale * hostScoreScale;
+    constexpr float kLog2e = 1.4426950408889634074F;
+    float const scoreScaleLog2 = kvDequantScale * kvDequantScale * hostScoreScale * kLog2e;
 
     if (tokenIdx >= numTokens || headIdx >= kLocalHeads)
     {
@@ -271,8 +286,9 @@ __global__ void contextAttentionKernel(__nv_bfloat16 const* fusedQ, __nv_fp8_e4m
     {
         // topkIndicesPool is INT32 [numTokens, topK]. Negative values are padding and become -inf scores.
         int const kvIdx = topkIndicesPool[tokenIdx * topK + topkIdx];
+        bool const validKv = kvIdx >= 0;
         float partial = 0.0F;
-        if (kvIdx >= 0)
+        if (validKv)
         {
             // kvPtr points at FP8 [576] for one sparse KV row. The first 512 dims are V, all 576 dims are K.
             __nv_fp8_e4m3 const* kvPtr = kvCachePool + kvIdx * kHeadDim;
@@ -280,14 +296,14 @@ __global__ void contextAttentionKernel(__nv_bfloat16 const* fusedQ, __nv_fp8_e4m
             {
                 // Match the FP8-KV attention path by rounding BF16 fusedQ to E4M3 before the QK dot.
                 float const qFp8 = static_cast<float>(
-                    __nv_fp8_e4m3(toFloat(fusedQ[(tokenIdx * kLocalHeads + headIdx) * kHeadDim + dim])));
+                    __nv_fp8_e4m3(toFloat(fusedQ[(tokenIdx * kLocalHeads + headIdx) * kHeadDim + dim]) * kvQuantScale));
                 partial += qFp8 * toFloat(kvPtr[dim]);
             }
         }
         float const dot = blockReduceSum(partial, reduce);
         if (tid == 0)
         {
-            float const score = kvIdx >= 0 ? dot * scoreScale : -INFINITY;
+            float const score = validKv ? dot * scoreScaleLog2 : -INFINITY;
             weights[topkIdx] = score;
             maxScore = fmaxf(maxScore, score);
         }
@@ -298,11 +314,21 @@ __global__ void contextAttentionKernel(__nv_bfloat16 const* fusedQ, __nv_fp8_e4m
     if (tid == 0)
     {
         float denom = 0.0F;
-        for (int topkIdx = 0; topkIdx < topK; ++topkIdx)
+        if (maxScore != -INFINITY)
         {
-            float const weight = expf(weights[topkIdx] - maxScore);
-            weights[topkIdx] = weight;
-            denom += weight;
+            for (int topkIdx = 0; topkIdx < topK; ++topkIdx)
+            {
+                float const weight = exp2f(weights[topkIdx] - maxScore);
+                weights[topkIdx] = weight;
+                denom += weight;
+            }
+        }
+        else
+        {
+            for (int topkIdx = 0; topkIdx < topK; ++topkIdx)
+            {
+                weights[topkIdx] = 0.0F;
+            }
         }
         denomShared = denom;
     }
@@ -316,12 +342,16 @@ __global__ void contextAttentionKernel(__nv_bfloat16 const* fusedQ, __nv_fp8_e4m
         for (int topkIdx = 0; topkIdx < topK; ++topkIdx)
         {
             int const kvIdx = topkIndicesPool[tokenIdx * topK + topkIdx];
-            if (kvIdx >= 0)
+            bool const validKv = kvIdx >= 0;
+            if (validKv)
             {
-                acc += weights[topkIdx] * invDenom * toFloat(kvCachePool[kvIdx * kHeadDim + dim]);
+                float const prob = toFloat(toBfloat16(weights[topkIdx] * invDenom));
+                float const value = toFloat(toBfloat16(toFloat(kvCachePool[kvIdx * kHeadDim + dim])));
+                acc += prob * value;
             }
         }
-        output[(tokenIdx * kLocalHeads + headIdx) * kKvLoraRank + dim] = toBfloat16(acc * kvDequantScale);
+        float const accBf16 = toFloat(toBfloat16(acc));
+        output[(tokenIdx * kLocalHeads + headIdx) * kKvLoraRank + dim] = toBfloat16(accBf16 * kvDequantScale);
     }
 }
 
@@ -451,15 +481,14 @@ namespace dsv3_fused_mla
 //
 // Side effects:
 // - Mutates fused_q by writing rotated Q RoPE suffix.
-// - Mutates latent_cache by rotating the K RoPE suffix in-place.
-// - Mutates kv_cache by appending/writing the context latent KV rows.
+// - Mutates kv_cache by appending/writing the context latent KV rows with rotated K RoPE.
 //
 // Output:
 // - Returns BF16 [numTokens, 8 * 512], logically [numTokens, 8, 512]. Each row is the sparse
 //   softmax-weighted sum of FP8 latent V rows from kv_cache_pool, in original/BF16 units.
 torch::Tensor dsv3_fused_mla_context_cuda(torch::Tensor fused_q, torch::Tensor q_pe, torch::Tensor latent_cache,
-    torch::Tensor topk_indices_pool, torch::Tensor kv_cache_pool, torch::Tensor rotary_cos_sin,
-    torch::Tensor ctx_cached_token_indptr, tensorrt_llm::kernels::KVBlockArray kv_cache,
+    torch::Tensor topk_indices_pool, torch::Tensor topk_indices_local, torch::Tensor kv_cache_pool,
+    torch::Tensor rotary_cos_sin, torch::Tensor ctx_cached_token_indptr, tensorrt_llm::kernels::KVBlockArray kv_cache,
     std::optional<torch::Tensor> kv_scale_orig_quant, std::optional<torch::Tensor> kv_scale_quant_orig,
     bool has_fp8_kv_cache, double q_scaling)
 {
@@ -483,22 +512,27 @@ torch::Tensor dsv3_fused_mla_context_cuda(torch::Tensor fused_q, torch::Tensor q
     auto* outputPtr = static_cast<__nv_bfloat16*>(output.data_ptr());
 
     dim3 preprocessGrid(numTokens, kLocalHeads + 1);
+    int64_t const qPeStrideToken = q_pe.stride(0);
+    int64_t const qPeStrideHead = q_pe.stride(1);
     if (has_fp8_kv_cache)
     {
         preprocessContextKernel<true><<<preprocessGrid, kThreads, 0, stream>>>(fusedQPtr, latentCachePtr, qPePtr,
-            rotaryCosSinPtr, ctx_cached_token_indptr.data_ptr<int64_t>(), kv_cache, kvScaleOrigQuantPtr, numTokens);
+            rotaryCosSinPtr, ctx_cached_token_indptr.data_ptr<int64_t>(), kv_cache, kvScaleOrigQuantPtr, qPeStrideToken,
+            qPeStrideHead, numTokens);
     }
     else
     {
         preprocessContextKernel<false><<<preprocessGrid, kThreads, 0, stream>>>(fusedQPtr, latentCachePtr, qPePtr,
-            rotaryCosSinPtr, ctx_cached_token_indptr.data_ptr<int64_t>(), kv_cache, kvScaleOrigQuantPtr, numTokens);
+            rotaryCosSinPtr, ctx_cached_token_indptr.data_ptr<int64_t>(), kv_cache, kvScaleOrigQuantPtr, qPeStrideToken,
+            qPeStrideHead, numTokens);
     }
 
     float const hostScoreScale = 1.0F / (static_cast<float>(q_scaling) * sqrtf(256.0F));
     dim3 attentionGrid(numTokens, kLocalHeads);
     size_t const sharedBytes = (kThreads + std::min(topK, kMaxTopK)) * sizeof(float);
     contextAttentionKernel<<<attentionGrid, kThreads, sharedBytes, stream>>>(fusedQPtr, kvCachePoolPtr,
-        topk_indices_pool.data_ptr<int32_t>(), outputPtr, kvScaleQuantOrigPtr, numTokens, topK, hostScoreScale);
+        topk_indices_pool.data_ptr<int32_t>(), outputPtr, kvScaleOrigQuantPtr, kvScaleQuantOrigPtr, numTokens, topK,
+        hostScoreScale);
 
     sync_check_cuda_error(stream);
     return output;

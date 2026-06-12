@@ -41,11 +41,12 @@ from ..modules.linear import Linear, TensorParallelMode, WeightsLoadingConfig
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
 from ..peft.lora.layer import LoraLayer
+from .modeling_deepseekv3_mla_pytorch import dsv3_mla_context_pytorch
 
 _FUSED_MLA_MODE_ENV = "TRTLLM_DEEPSEEKV3_FUSED_MLA_MODE"
 _FUSED_MLA_CONTEXT_KERNEL_ENV = "TRTLLM_DEEPSEEKV3_FUSED_MLA_CONTEXT_KERNEL"
-_FUSED_MLA_GENERATION_KERNEL_ENV = "TRTLLM_DEEPSEEKV3_FUSED_MLA_GENERATION_KERNEL"
 FUSED_MLA_MODE_BASELINE = "baseline"
+FUSED_MLA_MODE_PYTORCH = "pytorch"
 FUSED_MLA_MODE_WIP = "wip"
 
 
@@ -61,6 +62,9 @@ def get_fused_mla_mode() -> str:
         "original": FUSED_MLA_MODE_BASELINE,
         "baseline": FUSED_MLA_MODE_BASELINE,
         "mla": FUSED_MLA_MODE_BASELINE,
+        "pytorch": FUSED_MLA_MODE_PYTORCH,
+        "torch": FUSED_MLA_MODE_PYTORCH,
+        "pytorch_mla": FUSED_MLA_MODE_PYTORCH,
         "1": FUSED_MLA_MODE_WIP,
         "true": FUSED_MLA_MODE_WIP,
         "on": FUSED_MLA_MODE_WIP,
@@ -69,7 +73,9 @@ def get_fused_mla_mode() -> str:
         "wip_fused_mla": FUSED_MLA_MODE_WIP,
     }
     if mode not in mode_aliases:
-        allowed_modes = ", ".join((FUSED_MLA_MODE_BASELINE, FUSED_MLA_MODE_WIP))
+        allowed_modes = ", ".join(
+            (FUSED_MLA_MODE_BASELINE, FUSED_MLA_MODE_PYTORCH, FUSED_MLA_MODE_WIP)
+        )
         raise ValueError(
             f"Unsupported {_FUSED_MLA_MODE_ENV}={mode!r}; expected one of: {allowed_modes}"
         )
@@ -1173,16 +1179,18 @@ class FusedMLA(nn.Module):
 
         position_ids_lifetime = position_ids
 
-        if _is_env_enabled(_FUSED_MLA_CONTEXT_KERNEL_ENV):
-            assert self.num_heads_tp == 8
-            assert self.num_heads_tp_cp == self.num_heads_tp
-            assert self.kv_lora_rank == 512
-            assert self.qk_rope_head_dim == 64
-            assert attn_metadata.num_contexts == 1
-            assert getattr(attn_metadata, "num_ctx_cached_tokens", 0) == 0
-            assert topk_indices is not None
-            assert hasattr(attn_metadata, "ctx_cached_token_indptr")
+        fused_mla_mode = get_fused_mla_mode()
 
+        assert self.num_heads_tp == 8
+        assert self.num_heads_tp_cp == self.num_heads_tp
+        assert self.kv_lora_rank == 512
+        assert self.qk_rope_head_dim == 64
+        assert attn_metadata.num_contexts == 1
+        assert getattr(attn_metadata, "num_ctx_cached_tokens", 0) == 0
+        assert topk_indices is not None
+        assert hasattr(attn_metadata, "ctx_cached_token_indptr")
+
+        if fused_mla_mode == FUSED_MLA_MODE_PYTORCH or fused_mla_mode == FUSED_MLA_MODE_WIP:
             self.mqa._ensure_rope_table_size(attn_metadata.max_seq_len)
             topk_indices_pool, kv_cache_pool = transform_local_topk_and_prepare_pool_view(
                 topk_indices,
@@ -1190,25 +1198,40 @@ class FusedMLA(nn.Module):
                 layer_idx=self.mqa.get_local_layer_idx(attn_metadata),
                 is_generation=False,
             )
-            attn_out_latent = torch.ops.trtllm.dsv3_fused_mla_context(
-                fused_q,
-                q_pe,
-                latent_cache,
-                topk_indices_pool,
-                kv_cache_pool,
-                self.mqa.rotary_cos_sin,
-                attn_metadata.ctx_cached_token_indptr,
-                attn_metadata.kv_cache_block_offsets,
-                attn_metadata.kv_cache_manager.kv_cache_pool_pointers,
-                attn_metadata.kv_cache_manager.kv_cache_pool_mapping,
-                self.mqa.kv_scale_orig_quant,
-                self.mqa.kv_scale_quant_orig,
-                self.mqa.get_local_layer_idx(attn_metadata),
-                attn_metadata.kv_cache_manager.tokens_per_block,
-                int(self.mqa.quant_mode),
-                float(self.mqa.q_scaling),
-            )
-        else:
+            layer_idx = self.mqa.get_local_layer_idx(attn_metadata)
+
+            if fused_mla_mode == FUSED_MLA_MODE_PYTORCH:
+                attn_out_latent = dsv3_mla_context_pytorch(
+                    fused_q,
+                    q_pe,
+                    latent_cache,
+                    topk_indices,
+                    topk_indices_pool,
+                    kv_cache_pool,
+                    attn_metadata,
+                    self.mqa,
+                )
+            else:
+                attn_out_latent = torch.ops.trtllm.dsv3_fused_mla_context(
+                    fused_q,
+                    q_pe,
+                    latent_cache,
+                    topk_indices_pool,
+                    topk_indices,
+                    kv_cache_pool,
+                    self.mqa.rotary_cos_sin,
+                    attn_metadata.ctx_cached_token_indptr,
+                    attn_metadata.kv_cache_block_offsets,
+                    attn_metadata.kv_cache_manager.kv_cache_pool_pointers,
+                    attn_metadata.kv_cache_manager.kv_cache_pool_mapping,
+                    self.mqa.kv_scale_orig_quant,
+                    self.mqa.kv_scale_quant_orig,
+                    layer_idx,
+                    attn_metadata.kv_cache_manager.tokens_per_block,
+                    int(self.mqa.quant_mode),
+                    float(self.mqa.q_scaling),
+                )
+        else:  # baseline mode
             fused_q = fused_q.view(
                 [num_tokens, self.num_heads_tp * (self.kv_lora_rank + self.qk_rope_head_dim)]
             )

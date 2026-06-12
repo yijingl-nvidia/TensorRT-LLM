@@ -1062,18 +1062,21 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         needs_tp_reduce = not self.enable_attention_dp and self.mapping.tp_size > 1
         needs_cp_reduce = mapping_with_cp is not None and mapping_with_cp.has_cp_helix(
         )
-        from .modeling_deepseekv3_fused_mla import (FUSED_MLA_MODE_WIP,
+        from .modeling_deepseekv3_fused_mla import (FUSED_MLA_MODE_PYTORCH,
+                                                    FUSED_MLA_MODE_WIP,
                                                     DeepseekV3FusedMLA,
                                                     DeepseekV32FusedMLA,
                                                     get_fused_mla_mode)
 
         fused_mla_mode = get_fused_mla_mode()
+        use_fused_mla = fused_mla_mode in (FUSED_MLA_MODE_PYTORCH,
+                                           FUSED_MLA_MODE_WIP)
         if config.model_type == "deepseek_v32":
-            attention_cls = (DeepseekV32FusedMLA if fused_mla_mode
-                             == FUSED_MLA_MODE_WIP else DeepseekV32Attention)
+            attention_cls = (DeepseekV32FusedMLA
+                             if use_fused_mla else DeepseekV32Attention)
         else:
-            attention_cls = (DeepseekV3FusedMLA if fused_mla_mode
-                             == FUSED_MLA_MODE_WIP else DeepseekV3Attention)
+            attention_cls = (DeepseekV3FusedMLA
+                             if use_fused_mla else DeepseekV3Attention)
 
         self.self_attn = attention_cls(
             model_config,

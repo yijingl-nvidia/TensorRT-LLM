@@ -119,6 +119,16 @@ def _get_scalar(scale: torch.Tensor | None, device: torch.device) -> torch.Tenso
     return scale.reshape(-1)[0].to(dtype=torch.float32, device=device)
 
 
+def _set_kv_cache_scale(attention: AttentionBackend, dequant_scale: float) -> None:
+    device = attention.kv_scale_quant_orig.device
+    attention.kv_scale_quant_orig = torch.tensor(
+        [dequant_scale], dtype=torch.float32, device=device
+    )
+    attention.kv_scale_orig_quant = torch.tensor(
+        [1.0 / dequant_scale], dtype=torch.float32, device=device
+    )
+
+
 def _rope_cos_sin_for_rotation(
     rope_cos_sin: torch.Tensor,
     max_positions: int,
@@ -226,7 +236,7 @@ def _torch_context_attention_reference(
 
     kv_scale_orig_quant = _get_scalar(attention.kv_scale_orig_quant, device)
     kv_scale_quant_orig = _get_scalar(attention.kv_scale_quant_orig, device)
-    quant_q_scale = torch.ones((), dtype=torch.float32, device=device)
+    quant_q_scale = kv_scale_orig_quant
     dequant_q_scale = kv_scale_quant_orig
     dequant_kv_scale = kv_scale_quant_orig
     bmm2_scale = kv_scale_quant_orig
@@ -236,7 +246,7 @@ def _torch_context_attention_reference(
         device=device,
     )
 
-    kv_cache_pool_ref = torch.empty_like(kv_cache_pool)
+    kv_cache_pool_ref = torch.zeros_like(kv_cache_pool)
     kv_cache_pool_ref[token_pool_rows.squeeze(-1).long(), 0, :] = (
         latent_cache.float() * kv_scale_orig_quant
     ).to(torch.float8_e4m3fn)
@@ -294,7 +304,46 @@ def _assert_context_attention_close(actual: torch.Tensor, expected: torch.Tensor
         raise AssertionError(message) from err
 
 
-def _build_attention_and_metadata() -> tuple[AttentionBackend, AttentionMetadata, _Config]:
+def _custom_context_attention(
+    fused_q: torch.Tensor,
+    q_pe: torch.Tensor,
+    latent_cache: torch.Tensor,
+    topk_indices: torch.Tensor,
+    attention: AttentionBackend,
+    metadata: AttentionMetadata,
+) -> torch.Tensor:
+    attention._ensure_rope_table_size(metadata.max_seq_len)
+    topk_indices_pool, kv_cache_pool = transform_local_topk_and_prepare_pool_view(
+        topk_indices,
+        metadata,
+        layer_idx=attention.get_local_layer_idx(metadata),
+        is_generation=False,
+    )
+    return torch.ops.trtllm.dsv3_fused_mla_context(
+        fused_q,
+        q_pe,
+        latent_cache,
+        topk_indices_pool,
+        topk_indices,
+        kv_cache_pool,
+        attention.rotary_cos_sin,
+        metadata.ctx_cached_token_indptr,
+        metadata.kv_cache_block_offsets,
+        metadata.kv_cache_manager.kv_cache_pool_pointers,
+        metadata.kv_cache_manager.kv_cache_pool_mapping,
+        attention.kv_scale_orig_quant,
+        attention.kv_scale_quant_orig,
+        attention.get_local_layer_idx(metadata),
+        metadata.kv_cache_manager.tokens_per_block,
+        int(attention.quant_mode),
+        float(attention.q_scaling),
+    )
+
+
+def _build_attention_and_metadata(
+    layer_idx: int = 0,
+    num_layers: int = 1,
+) -> tuple[AttentionBackend, AttentionMetadata, _Config]:
     config = _make_glm5_config()
     sparse_config = DeepSeekSparseAttentionConfig(
         index_n_heads=64,
@@ -317,7 +366,7 @@ def _build_attention_and_metadata() -> tuple[AttentionBackend, AttentionMetadata
     )
     attn_cls = get_attention_backend("TRTLLM", sparse_config)
     attention = attn_cls(
-        layer_idx=0,
+        layer_idx=layer_idx,
         num_heads=_LOCAL_NUM_HEADS,
         head_dim=_HEAD_DIM,
         num_kv_heads=_NUM_KV_HEADS,
@@ -339,11 +388,14 @@ def _build_attention_and_metadata() -> tuple[AttentionBackend, AttentionMetadata
     )
     kv_cache_manager = DSACacheManager(
         KvCacheConfig(
-            max_tokens=_TOKENS_PER_BLOCK * 4,
+            max_tokens=max(
+                _TOKENS_PER_BLOCK * 4,
+                math.ceil(_CONTEXT_SEQUENCE_LENGTH / _TOKENS_PER_BLOCK) * _TOKENS_PER_BLOCK,
+            ),
             enable_block_reuse=False,
         ),
         tensorrt_llm.bindings.internal.batch_manager.CacheType.SELFKONLY,
-        num_layers=1,
+        num_layers=num_layers,
         num_kv_heads=1,
         head_dim=_HEAD_DIM,
         tokens_per_block=_TOKENS_PER_BLOCK,
@@ -424,3 +476,137 @@ def test_glm5_fp8_context_attention_matches_pytorch_reference() -> None:
         )
 
     _assert_context_attention_close(actual, expected)
+
+
+def test_glm5_fp8_context_custom_op_matches_pytorch_reference_with_strided_q_pe() -> None:
+    _require_glm5_context_attention_runtime()
+    device = torch.device("cuda")
+    torch.manual_seed(321)
+    torch.cuda.manual_seed(321)
+
+    attention, metadata, _ = _build_attention_and_metadata()
+    _set_kv_cache_scale(attention, dequant_scale=0.5)
+    fused_q = (
+        torch.randn(
+            _CONTEXT_SEQUENCE_LENGTH,
+            _LOCAL_NUM_HEADS,
+            _HEAD_DIM,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        * 0.125
+    )
+    q_for_split = (
+        torch.randn(
+            _CONTEXT_SEQUENCE_LENGTH,
+            _LOCAL_NUM_HEADS,
+            _QK_HEAD_DIM,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        * 0.125
+    )
+    _, q_pe = q_for_split.split([_QK_NOPE_HEAD_DIM, _QK_ROPE_HEAD_DIM], dim=-1)
+    assert q_pe.stride() == (
+        _LOCAL_NUM_HEADS * _QK_HEAD_DIM,
+        _QK_HEAD_DIM,
+        1,
+    )
+    assert not q_pe.is_contiguous()
+
+    latent_cache = (
+        torch.randn(
+            _CONTEXT_SEQUENCE_LENGTH,
+            _HEAD_DIM,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        * 0.125
+    )
+    topk_indices = _build_causal_topk(device)
+
+    with torch.inference_mode():
+        expected = _torch_context_attention_reference(
+            fused_q,
+            q_pe,
+            latent_cache,
+            topk_indices,
+            attention,
+            metadata,
+        )
+        actual_latent_cache = latent_cache.clone()
+        latent_cache_before = actual_latent_cache.clone()
+        actual = _custom_context_attention(
+            fused_q.clone(),
+            q_pe,
+            actual_latent_cache,
+            topk_indices,
+            attention,
+            metadata,
+        )
+
+    _assert_context_attention_close(actual, expected)
+    torch.testing.assert_close(actual_latent_cache, latent_cache_before, rtol=0.0, atol=0.0)
+
+
+def test_glm5_fp8_context_custom_op_matches_pytorch_reference_for_nonzero_layer() -> None:
+    _require_glm5_context_attention_runtime()
+    device = torch.device("cuda")
+    torch.manual_seed(456)
+    torch.cuda.manual_seed(456)
+
+    attention, metadata, _ = _build_attention_and_metadata(layer_idx=1, num_layers=2)
+    fused_q = (
+        torch.randn(
+            _CONTEXT_SEQUENCE_LENGTH,
+            _LOCAL_NUM_HEADS,
+            _HEAD_DIM,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        * 0.125
+    )
+    q_for_split = (
+        torch.randn(
+            _CONTEXT_SEQUENCE_LENGTH,
+            _LOCAL_NUM_HEADS,
+            _QK_HEAD_DIM,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        * 0.125
+    )
+    _, q_pe = q_for_split.split([_QK_NOPE_HEAD_DIM, _QK_ROPE_HEAD_DIM], dim=-1)
+    latent_cache = (
+        torch.randn(
+            _CONTEXT_SEQUENCE_LENGTH,
+            _HEAD_DIM,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        * 0.125
+    )
+    topk_indices = _build_causal_topk(device)
+
+    with torch.inference_mode():
+        expected = _torch_context_attention_reference(
+            fused_q,
+            q_pe,
+            latent_cache,
+            topk_indices,
+            attention,
+            metadata,
+        )
+        actual_latent_cache = latent_cache.clone()
+        latent_cache_before = actual_latent_cache.clone()
+        actual = _custom_context_attention(
+            fused_q.clone(),
+            q_pe,
+            actual_latent_cache,
+            topk_indices,
+            attention,
+            metadata,
+        )
+
+    _assert_context_attention_close(actual, expected)
+    torch.testing.assert_close(actual_latent_cache, latent_cache_before, rtol=0.0, atol=0.0)
