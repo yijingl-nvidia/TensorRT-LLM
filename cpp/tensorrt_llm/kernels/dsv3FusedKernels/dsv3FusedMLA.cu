@@ -365,7 +365,8 @@ __global__ void contextAttentionKernel(__nv_bfloat16 const* fusedQ, __nv_fp8_e4m
 
 __global__ void generationAttentionKernel(__nv_fp8_e4m3 const* quantQ, __nv_fp8_e4m3 const* kvCachePool,
     int32_t const* topkIndicesPool, int32_t const* topkIndicesLocal, int32_t const* sequenceLength,
-    __nv_bfloat16* output, float const* bmm1Scale, float const* bmm2Scale, int numTokens, int topK)
+    int32_t const* specDecodingPackedMask, int specMaskWords, __nv_bfloat16* output, float const* bmm1Scale,
+    float const* bmm2Scale, int numTokens, int topK)
 {
     // One CUDA block computes one (generation query token, local head) row.
     // Current Python dispatch restricts this custom path to one generation sequence, but numTokens may be
@@ -378,10 +379,28 @@ __global__ void generationAttentionKernel(__nv_fp8_e4m3 const* quantQ, __nv_fp8_
     int const headIdx = static_cast<int>(blockIdx.y);
     int const tid = threadIdx.x;
     // sequenceLength is INT32 [1] after mla_rope_generation appended the entire numTokens decode chunk.
-    // For row tokenIdx, valid local KV positions are:
-    //   [0, sequenceLength[0] - numTokens + tokenIdx]
-    // Example: old length 100 and numTokens 4 -> rows can attend through 100, 101, 102, 103 respectively.
-    int const localKvEnd = sequenceLength[0] - numTokens + tokenIdx;
+    // Historical rows before currentGroupStart are always valid when selected by topK. Rows inside the current
+    // decode/MTP group are filtered either by the packed spec-decoding mask or by the local causal order.
+    __shared__ int currentGroupStartShared;
+    if (tid == 0)
+    {
+        int currentGroupStart = sequenceLength[0] - numTokens;
+        if (sequenceLength[0] <= numTokens)
+        {
+            int maxLocalIdx = -1;
+            for (int idx = 0; idx < numTokens * topK; ++idx)
+            {
+                maxLocalIdx = max(maxLocalIdx, topkIndicesLocal[idx]);
+            }
+            if (maxLocalIdx >= numTokens)
+            {
+                currentGroupStart = maxLocalIdx - (numTokens - 1);
+            }
+        }
+        currentGroupStartShared = currentGroupStart;
+    }
+    __syncthreads();
+    int const currentGroupStart = currentGroupStartShared;
     // bmm1Scale[1] is already in log2 space. Using exp2f() below matches TRTLLM-Gen's softmax convention.
     float const scoreScaleLog2 = bmm1Scale == nullptr ? 1.4426950408889634F : bmm1Scale[1];
     // bmm2Scale[0] dequantizes FP8 V/cache values before storing BF16 latent output.
@@ -400,14 +419,34 @@ __global__ void generationAttentionKernel(__nv_fp8_e4m3 const* quantQ, __nv_fp8_
         // topkIndicesLocal: INT32 [numTokens, topK], original local KV position for causal validity.
         int const kvIdx = topkIndicesPool[tokenIdx * topK + topkIdx];
         int const localKvIdx = topkIndicesLocal[tokenIdx * topK + topkIdx];
-        bool const validKv = kvIdx >= 0 && localKvIdx >= 0 && localKvIdx <= localKvEnd;
+        int const currentGroupOffset = localKvIdx - currentGroupStart;
+        bool const historicalKv = localKvIdx >= 0 && localKvIdx < currentGroupStart;
+        bool const currentGroupKv = currentGroupOffset >= 0 && currentGroupOffset < numTokens;
+        bool currentGroupValid = false;
+        if (currentGroupKv)
+        {
+            if (specDecodingPackedMask != nullptr && specMaskWords > 0)
+            {
+                int const wordIdx = currentGroupOffset / 32;
+                int const bitIdx = currentGroupOffset % 32;
+                uint32_t const packed
+                    = static_cast<uint32_t>(specDecodingPackedMask[tokenIdx * specMaskWords + wordIdx]);
+                currentGroupValid = ((packed >> bitIdx) & 1U) != 0U;
+            }
+            else
+            {
+                currentGroupValid = currentGroupOffset <= tokenIdx;
+            }
+        }
+        bool const validKv = kvIdx >= 0 && (historicalKv || (currentGroupKv && currentGroupValid));
         float partial = 0.0F;
         if (validKv)
         {
             // quantQ is FP8 [numTokens, 8, 576]. It was produced by mla_rope_generation, not by this kernel.
             __nv_fp8_e4m3 const* qPtr = quantQ + (tokenIdx * kLocalHeads + headIdx) * kHeadDim;
             // kvCachePool is FP8 [poolTokens, 1, 576] viewed as [poolTokens, 576].
-            __nv_fp8_e4m3 const* kvPtr = kvCachePool + kvIdx * kHeadDim;
+            int64_t const kvOffset = static_cast<int64_t>(kvIdx) * kHeadDim;
+            __nv_fp8_e4m3 const* kvPtr = kvCachePool + kvOffset;
             for (int dim = tid; dim < kHeadDim; dim += blockDim.x)
             {
                 partial += toFloat(qPtr[dim]) * toFloat(kvPtr[dim]);
@@ -427,11 +466,21 @@ __global__ void generationAttentionKernel(__nv_fp8_e4m3 const* quantQ, __nv_fp8_
     if (tid == 0)
     {
         float denom = 0.0F;
-        for (int topkIdx = 0; topkIdx < topK; ++topkIdx)
+        if (maxScore != -INFINITY)
         {
-            float const weight = exp2f(weights[topkIdx] - maxScore);
-            weights[topkIdx] = weight;
-            denom += weight;
+            for (int topkIdx = 0; topkIdx < topK; ++topkIdx)
+            {
+                float const weight = exp2f(weights[topkIdx] - maxScore);
+                weights[topkIdx] = weight;
+                denom += weight;
+            }
+        }
+        else
+        {
+            for (int topkIdx = 0; topkIdx < topK; ++topkIdx)
+            {
+                weights[topkIdx] = 0.0F;
+            }
         }
         denomShared = denom;
     }
@@ -445,10 +494,30 @@ __global__ void generationAttentionKernel(__nv_fp8_e4m3 const* quantQ, __nv_fp8_
         {
             int const kvIdx = topkIndicesPool[tokenIdx * topK + topkIdx];
             int const localKvIdx = topkIndicesLocal[tokenIdx * topK + topkIdx];
-            bool const validKv = kvIdx >= 0 && localKvIdx >= 0 && localKvIdx <= localKvEnd;
+            int const currentGroupOffset = localKvIdx - currentGroupStart;
+            bool const historicalKv = localKvIdx >= 0 && localKvIdx < currentGroupStart;
+            bool const currentGroupKv = currentGroupOffset >= 0 && currentGroupOffset < numTokens;
+            bool currentGroupValid = false;
+            if (currentGroupKv)
+            {
+                if (specDecodingPackedMask != nullptr && specMaskWords > 0)
+                {
+                    int const wordIdx = currentGroupOffset / 32;
+                    int const bitIdx = currentGroupOffset % 32;
+                    uint32_t const packed
+                        = static_cast<uint32_t>(specDecodingPackedMask[tokenIdx * specMaskWords + wordIdx]);
+                    currentGroupValid = ((packed >> bitIdx) & 1U) != 0U;
+                }
+                else
+                {
+                    currentGroupValid = currentGroupOffset <= tokenIdx;
+                }
+            }
+            bool const validKv = kvIdx >= 0 && (historicalKv || (currentGroupKv && currentGroupValid));
             if (validKv)
             {
-                acc += weights[topkIdx] * invDenom * toFloat(kvCachePool[kvIdx * kHeadDim + dim]);
+                int64_t const kvOffset = static_cast<int64_t>(kvIdx) * kHeadDim + dim;
+                acc += weights[topkIdx] * invDenom * toFloat(kvCachePool[kvOffset]);
             }
         }
         output[(tokenIdx * kLocalHeads + headIdx) * kKvLoraRank + dim] = toBfloat16(acc * outputScale);
@@ -552,7 +621,8 @@ torch::Tensor dsv3_fused_mla_context_cuda(torch::Tensor fused_q, torch::Tensor q
 
 torch::Tensor dsv3_fused_mla_generation_cuda(torch::Tensor fused_q, torch::Tensor topk_indices_pool,
     torch::Tensor topk_indices, torch::Tensor kv_cache_pool, torch::Tensor sequence_length,
-    torch::Tensor quant_q_buffer, torch::Tensor mla_bmm1_scale, torch::Tensor mla_bmm2_scale)
+    torch::Tensor quant_q_buffer, torch::Tensor mla_bmm1_scale, torch::Tensor mla_bmm2_scale,
+    std::optional<torch::Tensor> spec_decoding_packed_mask)
 {
     // fused_q is BF16 [numTokens, 8, 576]. The generation attention kernel does not read it directly, but its
     // shape/device/dtype define the output allocation and are checked in the THOP wrapper.
@@ -567,12 +637,17 @@ torch::Tensor dsv3_fused_mla_generation_cuda(torch::Tensor fused_q, torch::Tenso
     auto* quantQPtr = reinterpret_cast<__nv_fp8_e4m3 const*>(quant_q_buffer.data_ptr());
     auto* kvCachePoolPtr = reinterpret_cast<__nv_fp8_e4m3 const*>(kv_cache_pool.data_ptr());
     auto* outputPtr = static_cast<__nv_bfloat16*>(output.data_ptr());
+    int32_t const* specDecodingPackedMaskPtr
+        = spec_decoding_packed_mask.has_value() ? spec_decoding_packed_mask.value().data_ptr<int32_t>() : nullptr;
+    int const specMaskWords
+        = spec_decoding_packed_mask.has_value() ? static_cast<int>(spec_decoding_packed_mask.value().size(-1)) : 0;
 
     dim3 attentionGrid(numTokens, kLocalHeads);
     size_t const sharedBytes = (kThreads + topK) * sizeof(float);
     generationAttentionKernel<<<attentionGrid, kThreads, sharedBytes, stream>>>(quantQPtr, kvCachePoolPtr,
         topk_indices_pool.data_ptr<int32_t>(), topk_indices.data_ptr<int32_t>(), sequence_length.data_ptr<int32_t>(),
-        outputPtr, mla_bmm1_scale.data_ptr<float>(), mla_bmm2_scale.data_ptr<float>(), numTokens, topK);
+        specDecodingPackedMaskPtr, specMaskWords, outputPtr, mla_bmm1_scale.data_ptr<float>(),
+        mla_bmm2_scale.data_ptr<float>(), numTokens, topK);
 
     sync_check_cuda_error(stream);
     return output;

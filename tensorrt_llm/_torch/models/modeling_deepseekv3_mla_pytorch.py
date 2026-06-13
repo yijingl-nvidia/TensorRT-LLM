@@ -366,3 +366,155 @@ def dsv3_mla_context_pytorch(
     _ = topk_indices_pool
     # [num_tokens, 4096], bfloat16
     return torch.cat(rows, dim=0).to(torch.bfloat16)
+
+
+def dsv3_mla_decode_pytorch(
+    quant_q_buffer: torch.Tensor,
+    topk_indices: torch.Tensor,
+    topk_indices_pool: torch.Tensor,
+    kv_cache_pool: torch.Tensor,
+    sequence_length: torch.Tensor,
+    mla_bmm1_scale: torch.Tensor,
+    mla_bmm2_scale: torch.Tensor,
+    spec_decoding_packed_mask: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """Run the GLM-5 FP8 sparse MLA decode attention in PyTorch.
+
+    This is the reference path for the BS=1, MTP=3 generation/decode fused
+    MLA branch. It consumes the buffers filled by 'mla_rope_generation':
+    rotated and FP8-quantized Q, current-step latent KV rows already appended
+    into the paged KV cache, top-k local indices, and top-k pool rows. The
+    computation mirrors the TRTLLM generation path by doing FP8 QK scaled
+    matrix multiplies, applying historical/current-group decode validity, using
+    the log2-domain softmax scale produced by 'mla_rope_generation', and
+    projecting FP8 latent V rows back to BF16.
+
+    Args
+    - quant_q_buffer: torch.Tensor, shape [num_tokens, 8, 576], uint8 storage
+      reinterpreted as float8_e4m3fn, rotated and quantized query rows.
+    - topk_indices: torch.Tensor, shape [num_tokens, top_k], int32, local KV
+      positions before pool conversion.
+    - topk_indices_pool: torch.Tensor, shape [num_tokens, top_k], int32, global
+      rows into 'kv_cache_pool'. Negative entries are padding.
+    - kv_cache_pool: torch.Tensor, shape [pool_tokens, 1, 576], float8_e4m3fn,
+      flattened view of the primary paged KV-cache pool.
+    - sequence_length: torch.Tensor, shape [1], int32, post-append KV length
+      for the single generation sequence.
+    - mla_bmm1_scale: torch.Tensor, shape [2], float32, score scale where index
+      1 is already multiplied by log2(e).
+    - mla_bmm2_scale: torch.Tensor, shape [1], float32, FP8 V dequantization
+      scale for the latent output.
+    - spec_decoding_packed_mask: Optional[torch.Tensor], shape
+      [max_requests, num_tokens, packed_words], int32, current-group attention
+      mask for speculative/MTP decode. Historical KV rows are always valid.
+
+    Returns
+    - torch.Tensor, shape [num_tokens, 4096], bfloat16, latent attention output
+      flattened across 8 local heads and 512 latent value dimensions.
+    """
+    num_tokens, num_heads, head_dim = quant_q_buffer.shape
+    assert num_heads == 8
+    assert head_dim == 576
+    assert kv_cache_pool.shape[1:] == (1, 576)
+
+    # scalar int32
+    current_group_start = sequence_length[0] - num_tokens
+    # scalar int32
+    max_local_index = topk_indices.clamp_min(0).max()
+    # CUDA graph warmup can capture generation with a dummy post-append length
+    # of 'num_tokens'. For the BS=1 1k prompt path, topK covers the full KV
+    # sequence, so the largest local top-k index recovers the real group end.
+    # scalar int32
+    inferred_group_start = max_local_index - (num_tokens - 1)
+    # scalar bool
+    use_inferred_group_start = (sequence_length[0] <= num_tokens) & (max_local_index >= num_tokens)
+    # scalar int32
+    current_group_start = torch.where(
+        use_inferred_group_start,
+        inferred_group_start,
+        current_group_start,
+    )
+    # [num_tokens, top_k], int32
+    current_group_offset = topk_indices - current_group_start
+    # [num_tokens, top_k], bool
+    historical_kv = topk_indices < current_group_start
+    # [num_tokens, top_k], bool
+    current_group_kv = (current_group_offset >= 0) & (current_group_offset < num_tokens)
+    if spec_decoding_packed_mask is None:
+        # [num_tokens], int32
+        token_positions = torch.arange(
+            num_tokens,
+            dtype=topk_indices.dtype,
+            device=topk_indices.device,
+        )
+        # [num_tokens, top_k], bool
+        current_group_valid = current_group_offset <= token_positions[:, None]
+    else:
+        # [num_tokens, packed_words], int32
+        packed_mask = spec_decoding_packed_mask[0, :num_tokens, :].to(topk_indices.dtype)
+        # [num_tokens, top_k], int32
+        packed_word_idx = torch.div(
+            current_group_offset.clamp_min(0),
+            32,
+            rounding_mode="floor",
+        )
+        # [num_tokens, top_k], int32
+        packed_bit_idx = current_group_offset.clamp(0, 31)
+        # [num_tokens, top_k], int32
+        packed_words = packed_mask.gather(
+            1,
+            packed_word_idx.clamp_max(packed_mask.shape[1] - 1).to(torch.long),
+        )
+        # [num_tokens, top_k], bool
+        current_group_valid = torch.bitwise_and(
+            torch.bitwise_right_shift(packed_words, packed_bit_idx),
+            1,
+        ).to(torch.bool)
+
+    # [num_tokens, top_k], bool
+    valid = (topk_indices_pool >= 0) & (historical_kv | (current_group_kv & current_group_valid))
+    # [num_tokens, top_k], int64
+    pool_indices = topk_indices_pool.clamp_min(0).to(torch.long)
+
+    # [num_tokens, 8, 576], float8_e4m3fn
+    q = quant_q_buffer.view(torch.float8_e4m3fn)
+    # [num_tokens, top_k, 576], float8_e4m3fn
+    kv_fp8 = kv_cache_pool[:, 0, :][pool_indices]
+    # scalar float32
+    mm_scale = torch.ones((), dtype=torch.float32, device=quant_q_buffer.device)
+    # [num_tokens, 8, top_k], float32
+    scores = torch.stack(
+        [
+            torch._scaled_mm(
+                q[token_idx],
+                kv_fp8[token_idx].transpose(0, 1).contiguous(),
+                scale_a=mm_scale,
+                scale_b=mm_scale,
+                out_dtype=torch.float32,
+            )
+            for token_idx in range(num_tokens)
+        ],
+        dim=0,
+    )
+    # [num_tokens, 8, top_k], float32
+    scores = scores * mla_bmm1_scale[1]
+    # [num_tokens, 8, top_k], float32
+    scores = scores.masked_fill(~valid[:, None, :], -float("inf"))
+
+    # [num_tokens, 8, 1], float32
+    max_scores = scores.max(dim=-1, keepdim=True).values
+    # [num_tokens, 8, top_k], float32
+    weights = torch.exp2(scores - max_scores)
+    # [num_tokens, 8, top_k], float32
+    weights = weights.masked_fill(~valid[:, None, :], 0.0)
+    # [num_tokens, 8, top_k], float32
+    weights = weights / weights.sum(dim=-1, keepdim=True).clamp_min(1.0e-20)
+
+    # [num_tokens, top_k, 576], float32
+    kv = kv_fp8.to(torch.float32)
+    # [num_tokens, 8, 512], float32
+    output = torch.einsum("thk,tkd->thd", weights, kv[..., :512])
+    # [num_tokens, 8, 512], float32
+    output = output * mla_bmm2_scale[0]
+    # [num_tokens, 4096], bfloat16
+    return output.to(torch.bfloat16).reshape(num_tokens, num_heads * 512)

@@ -36,7 +36,8 @@ torch::Tensor dsv3_fused_mla_context_cuda(torch::Tensor fused_q, torch::Tensor q
     bool has_fp8_kv_cache, double q_scaling);
 torch::Tensor dsv3_fused_mla_generation_cuda(torch::Tensor fused_q, torch::Tensor topk_indices_pool,
     torch::Tensor topk_indices, torch::Tensor kv_cache_pool, torch::Tensor sequence_length,
-    torch::Tensor quant_q_buffer, torch::Tensor mla_bmm1_scale, torch::Tensor mla_bmm2_scale);
+    torch::Tensor quant_q_buffer, torch::Tensor mla_bmm1_scale, torch::Tensor mla_bmm2_scale,
+    std::optional<torch::Tensor> spec_decoding_packed_mask);
 } // namespace dsv3_fused_mla
 
 namespace tensorrt_llm
@@ -164,6 +165,12 @@ th::Tensor dsv3_fused_mla_generation(th::Tensor fused_q, th::Tensor q_pe, th::Te
     TORCH_CHECK(mla_bmm2_scale.value().is_cuda(), "mla_bmm2_scale must be a CUDA tensor");
     TORCH_CHECK(quant_q_buffer.has_value(), "quant_q_buffer is required for GLM-5 fused MLA generation");
     TORCH_CHECK(quant_q_buffer.value().is_cuda(), "quant_q_buffer must be a CUDA tensor");
+    if (spec_decoding_packed_mask.has_value())
+    {
+        TORCH_CHECK(spec_decoding_packed_mask.value().is_cuda(), "spec_decoding_packed_mask must be a CUDA tensor");
+        TORCH_CHECK(spec_decoding_packed_mask.value().scalar_type() == torch::kInt32,
+            "spec_decoding_packed_mask must be int32");
+    }
 
     TORCH_CHECK(fused_q.scalar_type() == torch::kBFloat16, "GLM-5 fused MLA generation currently expects bf16 fused_q");
     TORCH_CHECK(q_pe.scalar_type() == torch::kBFloat16, "GLM-5 fused MLA generation currently expects bf16 q_pe");
@@ -245,7 +252,6 @@ th::Tensor dsv3_fused_mla_generation(th::Tensor fused_q, th::Tensor q_pe, th::Te
     (void) is_spec_dec_tree;
     (void) spec_decoding_generation_lengths;
     (void) spec_decoding_position_offsets;
-    (void) spec_decoding_packed_mask;
     (void) spec_decoding_bl_tree_mask_offset;
     (void) spec_decoding_bl_tree_mask;
     (void) spec_bl_tree_first_sparse_mask_offset_kv;
@@ -273,7 +279,8 @@ th::Tensor dsv3_fused_mla_generation(th::Tensor fused_q, th::Tensor q_pe, th::Te
 
     return dsv3_fused_mla::dsv3_fused_mla_generation_cuda(std::move(fused_q), std::move(topk_indices_pool),
         std::move(topk_indices), std::move(kv_cache_pool), std::move(sequence_length),
-        std::move(quant_q_buffer.value()), std::move(mla_bmm1_scale.value()), std::move(mla_bmm2_scale.value()));
+        std::move(quant_q_buffer.value()), std::move(mla_bmm1_scale.value()), std::move(mla_bmm2_scale.value()),
+        std::move(spec_decoding_packed_mask));
 }
 
 } // namespace torch_ext

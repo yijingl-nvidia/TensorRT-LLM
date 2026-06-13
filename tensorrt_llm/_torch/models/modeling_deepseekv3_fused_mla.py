@@ -41,7 +41,7 @@ from ..modules.linear import Linear, TensorParallelMode, WeightsLoadingConfig
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
 from ..peft.lora.layer import LoraLayer
-from .modeling_deepseekv3_mla_pytorch import dsv3_mla_context_pytorch
+from .modeling_deepseekv3_mla_pytorch import dsv3_mla_context_pytorch, dsv3_mla_decode_pytorch
 
 _FUSED_MLA_MODE_ENV = "TRTLLM_DEEPSEEKV3_FUSED_MLA_MODE"
 _FUSED_MLA_CONTEXT_KERNEL_ENV = "TRTLLM_DEEPSEEKV3_FUSED_MLA_CONTEXT_KERNEL"
@@ -87,86 +87,6 @@ def _is_env_enabled(env_name: str, default: bool = True) -> bool:
     if value is None:
         return default
     return value.strip().lower() not in {"0", "false", "off", "no"}
-
-
-def _dsv3_fused_mla_generation_torch(
-    quant_q_buffer: torch.Tensor,
-    topk_indices: torch.Tensor,
-    topk_indices_pool: torch.Tensor,
-    kv_cache_pool: torch.Tensor,
-    sequence_length: torch.Tensor,
-    mla_bmm1_scale: torch.Tensor,
-    mla_bmm2_scale: torch.Tensor,
-    spec_decoding_packed_mask: Optional[torch.Tensor],
-) -> torch.Tensor:
-    """GLM-5 BS=1 MTP=3 sparse MLA generation reference in PyTorch.
-
-    Shapes are fixed by the target benchmark:
-    - quant_q_buffer: uint8-backed FP8 E4M3 [4, 8, 576].
-    - topk_indices: int32 [4, topK], local KV positions before pool conversion.
-    - topk_indices_pool: int32 [4, topK], with negative padding entries.
-    - kv_cache_pool: FP8 E4M3 [pool_tokens, 1, 576].
-    - sequence_length: int32 [1], total KV length after appending the four decode rows.
-    - spec_decoding_packed_mask: optional int32 [max_requests, 4, 1]. For the
-      current four-row decode group, bit k says whether query row t may attend
-      to current-group row k. Historical KV rows before the group are always
-      valid if selected by topK.
-    - return: BF16 [4, 8 * 512].
-    """
-    num_tokens, num_heads, head_dim = quant_q_buffer.shape
-    assert num_tokens == 4
-    assert num_heads == 8
-    assert head_dim == 576
-    assert kv_cache_pool.shape[1:] == (1, 576)
-
-    current_group_start = sequence_length[0] - num_tokens
-    current_group_offset = topk_indices - current_group_start
-    historical_kv = topk_indices < current_group_start
-    current_group_kv = (current_group_offset >= 0) & (current_group_offset < num_tokens)
-    if spec_decoding_packed_mask is None:
-        current_group_valid = (
-            current_group_offset
-            <= torch.arange(num_tokens, dtype=topk_indices.dtype, device=topk_indices.device)[
-                :, None
-            ]
-        )
-    else:
-        packed_mask = spec_decoding_packed_mask[0, :num_tokens, 0].to(topk_indices.dtype)
-        current_group_bit = torch.bitwise_right_shift(
-            packed_mask[:, None], current_group_offset.clamp(0, 31)
-        )
-        current_group_valid = torch.bitwise_and(current_group_bit, 1).to(torch.bool)
-    valid = (topk_indices_pool >= 0) & (historical_kv | (current_group_kv & current_group_valid))
-    pool_indices = topk_indices_pool.clamp_min(0).to(torch.long)
-
-    q = quant_q_buffer.view(torch.float8_e4m3fn)
-    kv_fp8 = kv_cache_pool[:, 0, :][pool_indices]
-    mm_scale = torch.ones((), dtype=torch.float32, device=quant_q_buffer.device)
-    scores = torch.stack(
-        [
-            torch._scaled_mm(
-                q[token_idx],
-                kv_fp8[token_idx].transpose(0, 1).contiguous(),
-                scale_a=mm_scale,
-                scale_b=mm_scale,
-                out_dtype=torch.float32,
-            )
-            for token_idx in range(num_tokens)
-        ],
-        dim=0,
-    )
-    scores = scores * mla_bmm1_scale[1]
-    scores = scores.masked_fill(~valid[:, None, :], -float("inf"))
-
-    max_scores = scores.max(dim=-1, keepdim=True).values
-    weights = torch.exp2(scores - max_scores)
-    weights = weights.masked_fill(~valid[:, None, :], 0.0)
-    weights = weights / weights.sum(dim=-1, keepdim=True).clamp_min(1.0e-20)
-
-    kv = kv_fp8.to(torch.float32)
-    output = torch.einsum("thk,tkd->thd", weights, kv[..., :512])
-    output = output * mla_bmm2_scale[0]
-    return output.to(torch.bfloat16).reshape(num_tokens, num_heads * 512)
 
 
 class DeepseekV3Linear(Linear):
@@ -1005,17 +925,16 @@ class FusedMLA(nn.Module):
 
         position_ids_lifetime = position_ids
 
-        # use_generation_kernel = (
-        #     _is_env_enabled(_FUSED_MLA_GENERATION_KERNEL_ENV)
-        #     and num_tokens == 4
-        #     and num_seqs == 1
-        #     and topk_indices is not None
-        #     and quant_q_buffer is not None
-        #     and mla_bmm1_scale is not None
-        #     and mla_bmm2_scale is not None
-        # )
-
-        use_generation_kernel = False
+        fused_mla_mode = get_fused_mla_mode()
+        use_generation_kernel = (
+            fused_mla_mode in (FUSED_MLA_MODE_PYTORCH, FUSED_MLA_MODE_WIP)
+            and num_tokens == self.predicted_tokens_per_seq
+            and num_seqs == 1
+            and topk_indices is not None
+            and quant_q_buffer is not None
+            and mla_bmm1_scale is not None
+            and mla_bmm2_scale is not None
+        )
 
         if use_generation_kernel:
             self.mqa._ensure_rope_table_size(attn_metadata.max_seq_len)
@@ -1025,16 +944,85 @@ class FusedMLA(nn.Module):
                 layer_idx=self.mqa.get_local_layer_idx(attn_metadata),
                 is_generation=True,
             )
-            attn_out_latent = _dsv3_fused_mla_generation_torch(
-                quant_q_buffer,
-                topk_indices,
-                topk_indices_pool,
-                kv_cache_pool,
-                attn_metadata.kv_lens_cuda_runtime,
-                mla_bmm1_scale,
-                mla_bmm2_scale,
-                attn_metadata.spec_decoding_packed_mask,
-            )
+            if fused_mla_mode == FUSED_MLA_MODE_PYTORCH:
+                attn_out_latent = dsv3_mla_decode_pytorch(
+                    quant_q_buffer,
+                    topk_indices,
+                    topk_indices_pool,
+                    kv_cache_pool,
+                    attn_metadata.kv_lens_cuda_runtime,
+                    mla_bmm1_scale,
+                    mla_bmm2_scale,
+                    attn_metadata.spec_decoding_packed_mask,
+                )
+            else:
+                rope_params = self.mqa.rope_params
+                workspace = (
+                    attn_metadata.cuda_graph_workspace
+                    if attn_metadata.is_cuda_graph
+                    else attn_metadata.workspace
+                )
+                attn_out_latent = torch.ops.trtllm.dsv3_fused_mla_generation(
+                    fused_q,
+                    q_pe,
+                    latent_cache,
+                    topk_indices,
+                    topk_indices_pool,
+                    kv_cache_pool,
+                    workspace,
+                    attn_metadata.kv_lens_cuda_runtime,
+                    attn_metadata.kv_lens_runtime,
+                    attn_metadata.host_total_kv_lens,
+                    attn_metadata.prompt_lens_cuda_runtime,
+                    attn_metadata.prompt_lens_cpu_runtime,
+                    attn_metadata.host_request_types_runtime,
+                    self.mqa.rotary_cos_sin,
+                    self.mqa.rotary_inv_freq,
+                    attn_metadata.cache_indirection,
+                    getattr(attn_metadata, "block_ids_per_seq", None),
+                    attn_metadata.kv_cache_block_offsets,
+                    attn_metadata.kv_cache_manager.kv_cache_pool_pointers,
+                    attn_metadata.kv_cache_manager.kv_cache_pool_mapping,
+                    self.mqa.kv_scale_orig_quant,
+                    self.mqa.kv_scale_quant_orig,
+                    cu_q_seqlens,
+                    cu_kv_seqlens,
+                    fmha_scheduler_counter,
+                    mla_bmm1_scale,
+                    mla_bmm2_scale,
+                    quant_q_buffer,
+                    attn_metadata.is_spec_decoding_enabled,
+                    attn_metadata.use_spec_decoding,
+                    attn_metadata.is_spec_dec_tree,
+                    attn_metadata.spec_decoding_generation_lengths,
+                    attn_metadata.spec_decoding_position_offsets,
+                    attn_metadata.spec_decoding_packed_mask,
+                    attn_metadata.spec_decoding_bl_tree_mask_offset,
+                    attn_metadata.spec_decoding_bl_tree_mask,
+                    attn_metadata.spec_bl_tree_first_sparse_mask_offset_kv,
+                    self.mqa.get_local_layer_idx(attn_metadata),
+                    attn_metadata.kv_cache_manager.tokens_per_block,
+                    int(self.mqa.quant_mode),
+                    float(self.mqa.q_scaling),
+                    self.mqa.position_embedding_type,
+                    rope_params.dim,
+                    rope_params.theta,
+                    int(rope_params.scale_type),
+                    rope_params.scale,
+                    rope_params.short_m_scale,
+                    rope_params.long_m_scale,
+                    rope_params.max_positions,
+                    rope_params.original_max_positions,
+                    self.predicted_tokens_per_seq,
+                    self.q_lora_rank,
+                    self.qk_nope_head_dim,
+                    attn_metadata.max_num_requests,
+                    min(attn_metadata.max_seq_len - 1, attn_metadata.max_num_tokens),
+                    attn_metadata.max_seq_len,
+                    attn_metadata.beam_width,
+                    attn_metadata.num_contexts,
+                    attn_metadata.num_ctx_tokens,
+                )
         else:
             fused_q = fused_q.view(
                 [num_tokens, self.num_heads_tp * (self.kv_lora_rank + self.qk_rope_head_dim)]
@@ -1186,6 +1174,8 @@ class FusedMLA(nn.Module):
         assert self.kv_lora_rank == 512
         assert self.qk_rope_head_dim == 64
         assert attn_metadata.num_contexts == 1
+        # Current fused context paths only attend over the current prefill segment.
+        # Chunked prefill/cache-reuse needs cached-prefix reads before this assert can be relaxed.
         assert getattr(attn_metadata, "num_ctx_cached_tokens", 0) == 0
         assert topk_indices is not None
         assert hasattr(attn_metadata, "ctx_cached_token_indptr")

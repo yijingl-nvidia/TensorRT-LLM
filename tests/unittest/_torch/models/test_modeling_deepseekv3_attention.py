@@ -35,6 +35,7 @@ from tensorrt_llm._torch.attention_backend.sparse.dsa import (
 from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.models.modeling_deepseekv3_mla_pytorch import dsv3_mla_decode_pytorch
 from tensorrt_llm._utils import get_sm_version, str_dtype_to_binding, torch_dtype_to_str
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.functional import PositionEmbeddingType
@@ -55,6 +56,8 @@ _QK_HEAD_DIM = _QK_NOPE_HEAD_DIM + _QK_ROPE_HEAD_DIM
 _HIDDEN_SIZE = 6144
 _PREDICTED_TOKENS_PER_SEQ = 4
 _CONTEXT_SEQUENCE_LENGTH = 64
+_BENCH_CONTEXT_SEQUENCE_LENGTH = 1070
+_DECODE_NUM_TOKENS = _PREDICTED_TOKENS_PER_SEQ
 _INDEX_TOPK = 2048
 _TOKENS_PER_BLOCK = 32
 _MAX_POSITION_EMBEDDINGS = 4096
@@ -182,6 +185,27 @@ def _build_causal_topk(device: torch.device) -> torch.Tensor:
         topk_indices[token_idx, :valid_len] = torch.arange(
             token_idx + 1 - valid_len,
             token_idx + 1,
+            dtype=torch.int32,
+            device=device,
+        )
+    return topk_indices
+
+
+def _build_decode_topk(
+    device: torch.device,
+    context_sequence_length: int = _CONTEXT_SEQUENCE_LENGTH,
+) -> torch.Tensor:
+    topk_indices = torch.full(
+        (_DECODE_NUM_TOKENS, _INDEX_TOPK),
+        -1,
+        dtype=torch.int32,
+        device=device,
+    )
+    for token_idx in range(_DECODE_NUM_TOKENS):
+        valid_len = min(context_sequence_length + token_idx + 1, _INDEX_TOPK)
+        topk_indices[token_idx, :valid_len] = torch.arange(
+            context_sequence_length + token_idx + 1 - valid_len,
+            context_sequence_length + token_idx + 1,
             dtype=torch.int32,
             device=device,
         )
@@ -424,6 +448,212 @@ def _build_attention_and_metadata(
     return attention, metadata, config
 
 
+def _build_decode_attention_and_metadata(
+    layer_idx: int = 0,
+    num_layers: int = 1,
+    context_sequence_length: int = _CONTEXT_SEQUENCE_LENGTH,
+) -> tuple[AttentionBackend, AttentionMetadata, _Config]:
+    config = _make_glm5_config()
+    sparse_config = DeepSeekSparseAttentionConfig(
+        index_n_heads=64,
+        index_head_dim=128,
+        index_topk=_INDEX_TOPK,
+        skip_indexer_for_short_seqs=False,
+    )
+    mapping = Mapping(world_size=1, tp_size=1, rank=0)
+    quant_config = QuantConfig(kv_cache_quant_algo=QuantAlgo.FP8)
+    model_config = ModelConfig(
+        pretrained_config=config,
+        mapping=mapping,
+        quant_config=quant_config,
+        sparse_attention_config=sparse_config,
+    )
+    pos_embd_params = PositionalEmbeddingParams(
+        type=PositionEmbeddingType.yarn,
+        rope=RopeParams.from_config(config),
+        is_neox=False,
+    )
+    attn_cls = get_attention_backend("TRTLLM", sparse_config)
+    attention = attn_cls(
+        layer_idx=layer_idx,
+        num_heads=_LOCAL_NUM_HEADS,
+        head_dim=_HEAD_DIM,
+        num_kv_heads=_NUM_KV_HEADS,
+        quant_config=quant_config,
+        q_scaling=_compute_q_scaling(config),
+        pos_embd_params=pos_embd_params,
+        mla_params=MLAParams(
+            q_lora_rank=_Q_LORA_RANK,
+            kv_lora_rank=_KV_LORA_RANK,
+            qk_rope_head_dim=_QK_ROPE_HEAD_DIM,
+            qk_nope_head_dim=_QK_NOPE_HEAD_DIM,
+            v_head_dim=_V_HEAD_DIM,
+            rope_append=True,
+            predicted_tokens_per_seq=_PREDICTED_TOKENS_PER_SEQ,
+            hidden_size=_HIDDEN_SIZE,
+        ),
+        sparse_attention_config=sparse_config,
+        dtype=torch.bfloat16,
+    )
+    max_seq_len = context_sequence_length + _DECODE_NUM_TOKENS
+    kv_cache_manager = DSACacheManager(
+        KvCacheConfig(
+            max_tokens=max(
+                _TOKENS_PER_BLOCK * 4,
+                math.ceil(max_seq_len / _TOKENS_PER_BLOCK) * _TOKENS_PER_BLOCK,
+            ),
+            enable_block_reuse=False,
+        ),
+        tensorrt_llm.bindings.internal.batch_manager.CacheType.SELFKONLY,
+        num_layers=num_layers,
+        num_kv_heads=1,
+        head_dim=_HEAD_DIM,
+        tokens_per_block=_TOKENS_PER_BLOCK,
+        max_seq_len=max_seq_len,
+        max_batch_size=1,
+        mapping=mapping,
+        dtype=str_dtype_to_binding(torch_dtype_to_str(torch.float8_e4m3fn)),
+        sparse_attn_config=sparse_config,
+        model_config=model_config,
+    )
+    kv_cache_manager.add_dummy_requests([0], [max_seq_len])
+
+    metadata = attn_cls.Metadata(
+        seq_lens=torch.tensor([_DECODE_NUM_TOKENS], dtype=torch.int),
+        request_ids=[0],
+        max_num_requests=1,
+        num_contexts=0,
+        prompt_lens=[context_sequence_length],
+        max_num_tokens=_DECODE_NUM_TOKENS,
+        kv_cache_manager=kv_cache_manager,
+        kv_cache_params=KVCacheParams(
+            use_cache=True,
+            num_cached_tokens_per_seq=[context_sequence_length],
+        ),
+        mapping=mapping,
+        sparse_attention_config=sparse_config,
+    )
+    metadata.prepare()
+    return attention, metadata, config
+
+
+def _seed_decode_history_kv_cache(
+    attention: AttentionBackend,
+    metadata: AttentionMetadata,
+    device: torch.device,
+    context_sequence_length: int = _CONTEXT_SEQUENCE_LENGTH,
+) -> torch.Tensor:
+    history_indices = torch.arange(
+        context_sequence_length,
+        dtype=torch.int32,
+        device=device,
+    ).expand(_DECODE_NUM_TOKENS, -1)
+    history_pool_indices, kv_cache_pool = transform_local_topk_and_prepare_pool_view(
+        history_indices,
+        metadata,
+        layer_idx=attention.get_local_layer_idx(metadata),
+        is_generation=True,
+    )
+    kv_scale_orig_quant = _get_scalar(attention.kv_scale_orig_quant, device)
+    history_cache = (
+        torch.randn(
+            context_sequence_length,
+            _HEAD_DIM,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        * 0.125
+    )
+    history_cache_fp8 = (history_cache.float() * kv_scale_orig_quant).to(torch.float8_e4m3fn)
+    kv_cache_pool.view(torch.uint8).index_copy_(
+        0,
+        history_pool_indices[0].to(torch.long),
+        history_cache_fp8.view(torch.uint8).unsqueeze(1),
+    )
+    return kv_cache_pool
+
+
+def _custom_decode_attention(
+    fused_q: torch.Tensor,
+    q_pe: torch.Tensor,
+    latent_cache: torch.Tensor,
+    topk_indices: torch.Tensor,
+    topk_indices_pool: torch.Tensor,
+    kv_cache_pool: torch.Tensor,
+    attention: AttentionBackend,
+    metadata: AttentionMetadata,
+    cu_q_seqlens: torch.Tensor,
+    cu_kv_seqlens: torch.Tensor,
+    fmha_scheduler_counter: torch.Tensor,
+    mla_bmm1_scale: torch.Tensor,
+    mla_bmm2_scale: torch.Tensor,
+    quant_q_buffer: torch.Tensor,
+    spec_decoding_packed_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    rope_params = attention.rope_params
+    return torch.ops.trtllm.dsv3_fused_mla_generation(
+        fused_q,
+        q_pe,
+        latent_cache,
+        topk_indices,
+        topk_indices_pool,
+        kv_cache_pool,
+        metadata.workspace,
+        metadata.kv_lens_cuda_runtime,
+        metadata.kv_lens_runtime,
+        metadata.host_total_kv_lens,
+        metadata.prompt_lens_cuda_runtime,
+        metadata.prompt_lens_cpu_runtime,
+        metadata.host_request_types_runtime,
+        attention.rotary_cos_sin,
+        attention.rotary_inv_freq,
+        metadata.cache_indirection,
+        getattr(metadata, "block_ids_per_seq", None),
+        metadata.kv_cache_block_offsets,
+        metadata.kv_cache_manager.kv_cache_pool_pointers,
+        metadata.kv_cache_manager.kv_cache_pool_mapping,
+        attention.kv_scale_orig_quant,
+        attention.kv_scale_quant_orig,
+        cu_q_seqlens,
+        cu_kv_seqlens,
+        fmha_scheduler_counter,
+        mla_bmm1_scale,
+        mla_bmm2_scale,
+        quant_q_buffer,
+        metadata.is_spec_decoding_enabled,
+        metadata.use_spec_decoding,
+        metadata.is_spec_dec_tree,
+        metadata.spec_decoding_generation_lengths,
+        metadata.spec_decoding_position_offsets,
+        spec_decoding_packed_mask,
+        metadata.spec_decoding_bl_tree_mask_offset,
+        metadata.spec_decoding_bl_tree_mask,
+        metadata.spec_bl_tree_first_sparse_mask_offset_kv,
+        attention.get_local_layer_idx(metadata),
+        metadata.kv_cache_manager.tokens_per_block,
+        int(attention.quant_mode),
+        float(attention.q_scaling),
+        attention.position_embedding_type,
+        rope_params.dim,
+        rope_params.theta,
+        int(rope_params.scale_type),
+        rope_params.scale,
+        rope_params.short_m_scale,
+        rope_params.long_m_scale,
+        rope_params.max_positions,
+        rope_params.original_max_positions,
+        _PREDICTED_TOKENS_PER_SEQ,
+        _Q_LORA_RANK,
+        _QK_NOPE_HEAD_DIM,
+        metadata.max_num_requests,
+        min(metadata.max_seq_len - 1, metadata.max_num_tokens),
+        metadata.max_seq_len,
+        metadata.beam_width,
+        metadata.num_contexts,
+        metadata.num_ctx_tokens,
+    )
+
+
 def test_glm5_fp8_context_attention_matches_pytorch_reference() -> None:
     _require_glm5_context_attention_runtime()
     device = torch.device("cuda")
@@ -475,6 +705,458 @@ def test_glm5_fp8_context_attention_matches_pytorch_reference() -> None:
             is_generation=False,
         )
 
+    _assert_context_attention_close(actual, expected)
+
+
+def test_glm5_fp8_decode_attention_matches_pytorch_reference() -> None:
+    _require_glm5_context_attention_runtime()
+    device = torch.device("cuda")
+    torch.manual_seed(234)
+    torch.cuda.manual_seed(234)
+
+    attention, metadata, _ = _build_decode_attention_and_metadata()
+    kv_cache_pool = _seed_decode_history_kv_cache(attention, metadata, device)
+    fused_q = (
+        torch.randn(
+            _DECODE_NUM_TOKENS,
+            _LOCAL_NUM_HEADS,
+            _HEAD_DIM,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        * 0.125
+    )
+    q_pe = (
+        torch.randn(
+            _DECODE_NUM_TOKENS,
+            _LOCAL_NUM_HEADS,
+            _QK_ROPE_HEAD_DIM,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        * 0.125
+    )
+    latent_cache = (
+        torch.randn(
+            _DECODE_NUM_TOKENS,
+            _HEAD_DIM,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        * 0.125
+    )
+    topk_indices = _build_decode_topk(device)
+
+    num_seqs = metadata.kv_lens_cuda_runtime.size(0)
+    cu_q_seqlens = torch.empty(num_seqs + 1, dtype=torch.int32, device=device)
+    cu_kv_seqlens = torch.empty(num_seqs + 1, dtype=torch.int32, device=device)
+    fmha_scheduler_counter = torch.empty(1, dtype=torch.uint32, device=device)
+    mla_bmm1_scale = torch.empty(2, dtype=torch.float32, device=device)
+    mla_bmm2_scale = torch.empty(1, dtype=torch.float32, device=device)
+    quant_q_buffer = torch.empty(
+        _DECODE_NUM_TOKENS,
+        _LOCAL_NUM_HEADS,
+        _HEAD_DIM,
+        dtype=torch.uint8,
+        device=device,
+    )
+
+    with torch.inference_mode():
+        attention.mla_rope_generation(
+            fused_q,
+            q_pe,
+            latent_cache,
+            metadata,
+            cu_q_seqlens,
+            cu_kv_seqlens,
+            fmha_scheduler_counter,
+            mla_bmm1_scale,
+            mla_bmm2_scale,
+            quant_q_buffer,
+        )
+        topk_indices_pool, kv_cache_pool = transform_local_topk_and_prepare_pool_view(
+            topk_indices,
+            metadata,
+            layer_idx=attention.get_local_layer_idx(metadata),
+            is_generation=True,
+        )
+        expected = attention.forward(
+            fused_q.reshape(_DECODE_NUM_TOKENS, _LOCAL_NUM_HEADS * _HEAD_DIM),
+            None,
+            None,
+            metadata,
+            attention_input_type=AttentionInputType.generation_only,
+            latent_cache=latent_cache,
+            q_pe=q_pe,
+            topk_indices=topk_indices,
+            is_generation=True,
+            cu_q_seqlens=cu_q_seqlens,
+            cu_kv_seqlens=cu_kv_seqlens,
+            fmha_scheduler_counter=fmha_scheduler_counter,
+            mla_bmm1_scale=mla_bmm1_scale,
+            mla_bmm2_scale=mla_bmm2_scale,
+            quant_q_buffer=quant_q_buffer,
+        )
+        actual = dsv3_mla_decode_pytorch(
+            quant_q_buffer,
+            topk_indices,
+            topk_indices_pool,
+            kv_cache_pool,
+            metadata.kv_lens_cuda_runtime,
+            mla_bmm1_scale,
+            mla_bmm2_scale,
+            metadata.spec_decoding_packed_mask,
+        )
+
+    _assert_context_attention_close(actual, expected)
+
+
+def test_glm5_fp8_decode_custom_op_matches_pytorch_reference_with_spec_mask() -> None:
+    _require_glm5_context_attention_runtime()
+    device = torch.device("cuda")
+    torch.manual_seed(345)
+    torch.cuda.manual_seed(345)
+
+    attention, metadata, _ = _build_decode_attention_and_metadata(
+        context_sequence_length=_BENCH_CONTEXT_SEQUENCE_LENGTH,
+    )
+    _seed_decode_history_kv_cache(
+        attention,
+        metadata,
+        device,
+        context_sequence_length=_BENCH_CONTEXT_SEQUENCE_LENGTH,
+    )
+    fused_q = (
+        torch.randn(
+            _DECODE_NUM_TOKENS,
+            _LOCAL_NUM_HEADS,
+            _HEAD_DIM,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        * 0.125
+    )
+    q_pe = (
+        torch.randn(
+            _DECODE_NUM_TOKENS,
+            _LOCAL_NUM_HEADS,
+            _QK_ROPE_HEAD_DIM,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        * 0.125
+    )
+    latent_cache = (
+        torch.randn(
+            _DECODE_NUM_TOKENS,
+            _HEAD_DIM,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        * 0.125
+    )
+    topk_indices = _build_decode_topk(
+        device,
+        context_sequence_length=_BENCH_CONTEXT_SEQUENCE_LENGTH,
+    )
+    spec_decoding_packed_mask = torch.tensor(
+        [[[1], [1], [5], [13]]],
+        dtype=torch.int32,
+        device=device,
+    )
+
+    num_seqs = metadata.kv_lens_cuda_runtime.size(0)
+    cu_q_seqlens = torch.empty(num_seqs + 1, dtype=torch.int32, device=device)
+    cu_kv_seqlens = torch.empty(num_seqs + 1, dtype=torch.int32, device=device)
+    fmha_scheduler_counter = torch.empty(1, dtype=torch.uint32, device=device)
+    mla_bmm1_scale = torch.empty(2, dtype=torch.float32, device=device)
+    mla_bmm2_scale = torch.empty(1, dtype=torch.float32, device=device)
+    quant_q_buffer = torch.empty(
+        _DECODE_NUM_TOKENS,
+        _LOCAL_NUM_HEADS,
+        _HEAD_DIM,
+        dtype=torch.uint8,
+        device=device,
+    )
+
+    with torch.inference_mode():
+        attention.mla_rope_generation(
+            fused_q,
+            q_pe,
+            latent_cache,
+            metadata,
+            cu_q_seqlens,
+            cu_kv_seqlens,
+            fmha_scheduler_counter,
+            mla_bmm1_scale,
+            mla_bmm2_scale,
+            quant_q_buffer,
+        )
+        topk_indices_pool, kv_cache_pool = transform_local_topk_and_prepare_pool_view(
+            topk_indices,
+            metadata,
+            layer_idx=attention.get_local_layer_idx(metadata),
+            is_generation=True,
+        )
+        expected = dsv3_mla_decode_pytorch(
+            quant_q_buffer,
+            topk_indices,
+            topk_indices_pool,
+            kv_cache_pool,
+            metadata.kv_lens_cuda_runtime,
+            mla_bmm1_scale,
+            mla_bmm2_scale,
+            spec_decoding_packed_mask,
+        )
+        actual = _custom_decode_attention(
+            fused_q,
+            q_pe,
+            latent_cache,
+            topk_indices,
+            topk_indices_pool,
+            kv_cache_pool,
+            attention,
+            metadata,
+            cu_q_seqlens,
+            cu_kv_seqlens,
+            fmha_scheduler_counter,
+            mla_bmm1_scale,
+            mla_bmm2_scale,
+            quant_q_buffer,
+            spec_decoding_packed_mask,
+        )
+
+    _assert_context_attention_close(actual, expected)
+
+
+def test_glm5_fp8_decode_custom_op_cuda_graph_replay_infers_stale_sequence_length() -> None:
+    _require_glm5_context_attention_runtime()
+    device = torch.device("cuda")
+    torch.manual_seed(567)
+    torch.cuda.manual_seed(567)
+
+    attention, metadata, _ = _build_decode_attention_and_metadata(
+        context_sequence_length=_BENCH_CONTEXT_SEQUENCE_LENGTH,
+    )
+    _seed_decode_history_kv_cache(
+        attention,
+        metadata,
+        device,
+        context_sequence_length=_BENCH_CONTEXT_SEQUENCE_LENGTH,
+    )
+    fused_q = (
+        torch.randn(
+            _DECODE_NUM_TOKENS,
+            _LOCAL_NUM_HEADS,
+            _HEAD_DIM,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        * 0.125
+    )
+    q_pe = (
+        torch.randn(
+            _DECODE_NUM_TOKENS,
+            _LOCAL_NUM_HEADS,
+            _QK_ROPE_HEAD_DIM,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        * 0.125
+    )
+    latent_cache = (
+        torch.randn(
+            _DECODE_NUM_TOKENS,
+            _HEAD_DIM,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        * 0.125
+    )
+    topk_indices = _build_decode_topk(
+        device,
+        context_sequence_length=_BENCH_CONTEXT_SEQUENCE_LENGTH,
+    )
+
+    num_seqs = metadata.kv_lens_cuda_runtime.size(0)
+    cu_q_seqlens = torch.empty(num_seqs + 1, dtype=torch.int32, device=device)
+    cu_kv_seqlens = torch.empty(num_seqs + 1, dtype=torch.int32, device=device)
+    fmha_scheduler_counter = torch.empty(1, dtype=torch.uint32, device=device)
+    mla_bmm1_scale = torch.empty(2, dtype=torch.float32, device=device)
+    mla_bmm2_scale = torch.empty(1, dtype=torch.float32, device=device)
+    quant_q_buffer = torch.empty(
+        _DECODE_NUM_TOKENS,
+        _LOCAL_NUM_HEADS,
+        _HEAD_DIM,
+        dtype=torch.uint8,
+        device=device,
+    )
+
+    attention.mla_rope_generation(
+        fused_q,
+        q_pe,
+        latent_cache,
+        metadata,
+        cu_q_seqlens,
+        cu_kv_seqlens,
+        fmha_scheduler_counter,
+        mla_bmm1_scale,
+        mla_bmm2_scale,
+        quant_q_buffer,
+    )
+    topk_indices_pool, kv_cache_pool = transform_local_topk_and_prepare_pool_view(
+        topk_indices,
+        metadata,
+        layer_idx=attention.get_local_layer_idx(metadata),
+        is_generation=True,
+    )
+    _custom_decode_attention(
+        fused_q,
+        q_pe,
+        latent_cache,
+        topk_indices,
+        topk_indices_pool,
+        kv_cache_pool,
+        attention,
+        metadata,
+        cu_q_seqlens,
+        cu_kv_seqlens,
+        fmha_scheduler_counter,
+        mla_bmm1_scale,
+        mla_bmm2_scale,
+        quant_q_buffer,
+    )
+    torch.cuda.synchronize()
+
+    metadata.kv_lens_cuda_runtime.fill_(_DECODE_NUM_TOKENS)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = _custom_decode_attention(
+            fused_q,
+            q_pe,
+            latent_cache,
+            topk_indices,
+            topk_indices_pool,
+            kv_cache_pool,
+            attention,
+            metadata,
+            cu_q_seqlens,
+            cu_kv_seqlens,
+            fmha_scheduler_counter,
+            mla_bmm1_scale,
+            mla_bmm2_scale,
+            quant_q_buffer,
+        )
+
+    graph.replay()
+    expected = dsv3_mla_decode_pytorch(
+        quant_q_buffer,
+        topk_indices,
+        topk_indices_pool,
+        kv_cache_pool,
+        metadata.kv_lens_cuda_runtime,
+        mla_bmm1_scale,
+        mla_bmm2_scale,
+        metadata.spec_decoding_packed_mask,
+    )
+
+    _assert_context_attention_close(actual, expected)
+
+
+def test_glm5_fp8_decode_custom_op_handles_large_pool_indices() -> None:
+    _require_glm5_context_attention_runtime()
+    device = torch.device("cuda")
+    torch.manual_seed(678)
+    torch.cuda.manual_seed(678)
+
+    overflow_pool_row = 7_680_000
+    pool_rows = overflow_pool_row + torch.arange(
+        _DECODE_NUM_TOKENS,
+        dtype=torch.int32,
+        device=device,
+    )
+    required_bytes = (overflow_pool_row + _DECODE_NUM_TOKENS) * _HEAD_DIM
+    free_bytes, _ = torch.cuda.mem_get_info(device)
+    if free_bytes < required_bytes + (1 << 30):
+        pytest.skip("large-pool-index regression test needs about 5.5 GiB of free GPU memory")
+
+    attention, metadata, _ = _build_decode_attention_and_metadata()
+    topk_indices = torch.arange(
+        _DECODE_NUM_TOKENS,
+        dtype=torch.int32,
+        device=device,
+    ).unsqueeze(1)
+    topk_indices_pool = pool_rows.unsqueeze(1)
+    kv_cache_pool = torch.zeros(
+        (overflow_pool_row + _DECODE_NUM_TOKENS, 1, _HEAD_DIM),
+        dtype=torch.float8_e4m3fn,
+        device=device,
+    )
+    kv_rows = (
+        torch.randn(
+            _DECODE_NUM_TOKENS,
+            _HEAD_DIM,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        * 0.125
+    ).to(torch.float8_e4m3fn)
+    kv_cache_pool[pool_rows.to(torch.long), 0, :] = kv_rows
+
+    fused_q = torch.empty(
+        _DECODE_NUM_TOKENS,
+        _LOCAL_NUM_HEADS,
+        _HEAD_DIM,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    q_pe = torch.empty(
+        _DECODE_NUM_TOKENS,
+        _LOCAL_NUM_HEADS,
+        _QK_ROPE_HEAD_DIM,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    latent_cache = torch.empty(
+        _DECODE_NUM_TOKENS,
+        _HEAD_DIM,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    quant_q_buffer = torch.zeros_like(fused_q, dtype=torch.uint8)
+    cu_q_seqlens = torch.empty(2, dtype=torch.int32, device=device)
+    cu_kv_seqlens = torch.empty(2, dtype=torch.int32, device=device)
+    fmha_scheduler_counter = torch.empty(1, dtype=torch.uint32, device=device)
+    mla_bmm1_scale = torch.tensor([1.0, 1.0], dtype=torch.float32, device=device)
+    mla_bmm2_scale = torch.tensor([1.0], dtype=torch.float32, device=device)
+    metadata.kv_lens_cuda_runtime.fill_(_DECODE_NUM_TOKENS)
+
+    with torch.inference_mode():
+        actual = _custom_decode_attention(
+            fused_q,
+            q_pe,
+            latent_cache,
+            topk_indices,
+            topk_indices_pool,
+            kv_cache_pool,
+            attention,
+            metadata,
+            cu_q_seqlens,
+            cu_kv_seqlens,
+            fmha_scheduler_counter,
+            mla_bmm1_scale,
+            mla_bmm2_scale,
+            quant_q_buffer,
+        )
+
+    expected = (
+        kv_rows[:, :_KV_LORA_RANK]
+        .to(torch.float32)
+        .unsqueeze(1)
+        .expand(_DECODE_NUM_TOKENS, _LOCAL_NUM_HEADS, _KV_LORA_RANK)
+        .reshape(_DECODE_NUM_TOKENS, _LOCAL_NUM_HEADS * _KV_LORA_RANK)
+        .to(torch.bfloat16)
+    )
     _assert_context_attention_close(actual, expected)
 
 
