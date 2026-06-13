@@ -926,17 +926,14 @@ class FusedMLA(nn.Module):
         position_ids_lifetime = position_ids
 
         fused_mla_mode = get_fused_mla_mode()
-        use_generation_kernel = (
-            fused_mla_mode in (FUSED_MLA_MODE_PYTORCH, FUSED_MLA_MODE_WIP)
-            and num_tokens == self.predicted_tokens_per_seq
-            and num_seqs == 1
-            and topk_indices is not None
-            and quant_q_buffer is not None
-            and mla_bmm1_scale is not None
-            and mla_bmm2_scale is not None
-        )
+        assert num_tokens == self.predicted_tokens_per_seq
+        assert num_seqs == 1
+        assert topk_indices is not None
+        assert quant_q_buffer is not None
+        assert mla_bmm1_scale is not None
+        assert mla_bmm2_scale is not None
 
-        if use_generation_kernel:
+        if fused_mla_mode in (FUSED_MLA_MODE_PYTORCH, FUSED_MLA_MODE_WIP):
             self.mqa._ensure_rope_table_size(attn_metadata.max_seq_len)
             topk_indices_pool, kv_cache_pool = transform_local_topk_and_prepare_pool_view(
                 topk_indices,
