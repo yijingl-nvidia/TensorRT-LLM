@@ -175,7 +175,7 @@ __device__ __forceinline__ float blockReduceSum(float value, float* shared)
 // - blockIdx.y selects the preprocessing role:
 //   - [0, kLocalHeads) rotates one per-head Q RoPE suffix from qPe into fusedQ.
 //   - kLocalHeads reads the shared latent K RoPE suffix from latentCache, rotates it, then writes the full
-//     latent KV row into the temporary current-context KV tensor and the paged KV cache.
+//     latent KV row into the paged KV cache.
 // - threadIdx.x is used as a strided lane over RoPE pairs or full 576-dim KV elements.
 //
 // Inputs and mutable tensors:
@@ -189,21 +189,18 @@ __device__ __forceinline__ float blockReduceSum(float value, float* shared)
 // - ctxCachedTokenIndptr: INT64 [numContexts + 1]. The current custom path is restricted to one context request;
 //   ctxCachedTokenIndptr[1] - ctxCachedTokenIndptr[0] is the already-cached prefix length for sequence 0.
 // - kvCache: paged TRT-LLM KV cache view with one MLA KV head and kHeadDim elements per token.
-// - contextKvFp8: mutable FP8 E4M3 [numTokens, kHeadDim]. The KV branch writes the compact current-context
-//   cache consumed by contextAttentionKernel.
 // - kvScaleOrigQuant: optional FP32 [1]. BF16 latentCache values are multiplied by this original-domain to
-//   FP8 scale before storing to contextKvFp8 and, when kFp8KvCache is true, the paged KV cache.
+//   FP8 scale before storing to the paged KV cache when kFp8KvCache is true.
 // - numTokens: number of context tokens in fusedQ/qPe/latentCache.
 //
 // Side effects:
 // - Q branch mutates fusedQ[token, head, kKvLoraRank:kHeadDim].
-// - KV branch writes latentCache[token, :] to contextKvFp8 and kvCache with a rotated K RoPE suffix.
-// - The function does not produce a returned tensor; contextAttentionKernel consumes fusedQ and contextKvFp8 later.
+// - KV branch writes latentCache[token, :] to kvCache with a rotated K RoPE suffix.
+// - The function does not produce a returned tensor; contextAttentionKernel consumes fusedQ and kvCachePool later.
 template <bool kFp8KvCache>
 __global__ void preprocessContextKernel(__nv_bfloat16* fusedQ, __nv_bfloat16* latentCache, __nv_bfloat16 const* qPe,
     float2 const* rotaryCosSin, int64_t const* ctxCachedTokenIndptr, tensorrt_llm::kernels::KVBlockArray kvCache,
-    __nv_fp8_e4m3* contextKvFp8, float const* kvScaleOrigQuant, int64_t qPeStrideToken, int64_t qPeStrideHead,
-    int numTokens)
+    float const* kvScaleOrigQuant, int64_t qPeStrideToken, int64_t qPeStrideHead, int numTokens)
 {
     // Grid shape is [numTokens, kLocalHeads + 1].
     // - blockIdx.x selects one context token row.
@@ -281,13 +278,11 @@ __global__ void preprocessContextKernel(__nv_bfloat16* fusedQ, __nv_bfloat16* la
         int const cacheOffset = kvCache.getKVLocalIdx(tokenIdxInKvCache, /*headIdx=*/0, kHeadDim, dim);
         // Load latentCache[tokenIdx, dim] as BF16; this part does not use RoPE.
         __nv_bfloat16 const value = latentCache[tokenIdx * kHeadDim + dim];
-        // Quantize BF16 original-domain value to FP8 E4M3 using the same cache quantization scale as TRTLLM MLA.
-        __nv_fp8_e4m3 const quantized = __nv_fp8_e4m3(toFloat(value) * kvScale);
-        // Save an FP8 current-context copy for contextAttentionKernel, avoiding reads from paged cache pages.
-        contextKvFp8[tokenIdx * kHeadDim + dim] = quantized;
-        // Write the same value to the real paged KV cache so later decode steps can attend to this prefix.
+        // Write the value to the real paged KV cache so this context attention and later decode steps can read it.
         if constexpr (kFp8KvCache)
         {
+            // Quantize BF16 original-domain value to FP8 E4M3 using the same cache quantization scale as TRTLLM MLA.
+            __nv_fp8_e4m3 const quantized = __nv_fp8_e4m3(toFloat(value) * kvScale);
             // FP8 KV-cache mode stores the quantized byte directly.
             reinterpret_cast<__nv_fp8_e4m3*>(blockPtr)[cacheOffset] = quantized;
         }
@@ -323,17 +318,13 @@ __global__ void preprocessContextKernel(__nv_bfloat16* fusedQ, __nv_bfloat16* la
         __nv_bfloat16 const first = toBfloat16(rotated.x);
         // Round the second rotated scalar to BF16 before optional FP8 quantization.
         __nv_bfloat16 const second = toBfloat16(rotated.y);
-        // Quantize the first rounded scalar for the temporary FP8 context KV and FP8 paged cache.
-        __nv_fp8_e4m3 const quantizedFirst = __nv_fp8_e4m3(toFloat(first) * kvScale);
-        // Quantize the second rounded scalar for the temporary FP8 context KV and FP8 paged cache.
-        __nv_fp8_e4m3 const quantizedSecond = __nv_fp8_e4m3(toFloat(second) * kvScale);
-        // Save the first rotated K suffix component in the temporary current-context FP8 buffer.
-        contextKvFp8[tokenIdx * kHeadDim + kKvLoraRank + dim] = quantizedFirst;
-        // Save the second rotated K suffix component in the temporary current-context FP8 buffer.
-        contextKvFp8[tokenIdx * kHeadDim + kKvLoraRank + dim + 1] = quantizedSecond;
         // Mirror the rotated K suffix into the paged KV cache for later decode.
         if constexpr (kFp8KvCache)
         {
+            // Quantize the first rounded scalar for the FP8 paged cache.
+            __nv_fp8_e4m3 const quantizedFirst = __nv_fp8_e4m3(toFloat(first) * kvScale);
+            // Quantize the second rounded scalar for the FP8 paged cache.
+            __nv_fp8_e4m3 const quantizedSecond = __nv_fp8_e4m3(toFloat(second) * kvScale);
             // FP8 KV-cache mode stores quantized rotated suffix values.
             reinterpret_cast<__nv_fp8_e4m3*>(blockPtr)[cacheOffset] = quantizedFirst;
             // Store the adjacent rotated suffix scalar.
@@ -356,11 +347,16 @@ __global__ void preprocessContextKernel(__nv_bfloat16* fusedQ, __nv_bfloat16* la
 // - fusedQ: BF16 [numTokens, kLocalHeads, kHeadDim]. Per-token per-head Q.
 //   The first 512 dims in kHeadDim are absorbed q_nope, and the final 64 dims are Q RoPE
 //   written by preprocessContextKernel before this kernel runs.
-// - contextKvFp8: FP8 E4M3 [numTokens, kHeadDim]. Rotated current-context KV rows
-//   produced by preprocessContextKernel. All 576 dims are used as K for QK scores;
-//   only the first 512 dims are used as latent V for the output.
-// - topkIndicesLocal: INT32 [numTokens, topK]. For each query token, contains
-//   local current-context row indices into contextKvFp8. Negative entries are padding.
+// - kvCachePool: FP8 E4M3 [poolTokens, 1, kHeadDim], flattened as [poolTokens, kHeadDim]. This is the full
+//   primary KV-cache pool view. It contains cached-prefix rows from earlier prefill chunks and current rows
+//   written by preprocessContextKernel just before this kernel launches.
+// - topkIndicesPool: INT32 [numTokens, topK]. Global row indices into kvCachePool produced from local top-k.
+//   Negative entries are padding or conversion failures.
+// - topkIndicesLocal: INT32 [numTokens, topK]. Local sequence positions used only for context causal validity.
+//   Negative entries are padding.
+// - ctxCachedTokenIndptr: INT64 [numContexts + 1]. For the supported one-context path,
+//   ctxCachedTokenIndptr[1] - ctxCachedTokenIndptr[0] is the number of cached-prefix rows before token 0 in
+//   this current prefill chunk.
 // - kvScaleOrigQuant: optional FP32 scale mapping original BF16 values to FP8.
 //   Context uses the same scale for Q and KV quantization in the trusted path.
 // - kvScaleQuantOrig: optional FP32 scale mapping FP8 cache values back to
@@ -380,9 +376,10 @@ __global__ void preprocessContextKernel(__nv_bfloat16* fusedQ, __nv_bfloat16* la
 // - blockIdx.y selects local attention head.
 // - threadIdx.x cooperates across kHeadDim for QK reductions and across
 //   kKvLoraRank for the final V accumulation.
-__global__ void contextAttentionKernel(__nv_bfloat16 const* fusedQ, __nv_fp8_e4m3 const* contextKvFp8,
-    int32_t const* topkIndicesLocal, __nv_bfloat16* output, float const* kvScaleOrigQuant,
-    float const* kvScaleQuantOrig, int numTokens, int topK, float hostScoreScale)
+__global__ void contextAttentionKernel(__nv_bfloat16 const* fusedQ, __nv_fp8_e4m3 const* kvCachePool,
+    int32_t const* topkIndicesPool, int32_t const* topkIndicesLocal, int64_t const* ctxCachedTokenIndptr,
+    __nv_bfloat16* output, float const* kvScaleOrigQuant, float const* kvScaleQuantOrig, int numTokens, int topK,
+    float hostScoreScale)
 {
     // One CUDA block computes one (query token, local head) row.
     // Dynamic shared layout:
@@ -401,6 +398,9 @@ __global__ void contextAttentionKernel(__nv_bfloat16 const* fusedQ, __nv_fp8_e4m
     int const headIdx = static_cast<int>(blockIdx.y);
     // Thread-local lane id used for strided loops over head_dim and v_dim.
     int const tid = threadIdx.x;
+    // Current dispatch supports one context request. The first current-chunk query token has local sequence
+    // position cachedLen, so query token tokenIdx may attend through local position cachedLen + tokenIdx.
+    int const cachedLen = static_cast<int>(ctxCachedTokenIndptr[1] - ctxCachedTokenIndptr[0]);
     // Match the trusted context FP8-Q path: Q and KV are quantized with kvScaleOrigQuant, then FMHA dequantizes
     // both operands with kvScaleQuantOrig during BMM1.
     // This scale maps original BF16 Q values to FP8 for the explicit Q rounding below.
@@ -426,21 +426,27 @@ __global__ void contextAttentionKernel(__nv_bfloat16 const* fusedQ, __nv_fp8_e4m
     // First pass over sparse candidates computes QK logits and the row max.
     for (int topkIdx = 0; topkIdx < topK; ++topkIdx)
     {
-        // topkIndicesLocal is INT32 [numTokens, topK]. Negative values are padding and become -inf scores.
-        // localKvIdxRaw is the current-context row selected for this sparse candidate.
-        int const localKvIdxRaw = topkIndicesLocal[tokenIdx * topK + topkIdx];
-        // Only non-negative top-k entries point at a real context KV row.
-        bool const validKv = localKvIdxRaw >= 0;
-        // Clamp invalid entries so address arithmetic is safe when validKv is false.
-        int const localKvIdx = min(max(localKvIdxRaw, 0), numTokens - 1);
+        // topkIndicesPool is INT32 [numTokens, topK]. It resolves the selected local sequence position into
+        // the physical pool row that stores the FP8 KV data.
+        int const kvIdx = topkIndicesPool[tokenIdx * topK + topkIdx];
+        // topkIndicesLocal is INT32 [numTokens, topK]. It keeps the original local sequence position so the
+        // current chunk can mask future rows while allowing cached-prefix rows.
+        int const localKvIdx = topkIndicesLocal[tokenIdx * topK + topkIdx];
+        // Query token tokenIdx is located at local position cachedLen + tokenIdx.
+        int const maxVisibleLocalIdx = cachedLen + tokenIdx;
+        // A local candidate is visible when it is a real position at or before the query's absolute position.
+        bool const visibleKv = localKvIdx >= 0 && localKvIdx <= maxVisibleLocalIdx;
+        // A candidate is valid only when top-k conversion produced a real pool row and the causal check passes.
+        bool const validKv = kvIdx >= 0 && visibleKv;
         // Each thread accumulates a subset of the 576-dimensional dot product.
         float partial = 0.0F;
         // Skip memory reads for invalid/padded sparse candidates.
         if (validKv)
         {
-            // kvPtr points at FP8 [576] for one sparse current-context KV row.
-            // contextKvFp8 is compact current-context storage, so 32-bit local row math is enough here.
-            __nv_fp8_e4m3 const* kvPtr = contextKvFp8 + localKvIdx * kHeadDim;
+            // Use 64-bit offset math because real bench pool rows can exceed int32_t byte-address ranges.
+            int64_t const kvOffset = static_cast<int64_t>(kvIdx) * kHeadDim;
+            // kvPtr points at the full 576-dim FP8 KV row in the primary KV-cache pool.
+            __nv_fp8_e4m3 const* kvPtr = kvCachePool + kvOffset;
             // Stride threads across the full QK dimension [latent 512 + RoPE 64].
             for (int dim = tid; dim < kHeadDim; dim += blockDim.x)
             {
@@ -515,19 +521,25 @@ __global__ void contextAttentionKernel(__nv_bfloat16 const* fusedQ, __nv_fp8_e4m
         // Sum over the same sparse candidates used for QK.
         for (int topkIdx = 0; topkIdx < topK; ++topkIdx)
         {
-            // Reload the local context row index for this candidate.
-            int const localKvIdxRaw = topkIndicesLocal[tokenIdx * topK + topkIdx];
-            // Negative entries are padding and must not contribute.
-            bool const validKv = localKvIdxRaw >= 0;
-            // Clamp invalid entries to keep address arithmetic safe in the guarded block.
-            int const localKvIdx = min(max(localKvIdxRaw, 0), numTokens - 1);
+            // Reload the global pool row for the selected KV candidate.
+            int const kvIdx = topkIndicesPool[tokenIdx * topK + topkIdx];
+            // Reload the local sequence position for the same causal check used in QK.
+            int const localKvIdx = topkIndicesLocal[tokenIdx * topK + topkIdx];
+            // Query token tokenIdx is located at local position cachedLen + tokenIdx.
+            int const maxVisibleLocalIdx = cachedLen + tokenIdx;
+            // A local candidate is visible when it is a real position at or before the query's absolute position.
+            bool const visibleKv = localKvIdx >= 0 && localKvIdx <= maxVisibleLocalIdx;
+            // A candidate is valid only when top-k conversion produced a real pool row and the causal check passes.
+            bool const validKv = kvIdx >= 0 && visibleKv;
             // Accumulate only real sparse candidates.
             if (validKv)
             {
+                // Use 64-bit offset math because real bench pool rows can exceed int32_t byte-address ranges.
+                int64_t const kvOffset = static_cast<int64_t>(kvIdx) * kHeadDim;
                 // The trusted context path rounds probabilities to BF16 before BMM2.
                 float const prob = toFloat(toBfloat16(weights[topkIdx] * invDenom));
                 // The trusted context path also rounds FP8 V values through BF16 before multiply-add.
-                float const value = toFloat(toBfloat16(toFloat(contextKvFp8[localKvIdx * kHeadDim + dim])));
+                float const value = toFloat(toBfloat16(toFloat(kvCachePool[kvOffset + dim])));
                 // Accumulate prob * V in FP32.
                 acc += prob * value;
             }
@@ -988,7 +1000,7 @@ namespace dsv3_fused_mla
 //   ctx_cached_token_indptr[1] - ctx_cached_token_indptr[0] gives the cached prefix length used for
 //   absolute RoPE and cache positions.
 // - kv_cache: paged TRT-LLM KV cache view. preprocessContextKernel writes the rotated latent KV rows into
-//   this cache.
+//   this cache. contextAttentionKernel reads from kv_cache_pool after this append.
 // - kv_scale_orig_quant: optional FP32 [1], original-domain to FP8 scale used when storing BF16
 //   latent_cache values into an FP8 paged KV cache.
 // - kv_scale_quant_orig: optional FP32 [1], FP8 to original-domain scale used for score/output scaling in
@@ -1004,7 +1016,7 @@ namespace dsv3_fused_mla
 //
 // Output:
 // - Returns BF16 [numTokens, 8 * 512], logically [numTokens, 8, 512]. Each row is the sparse
-//   softmax-weighted sum of FP8 latent V rows from the temporary current-context KV tensor, in original/BF16 units.
+//   softmax-weighted sum of FP8 latent V rows from kv_cache_pool, in original/BF16 units.
 torch::Tensor dsv3_fused_mla_context_cuda(torch::Tensor fused_q, torch::Tensor q_pe, torch::Tensor latent_cache,
     torch::Tensor topk_indices_pool, torch::Tensor topk_indices_local, torch::Tensor kv_cache_pool,
     torch::Tensor rotary_cos_sin, torch::Tensor ctx_cached_token_indptr, tensorrt_llm::kernels::KVBlockArray kv_cache,
@@ -1024,9 +1036,6 @@ torch::Tensor dsv3_fused_mla_context_cuda(torch::Tensor fused_q, torch::Tensor q
     TORCH_CHECK(topK <= kMaxTopK, "dsv3_fused_mla_context supports topK <= ", kMaxTopK, ", got ", topK);
     // Allocate BF16 output [numTokens, 8 * 512] with the same device and dtype options as fused_q.
     auto output = torch::empty({numTokens, kLocalHeads * kKvLoraRank}, fused_q.options());
-    // Allocate compact FP8 current-context KV [numTokens, 576] used by contextAttentionKernel.
-    auto contextKvFp8 = torch::empty({numTokens, kHeadDim}, kv_cache_pool.options());
-
     // Optional original->FP8 scale. Null means identity scale.
     float const* kvScaleOrigQuantPtr
         = kv_scale_orig_quant.has_value() ? kv_scale_orig_quant.value().data_ptr<float>() : nullptr;
@@ -1041,8 +1050,8 @@ torch::Tensor dsv3_fused_mla_context_cuda(torch::Tensor fused_q, torch::Tensor q
     auto* qPePtr = static_cast<__nv_bfloat16*>(q_pe.data_ptr());
     // Raw BF16 pointer for latentCache [numTokens, 576].
     auto* latentCachePtr = static_cast<__nv_bfloat16*>(latent_cache.data_ptr());
-    // Raw FP8 pointer for compact current-context KV scratch [numTokens, 576].
-    auto* contextKvFp8Ptr = reinterpret_cast<__nv_fp8_e4m3*>(contextKvFp8.data_ptr());
+    // Raw FP8 pointer for flattened primary KV-cache pool [poolTokens, 576].
+    auto* kvCachePoolPtr = reinterpret_cast<__nv_fp8_e4m3*>(kv_cache_pool.data_ptr());
     // Raw BF16 pointer for output [numTokens, 8 * 512].
     auto* outputPtr = static_cast<__nv_bfloat16*>(output.data_ptr());
 
@@ -1055,17 +1064,17 @@ torch::Tensor dsv3_fused_mla_context_cuda(torch::Tensor fused_q, torch::Tensor q
     // Instantiate the preprocessing kernel according to the paged KV-cache storage dtype.
     if (has_fp8_kv_cache)
     {
-        // FP8 KV-cache mode writes quantized rows to kv_cache and contextKvFp8.
+        // FP8 KV-cache mode writes quantized rows to kv_cache.
         preprocessContextKernel<true><<<preprocessGrid, kThreads, 0, stream>>>(fusedQPtr, latentCachePtr, qPePtr,
-            rotaryCosSinPtr, ctx_cached_token_indptr.data_ptr<int64_t>(), kv_cache, contextKvFp8Ptr,
-            kvScaleOrigQuantPtr, qPeStrideToken, qPeStrideHead, numTokens);
+            rotaryCosSinPtr, ctx_cached_token_indptr.data_ptr<int64_t>(), kv_cache, kvScaleOrigQuantPtr, qPeStrideToken,
+            qPeStrideHead, numTokens);
     }
     else
     {
-        // BF16 KV-cache mode writes BF16 rows to kv_cache but still creates FP8 contextKvFp8 for attention.
+        // BF16 KV-cache mode writes BF16 rows to kv_cache. This mode is not used by the current GLM-5 FP8 wrapper.
         preprocessContextKernel<false><<<preprocessGrid, kThreads, 0, stream>>>(fusedQPtr, latentCachePtr, qPePtr,
-            rotaryCosSinPtr, ctx_cached_token_indptr.data_ptr<int64_t>(), kv_cache, contextKvFp8Ptr,
-            kvScaleOrigQuantPtr, qPeStrideToken, qPeStrideHead, numTokens);
+            rotaryCosSinPtr, ctx_cached_token_indptr.data_ptr<int64_t>(), kv_cache, kvScaleOrigQuantPtr, qPeStrideToken,
+            qPeStrideHead, numTokens);
     }
 
     // Context score scale follows the MLA absorbed-Q reference: 1 / (q_scaling * sqrt(qk_head_dim)).
@@ -1075,10 +1084,11 @@ torch::Tensor dsv3_fused_mla_context_cuda(torch::Tensor fused_q, torch::Tensor q
     dim3 attentionGrid(numTokens, kLocalHeads);
     // Shared memory stores kThreads reduction floats plus topK score/weight floats.
     size_t const sharedBytes = (kThreads + std::min(topK, kMaxTopK)) * sizeof(float);
-    // Compute sparse context attention from the rotated/quantized current-context KV scratch.
-    contextAttentionKernel<<<attentionGrid, kThreads, sharedBytes, stream>>>(fusedQPtr, contextKvFp8Ptr,
-        topk_indices_local.data_ptr<int32_t>(), outputPtr, kvScaleOrigQuantPtr, kvScaleQuantOrigPtr, numTokens, topK,
-        hostScoreScale);
+    // Compute sparse context attention from the primary KV-cache pool so chunked prefill can read cached prefixes.
+    contextAttentionKernel<<<attentionGrid, kThreads, sharedBytes, stream>>>(fusedQPtr, kvCachePoolPtr,
+        topk_indices_pool.data_ptr<int32_t>(), topk_indices_local.data_ptr<int32_t>(),
+        ctx_cached_token_indptr.data_ptr<int64_t>(), outputPtr, kvScaleOrigQuantPtr, kvScaleQuantOrigPtr, numTokens,
+        topK, hostScoreScale);
 
     // Surface any asynchronous launch/runtime errors before returning the tensor to Python.
     sync_check_cuda_error(stream);

@@ -262,7 +262,8 @@ def dsv3_mla_context_pytorch(
     - topk_indices: torch.Tensor, shape [num_tokens, top_k], int32, local sparse
       attention indices. Negative entries are padding.
     - topk_indices_pool: torch.Tensor, shape [num_tokens, top_k], int32, sparse
-      attention indices converted to KV-pool rows. Kept for signature parity.
+      attention indices converted to KV-pool rows. Cached-prefix candidates
+      are read through these rows.
     - kv_cache_pool: torch.Tensor, shape [pool_tokens, 1, 576], float8_e4m3fn,
       writable paged KV-cache pool view. The function stores the rotated latent
       context rows into this pool for subsequent decode.
@@ -323,13 +324,15 @@ def dsv3_mla_context_pytorch(
         # [top_k], int32
         local_indices = topk_indices[token_idx]
         # [top_k], bool
-        valid = local_indices >= 0
-        # [top_k], int64
-        gather_indices = local_indices.clamp(0, num_tokens - 1).to(torch.long)
-        # [top_k, 576], float8_e4m3fn
-        kv_fp8 = (latent_cache[gather_indices].float() * kv_scale_orig_quant).to(
-            torch.float8_e4m3fn
+        valid = (
+            (topk_indices_pool[token_idx] >= 0)
+            & (local_indices >= 0)
+            & (local_indices <= cached_len + token_idx)
         )
+        # [top_k], int64
+        gather_indices = topk_indices_pool[token_idx].clamp_min(0).to(torch.long)
+        # [top_k, 576], float8_e4m3fn
+        kv_fp8 = kv_cache_pool[:, 0, :][gather_indices]
         # [8, top_k], float32
         scores = torch._scaled_mm(
             q_fp8[token_idx],
@@ -363,7 +366,6 @@ def dsv3_mla_context_pytorch(
         # [1, 4096]
         rows.append(row.reshape(1, 8 * 512))
 
-    _ = topk_indices_pool
     # [num_tokens, 4096], bfloat16
     return torch.cat(rows, dim=0).to(torch.bfloat16)
 

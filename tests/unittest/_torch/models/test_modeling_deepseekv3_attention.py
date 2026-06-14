@@ -35,7 +35,10 @@ from tensorrt_llm._torch.attention_backend.sparse.dsa import (
 from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.models.modeling_deepseekv3_mla_pytorch import dsv3_mla_decode_pytorch
+from tensorrt_llm._torch.models.modeling_deepseekv3_mla_pytorch import (
+    dsv3_mla_context_pytorch,
+    dsv3_mla_decode_pytorch,
+)
 from tensorrt_llm._utils import get_sm_version, str_dtype_to_binding, torch_dtype_to_str
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.functional import PositionEmbeddingType
@@ -74,12 +77,6 @@ def _require_glm5_context_attention_runtime() -> None:
         pytest.skip("GLM-5 context attention test requires CUDA")
     if get_sm_version() not in (90, 100, 103, 120):
         pytest.skip("FP8 MLA context attention is only enabled on SM90/SM100/SM103/SM120")
-
-
-def _rotate_half(x: torch.Tensor) -> torch.Tensor:
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return torch.cat((-x2, x1), dim=-1)
 
 
 def _make_glm5_config() -> _Config:
@@ -132,59 +129,23 @@ def _set_kv_cache_scale(attention: AttentionBackend, dequant_scale: float) -> No
     )
 
 
-def _rope_cos_sin_for_rotation(
-    rope_cos_sin: torch.Tensor,
-    max_positions: int,
+def _build_causal_topk(
+    device: torch.device,
+    context_sequence_length: int = _CONTEXT_SEQUENCE_LENGTH,
+    cached_sequence_length: int = 0,
 ) -> torch.Tensor:
-    if rope_cos_sin.dim() == 2 and rope_cos_sin.shape[0] == 1:
-        rope_cos_sin = rope_cos_sin.reshape(max_positions, -1)
-    if rope_cos_sin.dim() == 2:
-        rope_cos_sin = rope_cos_sin.reshape(rope_cos_sin.shape[0], -1, 2)
-        return rope_cos_sin.transpose(-2, -1)
-    return rope_cos_sin
-
-
-def _rotate_context_tensors(
-    fused_q: torch.Tensor,
-    q_pe: torch.Tensor,
-    latent_cache: torch.Tensor,
-    rope_cos_sin: torch.Tensor,
-    cached_len: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    num_tokens = fused_q.shape[0]
-    fused_q = fused_q.clone().view(num_tokens, _LOCAL_NUM_HEADS, _HEAD_DIM)
-    latent_cache = latent_cache.clone()
-
-    rope_cos_sin = _rope_cos_sin_for_rotation(rope_cos_sin, _MAX_POSITION_EMBEDDINGS)
-    cos, sin = rope_cos_sin[cached_len : cached_len + num_tokens].chunk(2, dim=-2)
-
-    q_pe = q_pe.clone()
-    q_pe = q_pe.unflatten(-1, [-1, 2]).transpose(-2, -1).flatten(start_dim=-2)
-    q_pe = ((q_pe * cos) + (_rotate_half(q_pe) * sin)).to(dtype=fused_q.dtype)
-    q_pe = q_pe.unflatten(-1, [2, -1]).transpose(-2, -1).flatten(start_dim=-2)
-    fused_q[..., _KV_LORA_RANK:] = q_pe
-
-    k_pe = latent_cache[:, _KV_LORA_RANK:].unsqueeze(-2)
-    k_pe = k_pe.unflatten(-1, [-1, 2]).transpose(-2, -1).flatten(start_dim=-2)
-    k_pe = ((k_pe * cos) + (_rotate_half(k_pe) * sin)).to(dtype=latent_cache.dtype)
-    k_pe = k_pe.unflatten(-1, [2, -1]).transpose(-2, -1).flatten(start_dim=-2)
-    latent_cache[:, _KV_LORA_RANK:] = k_pe.squeeze(-2)
-
-    return fused_q, latent_cache
-
-
-def _build_causal_topk(device: torch.device) -> torch.Tensor:
     topk_indices = torch.full(
-        (_CONTEXT_SEQUENCE_LENGTH, _INDEX_TOPK),
+        (context_sequence_length, _INDEX_TOPK),
         -1,
         dtype=torch.int32,
         device=device,
     )
-    for token_idx in range(_CONTEXT_SEQUENCE_LENGTH):
-        valid_len = min(token_idx + 1, _INDEX_TOPK)
+    for token_idx in range(context_sequence_length):
+        max_visible_position = cached_sequence_length + token_idx
+        valid_len = min(max_visible_position + 1, _INDEX_TOPK)
         topk_indices[token_idx, :valid_len] = torch.arange(
-            token_idx + 1 - valid_len,
-            token_idx + 1,
+            max_visible_position + 1 - valid_len,
+            max_visible_position + 1,
             dtype=torch.int32,
             device=device,
         )
@@ -220,94 +181,24 @@ def _torch_context_attention_reference(
     attention: AttentionBackend,
     metadata: AttentionMetadata,
 ) -> torch.Tensor:
-    """PyTorch mirror of TRTLLM sparse FP8 MLA context attention.
-
-    This mirrors the trusted TRTLLM DSA path, not the WIP fused context kernel:
-    1. `mla_rope_context` applies GPT-J/interleaved RoPE to BF16 Q/K.
-    2. The rotated latent K/V rows are written to the paged KV cache as FP8.
-    3. The rotated Q rows are quantized to FP8 for FP8 context MLA.
-    4. Sparse FMHA uses DSA's global pool indices, FP8 Q/K/V dequant scales,
-       and `1 / (q_scaling * sqrt(qk_nope + qk_rope))` score scaling.
-    """
-    num_tokens = fused_q.shape[0]
-    device = fused_q.device
-    cached_len = 0
-    if hasattr(metadata, "host_ctx_cached_token_indptr"):
-        host_indptr = metadata.host_ctx_cached_token_indptr
-        cached_len = int((host_indptr[1] - host_indptr[0]).item())
-
-    fused_q, latent_cache = _rotate_context_tensors(
-        fused_q,
-        q_pe,
-        latent_cache,
-        attention.rotary_cos_sin,
-        cached_len,
-    )
-
+    """PyTorch mirror of TRTLLM sparse FP8 MLA context attention."""
     topk_indices_pool, kv_cache_pool = transform_local_topk_and_prepare_pool_view(
         topk_indices,
         metadata,
         layer_idx=attention.get_local_layer_idx(metadata),
         is_generation=False,
     )
-    token_positions = torch.arange(num_tokens, dtype=torch.int32, device=device)[:, None]
-    token_pool_rows, _ = transform_local_topk_and_prepare_pool_view(
-        token_positions,
+    kv_cache_pool_ref = kv_cache_pool.clone()
+    return dsv3_mla_context_pytorch(
+        fused_q,
+        q_pe,
+        latent_cache,
+        topk_indices,
+        topk_indices_pool,
+        kv_cache_pool_ref,
         metadata,
-        layer_idx=attention.get_local_layer_idx(metadata),
-        is_generation=False,
+        attention,
     )
-
-    kv_scale_orig_quant = _get_scalar(attention.kv_scale_orig_quant, device)
-    kv_scale_quant_orig = _get_scalar(attention.kv_scale_quant_orig, device)
-    quant_q_scale = kv_scale_orig_quant
-    dequant_q_scale = kv_scale_quant_orig
-    dequant_kv_scale = kv_scale_quant_orig
-    bmm2_scale = kv_scale_quant_orig
-    bmm1_host_scale = torch.tensor(
-        1.0 / (float(attention.q_scaling) * math.sqrt(_QK_HEAD_DIM)),
-        dtype=torch.float32,
-        device=device,
-    )
-
-    kv_cache_pool_ref = torch.zeros_like(kv_cache_pool)
-    kv_cache_pool_ref[token_pool_rows.squeeze(-1).long(), 0, :] = (
-        latent_cache.float() * kv_scale_orig_quant
-    ).to(torch.float8_e4m3fn)
-    q_fp8 = (fused_q.float() * quant_q_scale).to(torch.float8_e4m3fn)
-
-    rows: list[torch.Tensor] = []
-    for token_idx in range(num_tokens):
-        pool_indices = topk_indices_pool[token_idx]
-        valid = pool_indices >= 0
-        gather_indices = pool_indices.clamp_min(0).to(torch.long)
-        kv_fp8 = kv_cache_pool_ref[gather_indices, 0, :]
-        scores = torch._scaled_mm(
-            q_fp8[token_idx],
-            kv_fp8.transpose(0, 1).contiguous(),
-            scale_a=dequant_q_scale,
-            scale_b=dequant_kv_scale,
-            out_dtype=torch.float32,
-        )
-        scores = scores * bmm1_host_scale
-        scores = scores.masked_fill(~valid.unsqueeze(0), -float("inf"))
-        scores_log2 = scores * math.log2(math.e)
-        max_scores = scores_log2.max(dim=-1, keepdim=True).values
-        weights = torch.exp2(scores_log2 - max_scores)
-        weights = weights.masked_fill(~valid.unsqueeze(0), 0.0)
-        weights = weights / weights.sum(dim=-1, keepdim=True).clamp_min(1.0e-20)
-        # TRTLLM-Gen sparse MLA context uses FP8 Q/K/V storage, but BMM2's closest
-        # PyTorch-visible numerics are BF16-rounded probabilities and BF16-rounded V.
-        row = (
-            torch.matmul(
-                weights.to(torch.bfloat16),
-                kv_fp8[:, :_KV_LORA_RANK].to(torch.bfloat16),
-            ).float()
-            * bmm2_scale
-        )
-        rows.append(row.reshape(1, _LOCAL_NUM_HEADS * _KV_LORA_RANK))
-
-    return torch.cat(rows, dim=0).to(torch.bfloat16)
 
 
 def _assert_context_attention_close(actual: torch.Tensor, expected: torch.Tensor) -> None:
@@ -367,6 +258,8 @@ def _custom_context_attention(
 def _build_attention_and_metadata(
     layer_idx: int = 0,
     num_layers: int = 1,
+    context_sequence_length: int = _CONTEXT_SEQUENCE_LENGTH,
+    cached_sequence_length: int = 0,
 ) -> tuple[AttentionBackend, AttentionMetadata, _Config]:
     config = _make_glm5_config()
     sparse_config = DeepSeekSparseAttentionConfig(
@@ -410,11 +303,12 @@ def _build_attention_and_metadata(
         sparse_attention_config=sparse_config,
         dtype=torch.bfloat16,
     )
+    max_seq_len = cached_sequence_length + context_sequence_length
     kv_cache_manager = DSACacheManager(
         KvCacheConfig(
             max_tokens=max(
                 _TOKENS_PER_BLOCK * 4,
-                math.ceil(_CONTEXT_SEQUENCE_LENGTH / _TOKENS_PER_BLOCK) * _TOKENS_PER_BLOCK,
+                math.ceil(max_seq_len / _TOKENS_PER_BLOCK) * _TOKENS_PER_BLOCK,
             ),
             enable_block_reuse=False,
         ),
@@ -423,29 +317,87 @@ def _build_attention_and_metadata(
         num_kv_heads=1,
         head_dim=_HEAD_DIM,
         tokens_per_block=_TOKENS_PER_BLOCK,
-        max_seq_len=_CONTEXT_SEQUENCE_LENGTH,
+        max_seq_len=max_seq_len,
         max_batch_size=1,
         mapping=mapping,
         dtype=str_dtype_to_binding(torch_dtype_to_str(torch.float8_e4m3fn)),
         sparse_attn_config=sparse_config,
         model_config=model_config,
     )
-    kv_cache_manager.add_dummy_requests([0], [_CONTEXT_SEQUENCE_LENGTH])
+    kv_cache_manager.add_dummy_requests([0], [max_seq_len])
 
     metadata = attn_cls.Metadata(
-        seq_lens=torch.tensor([_CONTEXT_SEQUENCE_LENGTH], dtype=torch.int),
+        seq_lens=torch.tensor([context_sequence_length], dtype=torch.int),
         request_ids=[0],
         max_num_requests=1,
         num_contexts=1,
-        prompt_lens=[_CONTEXT_SEQUENCE_LENGTH],
-        max_num_tokens=_CONTEXT_SEQUENCE_LENGTH,
+        prompt_lens=[context_sequence_length],
+        max_num_tokens=context_sequence_length,
         kv_cache_manager=kv_cache_manager,
-        kv_cache_params=KVCacheParams(use_cache=True, num_cached_tokens_per_seq=[0]),
+        kv_cache_params=KVCacheParams(
+            use_cache=True,
+            num_cached_tokens_per_seq=[cached_sequence_length],
+        ),
         mapping=mapping,
         sparse_attention_config=sparse_config,
     )
     metadata.prepare()
     return attention, metadata, config
+
+
+def _get_context_kv_pool_rows(
+    attention: AttentionBackend,
+    metadata: AttentionMetadata,
+    token_positions: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    metadata._ensure_pool_view_cached()
+    layer_idx = attention.get_local_layer_idx(metadata)
+    tokens_per_block = metadata._cached_tokens_per_block
+    stride_factor = metadata._cached_stride_factor
+    token_positions = token_positions.to(
+        device=metadata._cached_block_table_ctx.device,
+        dtype=torch.long,
+    )
+    block_indices = token_positions // tokens_per_block
+    inblock_offsets = token_positions % tokens_per_block + layer_idx * tokens_per_block
+    block_bases = metadata._cached_block_table_ctx[0, block_indices].to(torch.long)
+    pool_rows = block_bases * stride_factor + inblock_offsets
+    return pool_rows, metadata._cached_pool_view
+
+
+def _seed_context_cached_kv_cache(
+    attention: AttentionBackend,
+    metadata: AttentionMetadata,
+    device: torch.device,
+    cached_sequence_length: int,
+) -> torch.Tensor:
+    token_positions = torch.arange(
+        cached_sequence_length,
+        dtype=torch.long,
+        device=device,
+    )
+    pool_rows, kv_cache_pool = _get_context_kv_pool_rows(
+        attention,
+        metadata,
+        token_positions,
+    )
+    kv_scale_orig_quant = _get_scalar(attention.kv_scale_orig_quant, device)
+    history_cache = (
+        torch.randn(
+            cached_sequence_length,
+            _HEAD_DIM,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        * 0.125
+    )
+    history_cache_fp8 = (history_cache.float() * kv_scale_orig_quant).to(torch.float8_e4m3fn)
+    kv_cache_pool.view(torch.uint8).index_copy_(
+        0,
+        pool_rows,
+        history_cache_fp8.view(torch.uint8).unsqueeze(1),
+    )
+    return kv_cache_pool
 
 
 def _build_decode_attention_and_metadata(
@@ -1317,6 +1269,84 @@ def test_glm5_fp8_context_custom_op_matches_pytorch_reference_with_strided_q_pe(
         * 0.125
     )
     topk_indices = _build_causal_topk(device)
+
+    with torch.inference_mode():
+        expected = _torch_context_attention_reference(
+            fused_q,
+            q_pe,
+            latent_cache,
+            topk_indices,
+            attention,
+            metadata,
+        )
+        actual_latent_cache = latent_cache.clone()
+        latent_cache_before = actual_latent_cache.clone()
+        actual = _custom_context_attention(
+            fused_q.clone(),
+            q_pe,
+            actual_latent_cache,
+            topk_indices,
+            attention,
+            metadata,
+        )
+
+    _assert_context_attention_close(actual, expected)
+    torch.testing.assert_close(actual_latent_cache, latent_cache_before, rtol=0.0, atol=0.0)
+
+
+def test_glm5_fp8_context_custom_op_matches_pytorch_reference_with_cached_prefix() -> None:
+    _require_glm5_context_attention_runtime()
+    device = torch.device("cuda")
+    torch.manual_seed(654)
+    torch.cuda.manual_seed(654)
+
+    cached_sequence_length = 48
+    context_sequence_length = 16
+    attention, metadata, _ = _build_attention_and_metadata(
+        context_sequence_length=context_sequence_length,
+        cached_sequence_length=cached_sequence_length,
+    )
+    _set_kv_cache_scale(attention, dequant_scale=0.5)
+    _seed_context_cached_kv_cache(
+        attention,
+        metadata,
+        device,
+        cached_sequence_length,
+    )
+    fused_q = (
+        torch.randn(
+            context_sequence_length,
+            _LOCAL_NUM_HEADS,
+            _HEAD_DIM,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        * 0.125
+    )
+    q_pe = (
+        torch.randn(
+            context_sequence_length,
+            _LOCAL_NUM_HEADS,
+            _QK_ROPE_HEAD_DIM,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        * 0.125
+    )
+    latent_cache = (
+        torch.randn(
+            context_sequence_length,
+            _HEAD_DIM,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        * 0.125
+    )
+    topk_indices = _build_causal_topk(
+        device,
+        context_sequence_length=context_sequence_length,
+        cached_sequence_length=cached_sequence_length,
+    )
 
     with torch.inference_mode():
         expected = _torch_context_attention_reference(

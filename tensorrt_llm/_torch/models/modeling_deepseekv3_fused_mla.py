@@ -900,8 +900,21 @@ class FusedMLA(nn.Module):
         # -> [num_heads, num_tokens, kv_lora_rank] -> [num_tokens, num_heads, kv_lora_rank]
         # The output of bmm is written directly into fused_q
         fused_mla_mode = get_fused_mla_mode()
-        assert 0 < num_tokens <= self.predicted_tokens_per_seq
-        assert num_seqs == 1
+        use_custom_generation = (
+            fused_mla_mode in (FUSED_MLA_MODE_PYTORCH, FUSED_MLA_MODE_WIP)
+            and 0 < num_tokens <= self.predicted_tokens_per_seq
+            and num_seqs == 1
+        )
+        # Chunked-prefill warmup can exercise larger generation-shaped batches.
+        # Keep those on the trusted backend until the custom decode path handles
+        # multi-sequence and non-MTP-group shapes.
+        if (
+            fused_mla_mode in (FUSED_MLA_MODE_PYTORCH, FUSED_MLA_MODE_WIP)
+            and not use_custom_generation
+        ):
+            fused_mla_mode = FUSED_MLA_MODE_BASELINE
+
+        assert num_tokens > 0
         assert topk_indices is not None
         assert quant_q_buffer is not None
         assert mla_bmm1_scale is not None
@@ -1140,9 +1153,6 @@ class FusedMLA(nn.Module):
         assert self.kv_lora_rank == 512
         assert self.qk_rope_head_dim == 64
         assert attn_metadata.num_contexts == 1
-        # Current fused context paths only attend over the current prefill segment.
-        # Chunked prefill/cache-reuse needs cached-prefix reads before this assert can be relaxed.
-        assert getattr(attn_metadata, "num_ctx_cached_tokens", 0) == 0
         assert topk_indices is not None
         assert hasattr(attn_metadata, "ctx_cached_token_indptr")
 
