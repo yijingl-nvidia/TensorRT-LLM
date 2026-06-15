@@ -60,18 +60,19 @@ constexpr int kMaxTopK = 4096;
 //
 //
 // Generation input tensors:
-// - quantQ:          FP8 E4M3, logical shape [num_gen_tokens, 8 local heads, 576]. It is produced by
-//                    the RoPE/KV-append preparation step after applying Q RoPE and quantizing the full absorbed Q.
+// - quantQ:          FP8 E4M3, logical shape [num_gen_tokens, 8 local heads, 576]. The combined generation kernel
+//                    writes it after applying Q RoPE and quantizing the full absorbed Q.
 // - topkIndicesLocal: INT32, logical shape [num_gen_tokens, topK]. Each non-negative entry is the local
 //                    KV position inside the single generation sequence. This is used only for causal
 //                    validity checks.
 // - topkIndicesPool: INT32, logical shape [num_gen_tokens, topK]. Each non-negative entry is the global
 //                    kvCachePool row to load after the DSA index conversion.
 // - sequenceLength:  INT32, logical shape [1] on the currently enabled custom path. It is the total KV
-//                    length after the RoPE/KV-append preparation step appends all num_gen_tokens rows.
-// - bmm1Scale:       FP32, logical shape [2]. bmm1Scale[0] is the natural-exp score scale, and
-//                    bmm1Scale[1] is bmm1Scale[0] * log2(e), used with exp2f().
-// - bmm2Scale:       FP32, logical shape [1]. It dequantizes the FP8 V/cache values before BF16 output.
+//                    length after the current combined kernel appends all num_gen_tokens rows.
+// - bmm1Scale:       FP32, logical shape [2]. The combined generation kernel writes both the natural-exp score scale
+//                    and the log2-space score scale used with exp2f().
+// - bmm2Scale:       FP32, logical shape [1]. The combined generation kernel writes the FP8 V dequantization scale
+//                    before consuming it for BF16 output.
 // - output:          BF16, logical shape [num_tokens, 8 * 512]. It stores latent attention output before
 //                    the per-head V-up projection in Python.
 
@@ -687,176 +688,41 @@ __global__ void contextAttentionKernel(__nv_bfloat16 const* fusedQ, __nv_fp8_e4m
     }
 }
 
-// Decode-stage RoPE, FP8 Q quantization, and paged KV append for the GLM-5 FP8 WIP path.
-//
-// Inputs:
-// - fusedQ: mutable BF16 [numTokens, 8, 576]. Dims [0, 512) already contain q_nope absorbed by BMM.
-// - qPe: BF16 [numTokens, 8, 64]. Unrotated per-head Q RoPE suffix.
-// - latentCache: BF16 [numTokens, 576]. Dims [0, 512) are latent KV/V; dims [512, 576) are unrotated K RoPE.
-// - rotaryCosSin: FP32 float2 RoPE table indexed as [position, rope_pair].
-// - sequenceLength: INT32 [1]. Total sequence length after the current decode/MTP group has been appended.
-// - kvCache: paged TRT-LLM KV cache view. The kernel writes the current decode/MTP group into sequence 0.
-// - quantQ: UINT8-backed FP8 E4M3 [numTokens, 8, 576]. The kernel writes the full rotated/absorbed Q.
-// - bmm1Scale: FP32 [2]. The kernel writes natural-log and log2-space QK dequant/score scales.
-// - bmm2Scale: FP32 [1]. The kernel writes the FP8 V dequant scale.
-//
-// Side effects:
-// - Writes quantQ, bmm1Scale, bmm2Scale, and the paged KV cache.
-// - Writes fusedQ[token, head, 512:576] with rotated Q RoPE for debuggability; decode attention consumes quantQ.
-__global__ void generationRopeAppendKernel(__nv_bfloat16* fusedQ, __nv_bfloat16 const* qPe,
-    __nv_bfloat16 const* latentCache, float2 const* rotaryCosSin, int32_t const* sequenceLength,
-    tensorrt_llm::kernels::KVBlockArray kvCache, __nv_fp8_e4m3* quantQ, float* bmm1Scale, float* bmm2Scale,
-    float const* kvScaleOrigQuant, float const* kvScaleQuantOrig, int64_t qPeStrideToken, int64_t qPeStrideHead,
-    int numTokens, float hostScoreScale)
-{
-    // blockIdx.x selects one decode/MTP token, blockIdx.y selects one Q head or the shared KV branch.
-    int const tokenIdx = static_cast<int>(blockIdx.x);
-    // headIdx in [0, 7] handles per-head Q; headIdx == 8 handles the shared latent KV row.
-    int const headIdx = static_cast<int>(blockIdx.y);
-    // Lane id for strided loops over latent dims and RoPE pairs.
-    int const tid = threadIdx.x;
-
-    // Publish the FP8 dequant scales once. The later attention kernel reads bmm1Scale[1] and bmm2Scale[0].
-    if (tokenIdx == 0 && headIdx == 0 && tid == 0)
-    {
-        // Original-domain to FP8 scale used for both Q and KV cache quantization.
-        float const quantScale = kvScaleOrigQuant == nullptr ? 1.0F : kvScaleOrigQuant[0];
-        // FP8 to original-domain dequant scale used by BMM1 and BMM2.
-        float const dequantScale = kvScaleQuantOrig == nullptr ? 1.0F : kvScaleQuantOrig[0];
-        // TRTLLM-Gen softmax uses exp2f, so keep both natural-log and log2-space score scales.
-        constexpr float kLog2e = 1.4426950408889634074F;
-        // BMM1 scale is dequant_q * dequant_k * attention_scale.
-        float const bmm1ScaleValue = dequantScale * dequantScale * hostScoreScale;
-        // Natural-log score scale.
-        bmm1Scale[0] = bmm1ScaleValue;
-        // Log2-space score scale consumed by the generation split-attention kernel.
-        bmm1Scale[1] = bmm1ScaleValue * kLog2e;
-        // BMM2 dequantizes FP8 V. The generic op multiplies by out_scale when provided; WIP passes no out_scale.
-        bmm2Scale[0] = dequantScale;
-        // quantScale is intentionally computed here only for symmetry with the per-token branches.
-        (void) quantScale;
-    }
-
-    // Defensive guard for padded launches. Current launches are exact.
-    if (tokenIdx >= numTokens)
-    {
-        // This CTA owns no real token.
-        return;
-    }
-
-    // The scheduler has already appended numTokens rows; the first current-group row is total_length - numTokens.
-    int const tokenIdxInKvCache = sequenceLength[0] - numTokens + tokenIdx;
-    // Original-domain to FP8 scale for Q and KV.
-    float const quantScale = kvScaleOrigQuant == nullptr ? 1.0F : kvScaleOrigQuant[0];
-
-    if (headIdx < kLocalHeads)
-    {
-        // Quantize the absorbed q_nope prefix [0, 512) from fusedQ into quantQ.
-        for (int dim = tid; dim < kKvLoraRank; dim += blockDim.x)
-        {
-            // Flattened [token, head, dim] offset for both fusedQ and quantQ.
-            int const qOffset = (tokenIdx * kLocalHeads + headIdx) * kHeadDim + dim;
-            // The BMM wrote BF16 q_nope into fusedQ; convert original-domain BF16 to scaled FP8.
-            quantQ[qOffset] = __nv_fp8_e4m3(toFloat(fusedQ[qOffset]) * quantScale);
-        }
-
-        // Rotate and quantize the per-head Q RoPE suffix [512, 576).
-        for (int pairIdx = tid; pairIdx < kRopeDim / 2; pairIdx += blockDim.x)
-        {
-            // Adjacent RoPE scalar pair within the 64-dim suffix.
-            int const dim = 2 * pairIdx;
-            // qPe may be a non-contiguous view, so use runtime token/head strides.
-            int64_t const qPeOffset = tokenIdx * qPeStrideToken + headIdx * qPeStrideHead + dim;
-            // Load one BF16 pair as FP32 for RoPE math.
-            float2 value;
-            value.x = toFloat(qPe[qPeOffset]);
-            value.y = toFloat(qPe[qPeOffset + 1]);
-            // Use absolute KV position for the current decode/MTP token.
-            float2 const coef = rotaryCosSin[tokenIdxInKvCache * kRopeDim + pairIdx];
-            // Apply GPT-J style adjacent-pair RoPE.
-            float2 const rotated = rotaryTransform(value, coef);
-            // Flattened output offset for the first RoPE suffix scalar.
-            int const qOffset = (tokenIdx * kLocalHeads + headIdx) * kHeadDim + kKvLoraRank + dim;
-            // Match the generic kernel by rounding rotated RoPE values to BF16 before FP8 quantization.
-            __nv_bfloat16 const first = toBfloat16(rotated.x);
-            // Round the second adjacent component to BF16.
-            __nv_bfloat16 const second = toBfloat16(rotated.y);
-            // Keep fusedQ readable for debug comparisons even though decode attention consumes quantQ.
-            fusedQ[qOffset] = first;
-            // Store the second rotated component in fusedQ.
-            fusedQ[qOffset + 1] = second;
-            // Quantize first rotated component into full FP8 Q.
-            quantQ[qOffset] = __nv_fp8_e4m3(toFloat(first) * quantScale);
-            // Quantize second rotated component into full FP8 Q.
-            quantQ[qOffset + 1] = __nv_fp8_e4m3(toFloat(second) * quantScale);
-        }
-        // Per-head Q branches do not write KV cache.
-        return;
-    }
-
-    // Shared KV branch: write latent KV/V prefix and rotated K RoPE suffix into the paged KV cache.
-    auto* blockPtr = kvCache.getKBlockPtr(/*seqIdx=*/0, tokenIdxInKvCache);
-    // Copy and quantize latent KV/V prefix [0, 512).
-    for (int dim = tid; dim < kKvLoraRank; dim += blockDim.x)
-    {
-        // Scalar offset inside the resolved physical KV page.
-        int const cacheOffset = kvCache.getKVLocalIdx(tokenIdxInKvCache, /*headIdx=*/0, kHeadDim, dim);
-        // Load BF16 latent KV/V and store scaled FP8.
-        reinterpret_cast<__nv_fp8_e4m3*>(blockPtr)[cacheOffset]
-            = __nv_fp8_e4m3(toFloat(latentCache[tokenIdx * kHeadDim + dim]) * quantScale);
-    }
-
-    // Rotate and quantize the shared K RoPE suffix [512, 576).
-    for (int pairIdx = tid; pairIdx < kRopeDim / 2; pairIdx += blockDim.x)
-    {
-        // Adjacent scalar pair within the K RoPE suffix.
-        int const dim = 2 * pairIdx;
-        // Flattened latentCache offset for the first suffix scalar.
-        int const latentOffset = tokenIdx * kHeadDim + kKvLoraRank + dim;
-        // Load one K RoPE pair as FP32 for rotation.
-        float2 value;
-        value.x = toFloat(latentCache[latentOffset]);
-        value.y = toFloat(latentCache[latentOffset + 1]);
-        // K uses the same absolute position as Q for the appended token.
-        float2 const coef = rotaryCosSin[tokenIdxInKvCache * kRopeDim + pairIdx];
-        // Apply RoPE to the K suffix.
-        float2 const rotated = rotaryTransform(value, coef);
-        // Scalar offset inside the paged KV row.
-        int const cacheOffset = kvCache.getKVLocalIdx(tokenIdxInKvCache, /*headIdx=*/0, kHeadDim, kKvLoraRank + dim);
-        // Round to BF16 before FP8 quantization to match the generic MLA RoPE kernel.
-        __nv_bfloat16 const first = toBfloat16(rotated.x);
-        // Round the second component.
-        __nv_bfloat16 const second = toBfloat16(rotated.y);
-        // Store first rotated K suffix component as FP8.
-        reinterpret_cast<__nv_fp8_e4m3*>(blockPtr)[cacheOffset] = __nv_fp8_e4m3(toFloat(first) * quantScale);
-        // Store second rotated K suffix component as FP8.
-        reinterpret_cast<__nv_fp8_e4m3*>(blockPtr)[cacheOffset + 1] = __nv_fp8_e4m3(toFloat(second) * quantScale);
-    }
-}
-
 // Combined TileRT-style split and combine kernel for GLM-5 generation sparse MLA attention.
 //
 // This kernel changes the decode attention work decomposition from one CTA per [token, head] to one CTA per
 // [token, sparse top-k split]. For the GLM-5 topK=2048 path, kSparseSplitSize=64 gives 32 CTAs per token, matching
-// TileRT's documented CTAID layout. Inside each CTA, consumer warps 0..7 map one warp to one local MLA head and
-// producer/control warps 8..11 are intentionally kept out of math so the CTA shape stays compatible with the
-// TileRT 12-warp design. After all split CTAs finish, the same launch grid-syncs and the first eight split CTAs
-// for each token combine one local-head output each.
+// TileRT's documented CTAID layout. The launch starts by using the split CTAs to apply RoPE, quantize Q, and append
+// the current KV rows. During attention math, consumer warps 0..7 map one warp to one local MLA head and
+// producer/control warps 8..11 stay alive as the reserved TileRT-style group. After all split CTAs finish, the same
+// launch grid-syncs and the first eight split CTAs for each token combine one local-head output each.
 //
 // Inputs:
-// - quantQ: FP8 E4M3 [numTokens, kLocalHeads, kHeadDim]. Rotated and quantized Q from the prep op.
+// - fusedQ: mutable BF16 [numTokens, kLocalHeads, kHeadDim]. Dims [0, kKvLoraRank) already contain absorbed q_nope.
+// - qPe: BF16 [numTokens, kLocalHeads, kRopeDim]. Unrotated per-head Q RoPE suffix.
+// - latentCache: BF16 [numTokens, kHeadDim]. Dims [0, kKvLoraRank) are latent KV/V; dims [kKvLoraRank, kHeadDim)
+//   are unrotated shared K RoPE.
+// - rotaryCosSin: FP32 float2 RoPE table indexed as [position, rope_pair].
+// - kvCache: paged TRT-LLM KV cache view. The kernel writes the current decode/MTP group into sequence 0 before
+//   attention reads those rows through kvCachePool.
+// - quantQ: FP8 E4M3 [numTokens, kLocalHeads, kHeadDim]. The kernel writes the full rotated/absorbed Q before
+//   attention consumes it.
 // - kvCachePool: FP8 E4M3 [poolTokens, 1, kHeadDim], flattened as [poolTokens, kHeadDim].
 // - topkIndicesPool: INT32 [numTokens, topK]. Global row indices into kvCachePool produced from local top-k.
 // - topkIndicesLocal: INT32 [numTokens, topK]. Local sequence positions for MTP visibility checks.
 // - sequenceLength: INT32 [1]. Total KV length after the current decode/MTP group has been appended.
 // - specDecodingPackedMask: optional INT32 [numTokens, specMaskWords] for request 0.
 // - specMaskWords: int, number of packed int32 mask words per query token.
-// - bmm1Scale: optional FP32 [2]. bmm1Scale[1] is the log2-space QK score scale.
-// - bmm2Scale: optional FP32 [1]. Dequantization scale for FP8 V values before BF16 output.
+// - bmm1Scale: optional FP32 [2]. The append phase writes natural-log and log2-space QK score scales.
+// - bmm2Scale: optional FP32 [1]. The append phase writes the dequantization scale for FP8 V values.
+// - kvScaleOrigQuant: optional FP32 [1]. Original-domain to FP8 scale for Q and appended KV.
+// - kvScaleQuantOrig: optional FP32 [1]. FP8 to original-domain dequant scale.
+// - qPeStrideToken/qPeStrideHead: runtime strides for qPe because it can be a non-contiguous split view.
 // - numTokens: int, number of decode/MTP tokens in this call.
 // - topK: int, sparse candidate count per query token.
 // - numSplits: int, ceil(topK / kSparseSplitSize).
-// - expectedCtas: int, exact split CTA grid size used by the one-shot global barrier.
+// - expectedCtas: int, exact split CTA grid size used by each one-shot global barrier.
+// - hostScoreScale: float, unquantized model attention scale.
 //
 // Outputs:
 // - splitLse: FP32 [numTokens, kLocalHeads, numSplits]. Each element is log2(sum(exp2(score))) for one split.
@@ -865,13 +731,17 @@ __global__ void generationRopeAppendKernel(__nv_bfloat16* fusedQ, __nv_bfloat16 
 // - output: BF16 [numTokens, kLocalHeads * kKvLoraRank], logically [numTokens, 8, 512].
 //
 // Side effects:
-// - Writes splitLse, splitOutput, syncScratch, and output. It does not mutate Q, KV cache, or top-k tensors.
+// - Writes fusedQ's RoPE suffix, quantQ, bmm1Scale, bmm2Scale, the paged KV cache, splitLse, splitOutput,
+//   syncScratch, and output.
 // - Uses dynamic shared memory [kLocalHeads, kSparseSplitSize] floats for per-head split scores/probabilities.
-__global__ void generationAttentionCombinedKernel(__nv_fp8_e4m3 const* quantQ, __nv_fp8_e4m3 const* kvCachePool,
-    int32_t const* topkIndicesPool, int32_t const* topkIndicesLocal, int32_t const* sequenceLength,
-    int32_t const* specDecodingPackedMask, int specMaskWords, float* splitLse, float* splitOutput, int32_t* syncScratch,
-    __nv_bfloat16* output, float const* bmm1Scale, float const* bmm2Scale, int numTokens, int topK, int numSplits,
-    int expectedCtas)
+__global__ void generationAttentionCombinedKernel(__nv_bfloat16* fusedQ, __nv_bfloat16 const* qPe,
+    __nv_bfloat16 const* latentCache, float2 const* rotaryCosSin, tensorrt_llm::kernels::KVBlockArray kvCache,
+    __nv_fp8_e4m3* quantQ, __nv_fp8_e4m3 const* kvCachePool, int32_t const* topkIndicesPool,
+    int32_t const* topkIndicesLocal, int32_t const* sequenceLength, int32_t const* specDecodingPackedMask,
+    int specMaskWords, float* splitLse, float* splitOutput, int32_t* syncScratch, __nv_bfloat16* output,
+    float* bmm1Scale, float* bmm2Scale, float const* kvScaleOrigQuant, float const* kvScaleQuantOrig,
+    int64_t qPeStrideToken, int64_t qPeStrideHead, int numTokens, int topK, int numSplits, int expectedCtas,
+    float hostScoreScale)
 {
     // Dynamic shared memory is partitioned as [head, split_offset]. Lane 0 in each consumer warp first writes
     // log2 scores, then rewrites the same slots as split-local normalized probabilities.
@@ -923,6 +793,124 @@ __global__ void generationAttentionCombinedKernel(__nv_fp8_e4m3 const* quantQ, _
     {
         return;
     }
+
+    // Publish FP8 dequant scales once before any CTA can enter attention.
+    if (tokenIdx == 0 && splitIdx == 0 && tid == 0)
+    {
+        // FP8 to original-domain dequant scale used by BMM1 and BMM2.
+        float const dequantScale = kvScaleQuantOrig == nullptr ? 1.0F : kvScaleQuantOrig[0];
+        // TRTLLM-Gen softmax uses exp2f, so keep both natural-log and log2-space score scales.
+        constexpr float kLog2e = 1.4426950408889634074F;
+        // BMM1 scale is dequant_q * dequant_k * attention_scale.
+        float const bmm1ScaleValue = dequantScale * dequantScale * hostScoreScale;
+        // Natural-log score scale.
+        bmm1Scale[0] = bmm1ScaleValue;
+        // Log2-space score scale consumed by the generation split-attention phase below.
+        bmm1Scale[1] = bmm1ScaleValue * kLog2e;
+        // BMM2 dequantizes FP8 V. The generic op multiplies by out_scale when provided; WIP passes no out_scale.
+        bmm2Scale[0] = dequantScale;
+    }
+
+    // The current group's first absolute KV position. This uses the same fallback as the visibility logic so CUDA
+    // graph warmup with a dummy sequenceLength still rotates and appends at the top-k-derived positions.
+    int const currentGroupStart = currentGroupStartShared;
+    // Original-domain to FP8 scale for Q and KV.
+    float const quantScale = kvScaleOrigQuant == nullptr ? 1.0F : kvScaleOrigQuant[0];
+    // Absolute KV-cache position for this decode/MTP token.
+    int const tokenIdxInKvCache = currentGroupStart + tokenIdx;
+
+    // Split CTAs cooperatively cover Q heads. For the common topK=2048 case, splitIdx 0..7 each owns one head; for
+    // smaller unit-test topK values, the available split CTAs stride over all heads.
+    for (int appendHeadIdx = splitIdx; appendHeadIdx < kLocalHeads; appendHeadIdx += numSplits)
+    {
+        // Quantize the absorbed q_nope prefix [0, 512) from fusedQ into quantQ.
+        for (int dim = tid; dim < kKvLoraRank; dim += blockDim.x)
+        {
+            // Flattened [token, head, dim] offset for both fusedQ and quantQ.
+            int const qOffset = (tokenIdx * kLocalHeads + appendHeadIdx) * kHeadDim + dim;
+            // The BMM wrote BF16 q_nope into fusedQ; convert original-domain BF16 to scaled FP8.
+            quantQ[qOffset] = __nv_fp8_e4m3(toFloat(fusedQ[qOffset]) * quantScale);
+        }
+
+        // Rotate and quantize the per-head Q RoPE suffix [512, 576).
+        for (int pairIdx = tid; pairIdx < kRopeDim / 2; pairIdx += blockDim.x)
+        {
+            // Adjacent RoPE scalar pair within the 64-dim suffix.
+            int const dim = 2 * pairIdx;
+            // qPe may be a non-contiguous view, so use runtime token/head strides.
+            int64_t const qPeOffset = tokenIdx * qPeStrideToken + appendHeadIdx * qPeStrideHead + dim;
+            // Load one BF16 pair as FP32 for RoPE math.
+            float2 value;
+            value.x = toFloat(qPe[qPeOffset]);
+            value.y = toFloat(qPe[qPeOffset + 1]);
+            // Use absolute KV position for the current decode/MTP token.
+            float2 const coef = rotaryCosSin[tokenIdxInKvCache * kRopeDim + pairIdx];
+            // Apply GPT-J style adjacent-pair RoPE.
+            float2 const rotated = rotaryTransform(value, coef);
+            // Flattened output offset for the first RoPE suffix scalar.
+            int const qOffset = (tokenIdx * kLocalHeads + appendHeadIdx) * kHeadDim + kKvLoraRank + dim;
+            // Match the generic kernel by rounding rotated RoPE values to BF16 before FP8 quantization.
+            __nv_bfloat16 const first = toBfloat16(rotated.x);
+            // Round the second adjacent component to BF16.
+            __nv_bfloat16 const second = toBfloat16(rotated.y);
+            // Keep fusedQ readable for debug comparisons even though decode attention consumes quantQ.
+            fusedQ[qOffset] = first;
+            // Store the second rotated component in fusedQ.
+            fusedQ[qOffset + 1] = second;
+            // Quantize first rotated component into full FP8 Q.
+            quantQ[qOffset] = __nv_fp8_e4m3(toFloat(first) * quantScale);
+            // Quantize second rotated component into full FP8 Q.
+            quantQ[qOffset + 1] = __nv_fp8_e4m3(toFloat(second) * quantScale);
+        }
+    }
+
+    // Split CTA 0 owns the shared KV append for this token. It writes the compressed latent KV/V prefix and the
+    // rotated K RoPE suffix into the paged KV cache before all split CTAs read through kvCachePool.
+    if (splitIdx == 0)
+    {
+        // Resolve the physical page that contains this token's single MLA KV head.
+        auto* blockPtr = kvCache.getKBlockPtr(/*seqIdx=*/0, tokenIdxInKvCache);
+        // Copy and quantize latent KV/V prefix [0, 512).
+        for (int dim = tid; dim < kKvLoraRank; dim += blockDim.x)
+        {
+            // Scalar offset inside the resolved physical KV page.
+            int const cacheOffset = kvCache.getKVLocalIdx(tokenIdxInKvCache, /*headIdx=*/0, kHeadDim, dim);
+            // Load BF16 latent KV/V and store scaled FP8.
+            reinterpret_cast<__nv_fp8_e4m3*>(blockPtr)[cacheOffset]
+                = __nv_fp8_e4m3(toFloat(latentCache[tokenIdx * kHeadDim + dim]) * quantScale);
+        }
+
+        // Rotate and quantize the shared K RoPE suffix [512, 576).
+        for (int pairIdx = tid; pairIdx < kRopeDim / 2; pairIdx += blockDim.x)
+        {
+            // Adjacent scalar pair within the K RoPE suffix.
+            int const dim = 2 * pairIdx;
+            // Flattened latentCache offset for the first suffix scalar.
+            int const latentOffset = tokenIdx * kHeadDim + kKvLoraRank + dim;
+            // Load one K RoPE pair as FP32 for rotation.
+            float2 value;
+            value.x = toFloat(latentCache[latentOffset]);
+            value.y = toFloat(latentCache[latentOffset + 1]);
+            // K uses the same absolute position as Q for the appended token.
+            float2 const coef = rotaryCosSin[tokenIdxInKvCache * kRopeDim + pairIdx];
+            // Apply RoPE to the K suffix.
+            float2 const rotated = rotaryTransform(value, coef);
+            // Scalar offset inside the paged KV row.
+            int const cacheOffset
+                = kvCache.getKVLocalIdx(tokenIdxInKvCache, /*headIdx=*/0, kHeadDim, kKvLoraRank + dim);
+            // Round to BF16 before FP8 quantization to match the generic MLA RoPE kernel.
+            __nv_bfloat16 const first = toBfloat16(rotated.x);
+            // Round the second component.
+            __nv_bfloat16 const second = toBfloat16(rotated.y);
+            // Store first rotated K suffix component as FP8.
+            reinterpret_cast<__nv_fp8_e4m3*>(blockPtr)[cacheOffset] = __nv_fp8_e4m3(toFloat(first) * quantScale);
+            // Store second rotated K suffix component as FP8.
+            reinterpret_cast<__nv_fp8_e4m3*>(blockPtr)[cacheOffset + 1] = __nv_fp8_e4m3(toFloat(second) * quantScale);
+        }
+    }
+
+    // Wait until Q quantization, bmm scale publication, and paged KV appends are visible to every split CTA.
+    generationGridBarrier(syncScratch, expectedCtas);
 
     // Threads 256..383 correspond to TileRT's producer/control group. This WIP version does not issue TMA gather
     // from them yet; they skip split math but stay alive so the CTA reaches the common grid barrier safely.
@@ -1062,8 +1050,9 @@ __global__ void generationAttentionCombinedKernel(__nv_fp8_e4m3 const* quantQ, _
         }
     }
 
-    // Wait until every split CTA has published splitLse and splitOutput.
-    generationGridBarrier(syncScratch, expectedCtas);
+    // Wait until every split CTA has published splitLse and splitOutput. Use a second independent one-shot barrier
+    // because the append-phase barrier's release flag remains set for the rest of this kernel launch.
+    generationGridBarrier(syncScratch + 2, expectedCtas);
 
     // Reuse the split CTAs for each token as combine collectors. With the target topK=2048 case there are 32 split
     // CTAs per token, so the first eight CTAs collect one local head each. Small-topK tests may have fewer than eight
@@ -1269,8 +1258,8 @@ torch::Tensor dsv3_fused_mla_context_cuda(torch::Tensor fused_q, torch::Tensor q
 // Fused GLM-5/DeepSeek-V3 sparse MLA generation/decode path.
 //
 // Inputs:
-// - fused_q: mutable BF16 [numTokens, 8, 576]. Dims [0, 512) contain absorbed q_nope from the BMM; the
-//   RoPE-prep launch fills dims [512, 576).
+// - fused_q: mutable BF16 [numTokens, 8, 576]. Dims [0, 512) contain absorbed q_nope from the BMM; the combined
+//   kernel fills dims [512, 576).
 // - q_pe: BF16 [numTokens, 8, 64]. Unrotated per-head Q RoPE suffix.
 // - latent_cache: BF16 [numTokens, 576]. Current decode/MTP latent KV/V plus unrotated shared K RoPE.
 // - rotary_cos_sin: FP32 float2 RoPE table.
@@ -1335,14 +1324,6 @@ torch::Tensor dsv3_fused_mla_generation_cuda(torch::Tensor fused_q, torch::Tenso
     // Generic MLA RoPE uses 1 / (q_scaling * sqrt(qk_nope + qk_rope)); GLM-5 has 192 + 64.
     float const hostScoreScale = 1.0F / (static_cast<float>(q_scaling) * sqrtf(256.0F));
 
-    // Launch one CTA per token for each Q head plus one shared KV-cache branch. This produces quantQ and appends
-    // the current decode/MTP rows before the attention launch below reads them through kv_cache_pool.
-    dim3 prepGrid(numTokens, kLocalHeads + 1);
-    generationRopeAppendKernel<<<prepGrid, kThreads, 0, stream>>>(fusedQPtr, qPePtr, latentCachePtr, rotaryCosSinPtr,
-        sequence_length.data_ptr<int32_t>(), kv_cache, quantQPtr, mla_bmm1_scale.data_ptr<float>(),
-        mla_bmm2_scale.data_ptr<float>(), kvScaleOrigQuantPtr, kvScaleQuantOrigPtr, qPeStrideToken, qPeStrideHead,
-        numTokens, hostScoreScale);
-
     // Allocate BF16 output [numTokens, 8 * 512] on the same device as fused_q.
     auto output = torch::empty({numTokens, kLocalHeads * kKvLoraRank}, fused_q.options());
     // TileRT splits topK=2048 into 32 chunks of 64 selected KV rows. Keep the same split size and support
@@ -1365,10 +1346,11 @@ torch::Tensor dsv3_fused_mla_generation_cuda(torch::Tensor fused_q, torch::Tenso
     auto splitLse = torch::empty({numTokens, kLocalHeads, numSplits}, scratchOptions);
     // splitOutput: FP32 [numTokens, 8, numSplits, 512], split-local normalized latent output.
     auto splitOutput = torch::empty({numTokens, kLocalHeads, numSplits, kKvLoraRank}, scratchOptions);
-    // syncScratch: INT32 [2], [arrival counter, release flag] for the one-shot in-kernel grid barrier.
-    auto syncScratch = torch::empty({2}, fused_q.options().dtype(torch::kInt32));
-    // Start every combined launch with a clear barrier state.
-    TLLM_CUDA_CHECK(cudaMemsetAsync(syncScratch.data_ptr<int32_t>(), 0, 2 * sizeof(int32_t), stream));
+    // syncScratch: INT32 [4]. Entries [0, 1] are the append-phase barrier state, and entries [2, 3] are the
+    // split-output barrier state.
+    auto syncScratch = torch::empty({4}, fused_q.options().dtype(torch::kInt32));
+    // Start every combined launch with both barrier states clear.
+    TLLM_CUDA_CHECK(cudaMemsetAsync(syncScratch.data_ptr<int32_t>(), 0, 4 * sizeof(int32_t), stream));
     // kv_cache_pool is an FP8 E4M3 tensor [poolTokens, 1, 576].
     auto* kvCachePoolPtr = reinterpret_cast<__nv_fp8_e4m3 const*>(kv_cache_pool.data_ptr());
     // Raw BF16 output pointer [numTokens, 8 * 512].
@@ -1384,12 +1366,14 @@ torch::Tensor dsv3_fused_mla_generation_cuda(torch::Tensor fused_q, torch::Tenso
     dim3 splitGrid(numTokens * numSplits);
     // Shared memory stores [8 heads, 64 split candidates] score/probability slots.
     size_t const splitSharedBytes = kLocalHeads * kSparseSplitSize * sizeof(float);
-    // Compute split-local partials, synchronize split CTAs, and combine into final latent outputs in one launch.
-    generationAttentionCombinedKernel<<<splitGrid, kTileRtThreads, splitSharedBytes, stream>>>(quantQPtr,
-        kvCachePoolPtr, topk_indices_pool.data_ptr<int32_t>(), topk_indices.data_ptr<int32_t>(),
-        sequence_length.data_ptr<int32_t>(), specDecodingPackedMaskPtr, specMaskWords, splitLse.data_ptr<float>(),
-        splitOutput.data_ptr<float>(), syncScratch.data_ptr<int32_t>(), outputPtr, mla_bmm1_scale.data_ptr<float>(),
-        mla_bmm2_scale.data_ptr<float>(), numTokens, topK, numSplits, numTokens * numSplits);
+    // The combined launch first performs RoPE/Q quantization/KV append, grid-syncs, computes split-local partials,
+    // grid-syncs again, and then combines into final latent outputs.
+    generationAttentionCombinedKernel<<<splitGrid, kTileRtThreads, splitSharedBytes, stream>>>(fusedQPtr, qPePtr,
+        latentCachePtr, rotaryCosSinPtr, kv_cache, quantQPtr, kvCachePoolPtr, topk_indices_pool.data_ptr<int32_t>(),
+        topk_indices.data_ptr<int32_t>(), sequence_length.data_ptr<int32_t>(), specDecodingPackedMaskPtr, specMaskWords,
+        splitLse.data_ptr<float>(), splitOutput.data_ptr<float>(), syncScratch.data_ptr<int32_t>(), outputPtr,
+        mla_bmm1_scale.data_ptr<float>(), mla_bmm2_scale.data_ptr<float>(), kvScaleOrigQuantPtr, kvScaleQuantOrigPtr,
+        qPeStrideToken, qPeStrideHead, numTokens, topK, numSplits, numTokens * numSplits, hostScoreScale);
 
     // Report any asynchronous CUDA error before returning to Python.
     sync_check_cuda_error(stream);
