@@ -542,16 +542,30 @@ def _custom_decode_attention(
     quant_q_buffer: torch.Tensor,
     spec_decoding_packed_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    _ = fused_q, q_pe, latent_cache, attention, cu_q_seqlens, cu_kv_seqlens, fmha_scheduler_counter
+    _ = cu_q_seqlens, cu_kv_seqlens, fmha_scheduler_counter
+    attention._ensure_rope_table_size(metadata.max_seq_len)
     return torch.ops.trtllm.dsv3_fused_mla_generation(
+        fused_q,
+        q_pe,
+        latent_cache,
+        attention.rotary_cos_sin,
+        metadata.kv_lens_cuda_runtime,
+        metadata.kv_cache_block_offsets,
+        metadata.kv_cache_manager.kv_cache_pool_pointers,
+        metadata.kv_cache_manager.kv_cache_pool_mapping,
         topk_indices,
         topk_indices_pool,
         kv_cache_pool,
-        metadata.kv_lens_cuda_runtime,
+        attention.kv_scale_orig_quant,
+        attention.kv_scale_quant_orig,
         quant_q_buffer,
         mla_bmm1_scale,
         mla_bmm2_scale,
         spec_decoding_packed_mask,
+        attention.get_local_layer_idx(metadata),
+        metadata.kv_cache_manager.tokens_per_block,
+        int(attention.quant_mode),
+        float(attention.q_scaling),
     )
 
 
@@ -1166,21 +1180,21 @@ def test_glm5_fp8_decode_custom_op_handles_large_pool_indices() -> None:
     ).to(torch.float8_e4m3fn)
     kv_cache_pool[pool_rows.to(torch.long), 0, :] = kv_rows
 
-    fused_q = torch.empty(
+    fused_q = torch.zeros(
         _DECODE_NUM_TOKENS,
         _LOCAL_NUM_HEADS,
         _HEAD_DIM,
         dtype=torch.bfloat16,
         device=device,
     )
-    q_pe = torch.empty(
+    q_pe = torch.zeros(
         _DECODE_NUM_TOKENS,
         _LOCAL_NUM_HEADS,
         _QK_ROPE_HEAD_DIM,
         dtype=torch.bfloat16,
         device=device,
     )
-    latent_cache = torch.empty(
+    latent_cache = torch.zeros(
         _DECODE_NUM_TOKENS,
         _HEAD_DIM,
         dtype=torch.bfloat16,
@@ -1212,9 +1226,9 @@ def test_glm5_fp8_decode_custom_op_handles_large_pool_indices() -> None:
             quant_q_buffer,
         )
 
+    output_scale = _get_scalar(attention.kv_scale_quant_orig, device)
     expected = (
-        kv_rows[:, :_KV_LORA_RANK]
-        .to(torch.float32)
+        (kv_rows[:, :_KV_LORA_RANK].to(torch.float32) * output_scale)
         .unsqueeze(1)
         .expand(_DECODE_NUM_TOKENS, _LOCAL_NUM_HEADS, _KV_LORA_RANK)
         .reshape(_DECODE_NUM_TOKENS, _LOCAL_NUM_HEADS * _KV_LORA_RANK)

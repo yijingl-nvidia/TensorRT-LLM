@@ -44,7 +44,6 @@ from ..peft.lora.layer import LoraLayer
 from .modeling_deepseekv3_mla_pytorch import dsv3_mla_context_pytorch, dsv3_mla_decode_pytorch
 
 _FUSED_MLA_MODE_ENV = "TRTLLM_DEEPSEEKV3_FUSED_MLA_MODE"
-_FUSED_MLA_CONTEXT_KERNEL_ENV = "TRTLLM_DEEPSEEKV3_FUSED_MLA_CONTEXT_KERNEL"
 FUSED_MLA_MODE_BASELINE = "baseline"
 FUSED_MLA_MODE_PYTORCH = "pytorch"
 FUSED_MLA_MODE_WIP = "wip"
@@ -921,29 +920,6 @@ class FusedMLA(nn.Module):
         assert mla_bmm2_scale is not None
 
         def run_mla_rope_generation() -> None:
-            if fused_mla_mode == FUSED_MLA_MODE_WIP:
-                self.mqa._ensure_rope_table_size(attn_metadata.max_seq_len)
-                torch.ops.trtllm.dsv3_fused_mla_rope_generation(
-                    fused_q,
-                    q_pe,
-                    latent_cache,
-                    self.mqa.rotary_cos_sin,
-                    attn_metadata.kv_lens_cuda_runtime,
-                    attn_metadata.kv_cache_block_offsets,
-                    attn_metadata.kv_cache_manager.kv_cache_pool_pointers,
-                    attn_metadata.kv_cache_manager.kv_cache_pool_mapping,
-                    self.mqa.kv_scale_orig_quant,
-                    self.mqa.kv_scale_quant_orig,
-                    quant_q_buffer,
-                    mla_bmm1_scale,
-                    mla_bmm2_scale,
-                    self.mqa.get_local_layer_idx(attn_metadata),
-                    attn_metadata.kv_cache_manager.tokens_per_block,
-                    int(self.mqa.quant_mode),
-                    float(self.mqa.q_scaling),
-                )
-                return
-
             self.mqa.mla_rope_generation(
                 fused_q,
                 q_pe,
@@ -957,15 +933,23 @@ class FusedMLA(nn.Module):
                 quant_q_buffer,
             )
 
-        maybe_execute_in_parallel(
-            lambda: self._bmm_bf16_out(
+        if fused_mla_mode == FUSED_MLA_MODE_WIP:
+            self._bmm_bf16_out(
                 q_nope_t, self.k_b_proj_trans, self.k_b_proj_trans.transpose(1, 2), q_nope_out
-            ),
-            run_mla_rope_generation,
-            self.ln_events[0],
-            self.ln_events[1],
-            rope_stream,
-        )
+            )
+        else:
+            maybe_execute_in_parallel(
+                lambda: self._bmm_bf16_out(
+                    q_nope_t,
+                    self.k_b_proj_trans,
+                    self.k_b_proj_trans.transpose(1, 2),
+                    q_nope_out,
+                ),
+                run_mla_rope_generation,
+                self.ln_events[0],
+                self.ln_events[1],
+                rope_stream,
+            )
 
         # Use generation_only for generation phase and context_only for context phase in DSA attention
         attention_input_type = AttentionInputType.generation_only
@@ -993,14 +977,27 @@ class FusedMLA(nn.Module):
                 )
             else:
                 attn_out_latent = torch.ops.trtllm.dsv3_fused_mla_generation(
+                    fused_q,
+                    q_pe,
+                    latent_cache,
+                    self.mqa.rotary_cos_sin,
+                    attn_metadata.kv_lens_cuda_runtime,
+                    attn_metadata.kv_cache_block_offsets,
+                    attn_metadata.kv_cache_manager.kv_cache_pool_pointers,
+                    attn_metadata.kv_cache_manager.kv_cache_pool_mapping,
                     topk_indices,
                     topk_indices_pool,
                     kv_cache_pool,
-                    attn_metadata.kv_lens_cuda_runtime,
+                    self.mqa.kv_scale_orig_quant,
+                    self.mqa.kv_scale_quant_orig,
                     quant_q_buffer,
                     mla_bmm1_scale,
                     mla_bmm2_scale,
                     attn_metadata.spec_decoding_packed_mask,
+                    self.mqa.get_local_layer_idx(attn_metadata),
+                    attn_metadata.kv_cache_manager.tokens_per_block,
+                    int(self.mqa.quant_mode),
+                    float(self.mqa.q_scaling),
                 )
         else:
             fused_q = fused_q.view(

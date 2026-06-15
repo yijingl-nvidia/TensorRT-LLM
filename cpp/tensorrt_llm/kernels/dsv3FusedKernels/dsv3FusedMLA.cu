@@ -1166,42 +1166,82 @@ void dsv3_fused_mla_rope_generation_cuda(torch::Tensor fused_q, torch::Tensor q_
 // Fused GLM-5/DeepSeek-V3 sparse MLA generation/decode path.
 //
 // Inputs:
+// - fused_q: mutable BF16 [numTokens, 8, 576]. Dims [0, 512) contain absorbed q_nope from the BMM; the
+//   RoPE-prep launch fills dims [512, 576).
+// - q_pe: BF16 [numTokens, 8, 64]. Unrotated per-head Q RoPE suffix.
+// - latent_cache: BF16 [numTokens, 576]. Current decode/MTP latent KV/V plus unrotated shared K RoPE.
+// - rotary_cos_sin: FP32 float2 RoPE table.
+// - sequence_length: INT32 [1], total KV length after appending this decode/MTP group.
+// - kv_cache: paged TRT-LLM KV cache view to receive the current decode/MTP rows.
 // - topk_indices: INT32 [numTokens, topK], local sequence positions used for MTP visibility checks.
 // - topk_indices_pool: INT32 [numTokens, topK], global KV-cache pool rows.
 // - kv_cache_pool: FP8 E4M3 [poolTokens, 1, 576], flattened by the kernel as [poolTokens, 576].
-// - sequence_length: INT32 [1], total KV length after appending this decode/MTP group.
 // - quant_q_buffer: UINT8-backed FP8 E4M3 [numTokens, 8, 576].
 // - mla_bmm1_scale: FP32 [2], with index 1 holding log2-space QK score scale.
 // - mla_bmm2_scale: FP32 [1], FP8 V dequantization scale.
+// - kv_scale_orig_quant: optional FP32 [1], original-domain to FP8 scale.
+// - kv_scale_quant_orig: optional FP32 [1], FP8 to original-domain scale.
 // - spec_decoding_packed_mask: optional INT32 [maxRequests, numTokens, packedWords].
+// - q_scaling: model attention scaling divisor.
 //
 // Output:
 // - Returns BF16 [numTokens, 8 * 512], logically [numTokens, 8, 512].
 //
 // Side effects:
-// - Writes only the returned output tensor. The paged KV cache was already updated by the prep op.
-torch::Tensor dsv3_fused_mla_generation_cuda(torch::Tensor topk_indices, torch::Tensor topk_indices_pool,
-    torch::Tensor kv_cache_pool, torch::Tensor sequence_length, torch::Tensor quant_q_buffer,
-    torch::Tensor mla_bmm1_scale, torch::Tensor mla_bmm2_scale, std::optional<torch::Tensor> spec_decoding_packed_mask)
+// - Mutates fused_q suffix for debug visibility.
+// - Mutates quant_q_buffer, mla_bmm1_scale, mla_bmm2_scale, and kv_cache before running attention.
+// - Writes the returned output tensor.
+torch::Tensor dsv3_fused_mla_generation_cuda(torch::Tensor fused_q, torch::Tensor q_pe, torch::Tensor latent_cache,
+    torch::Tensor rotary_cos_sin, torch::Tensor sequence_length, tensorrt_llm::kernels::KVBlockArray kv_cache,
+    torch::Tensor topk_indices, torch::Tensor topk_indices_pool, torch::Tensor kv_cache_pool,
+    torch::Tensor quant_q_buffer, torch::Tensor mla_bmm1_scale, torch::Tensor mla_bmm2_scale,
+    std::optional<torch::Tensor> kv_scale_orig_quant, std::optional<torch::Tensor> kv_scale_quant_orig,
+    std::optional<torch::Tensor> spec_decoding_packed_mask, double q_scaling)
 {
-    // quant_q_buffer is UINT8-backed FP8 [numTokens, 8, 576]; it defines the token count and output device.
-    // Set active CUDA device from quant_q_buffer.
-    c10::cuda::CUDAGuard const deviceGuard{quant_q_buffer.device()};
+    // Set the active CUDA device to match fused_q so the launch uses the correct GPU.
+    c10::cuda::CUDAGuard const deviceGuard{fused_q.device()};
     // Use PyTorch's current stream for stream-ordering and CUDA graph capture compatibility.
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream(quant_q_buffer.get_device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream(fused_q.get_device());
 
     // Number of decode/MTP query rows in this call.
-    int const numTokens = static_cast<int>(quant_q_buffer.size(0));
+    int const numTokens = static_cast<int>(fused_q.size(0));
     // Sparse top-k width per query row.
     int const topK = static_cast<int>(topk_indices_pool.size(1));
     // Dynamic shared memory uses topK floats for weights, so enforce the development-kernel bound.
     TORCH_CHECK(topK <= kMaxTopK, "dsv3_fused_mla_generation supports topK <= ", kMaxTopK, ", got ", topK);
-    // Allocate BF16 output [numTokens, 8 * 512] on the same device as quant_q_buffer.
-    auto output
-        = torch::empty({numTokens, kLocalHeads * kKvLoraRank}, quant_q_buffer.options().dtype(torch::kBFloat16));
-
+    // Optional original->FP8 scale pointer.
+    float const* kvScaleOrigQuantPtr
+        = kv_scale_orig_quant.has_value() ? kv_scale_orig_quant.value().data_ptr<float>() : nullptr;
+    // Optional FP8->original scale pointer.
+    float const* kvScaleQuantOrigPtr
+        = kv_scale_quant_orig.has_value() ? kv_scale_quant_orig.value().data_ptr<float>() : nullptr;
+    // RoPE table is stored as adjacent [cos, sin] pairs.
+    auto* rotaryCosSinPtr = reinterpret_cast<float2 const*>(rotary_cos_sin.data_ptr());
+    // Raw BF16 fused Q pointer [numTokens, 8, 576].
+    auto* fusedQPtr = static_cast<__nv_bfloat16*>(fused_q.data_ptr());
+    // Raw BF16 qPe pointer. It may be a strided view.
+    auto* qPePtr = static_cast<__nv_bfloat16 const*>(q_pe.data_ptr());
+    // Raw BF16 latent cache pointer [numTokens, 576].
+    auto* latentCachePtr = static_cast<__nv_bfloat16 const*>(latent_cache.data_ptr());
     // quant_q_buffer is a uint8 tensor whose bytes are FP8 E4M3 values.
-    auto* quantQPtr = reinterpret_cast<__nv_fp8_e4m3 const*>(quant_q_buffer.data_ptr());
+    auto* quantQPtr = reinterpret_cast<__nv_fp8_e4m3*>(quant_q_buffer.data_ptr());
+    // q_pe may be a split view, so pass runtime strides.
+    int64_t const qPeStrideToken = q_pe.stride(0);
+    // Head stride for q_pe.
+    int64_t const qPeStrideHead = q_pe.stride(1);
+    // Generic MLA RoPE uses 1 / (q_scaling * sqrt(qk_nope + qk_rope)); GLM-5 has 192 + 64.
+    float const hostScoreScale = 1.0F / (static_cast<float>(q_scaling) * sqrtf(256.0F));
+
+    // Launch one CTA per token for each Q head plus one shared KV-cache branch. This produces quantQ and appends
+    // the current decode/MTP rows before the attention launch below reads them through kv_cache_pool.
+    dim3 prepGrid(numTokens, kLocalHeads + 1);
+    generationRopeAppendKernel<<<prepGrid, kThreads, 0, stream>>>(fusedQPtr, qPePtr, latentCachePtr, rotaryCosSinPtr,
+        sequence_length.data_ptr<int32_t>(), kv_cache, quantQPtr, mla_bmm1_scale.data_ptr<float>(),
+        mla_bmm2_scale.data_ptr<float>(), kvScaleOrigQuantPtr, kvScaleQuantOrigPtr, qPeStrideToken, qPeStrideHead,
+        numTokens, hostScoreScale);
+
+    // Allocate BF16 output [numTokens, 8 * 512] on the same device as fused_q.
+    auto output = torch::empty({numTokens, kLocalHeads * kKvLoraRank}, fused_q.options());
     // kv_cache_pool is an FP8 E4M3 tensor [poolTokens, 1, 576].
     auto* kvCachePoolPtr = reinterpret_cast<__nv_fp8_e4m3 const*>(kv_cache_pool.data_ptr());
     // Raw BF16 output pointer [numTokens, 8 * 512].
