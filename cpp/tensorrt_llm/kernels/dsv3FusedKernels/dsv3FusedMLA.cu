@@ -910,7 +910,8 @@ __global__ void generationAttentionCombinedKernel(__nv_bfloat16* fusedQ, __nv_bf
     float* splitOutput, int32_t* syncScratch, __nv_bfloat16* output, float* bmm1Scale, float* bmm2Scale,
     float const* kvScaleOrigQuant, float const* kvScaleQuantOrig, int64_t qNopeStrideToken, int64_t qNopeStrideHead,
     int64_t kBProjStrideHead, int64_t kBProjStrideDim, int64_t kBProjStrideReduction, int64_t qPeStrideToken,
-    int64_t qPeStrideHead, int numTokens, int topK, int numSplits, int expectedCtas, float hostScoreScale)
+    int64_t qPeStrideHead, int numTokens, int topK, int numSplits, int expectedCtas, float hostScoreScale,
+    bool isContext, int contextChunkStart)
 {
     // Dynamic shared memory is partitioned as [head, split_offset]. Lane 0 in each consumer warp first writes
     // log2 scores, then rewrites the same slots as split-local normalized probabilities.
@@ -932,10 +933,11 @@ __global__ void generationAttentionCombinedKernel(__nv_bfloat16* fusedQ, __nv_bf
     if (tid == 0)
     {
         // Normally: post-append length minus number of just-appended decode tokens.
-        int currentGroupStart = sequenceLength[0] - numTokens;
+        int currentGroupStart = isContext ? contextChunkStart : sequenceLength[0] - numTokens;
         // CUDA graph warmup can capture a dummy sequenceLength equal to numTokens. If top-k was replay-updated to
-        // real positions, infer the group start from the maximum local selected index.
-        if (sequenceLength[0] <= numTokens)
+        // real positions, infer the group start from the maximum local selected index. Context callers provide the
+        // exact chunk start because they process long prefill in multiple 4-token launches.
+        if (!isContext && sequenceLength[0] <= numTokens)
         {
             // Initialize to no valid top-k entries.
             int maxLocalIdx = -1;
@@ -1400,6 +1402,8 @@ torch::Tensor dsv3_fused_mla_context_cuda(torch::Tensor fused_q, torch::Tensor q
 // - kv_scale_quant_orig: optional FP32 [1], FP8 to original-domain scale.
 // - spec_decoding_packed_mask: optional INT32 [maxRequests, numTokens, packedWords].
 // - q_scaling: model attention scaling divisor.
+// - is_context: bool, true when this launch handles a context/prefill chunk instead of a decode/MTP group.
+// - context_chunk_start: int64, first local KV position of the current context chunk when is_context is true.
 //
 // Output:
 // - Returns BF16 [numTokens, 8 * 512], logically [numTokens, 8, 512].
@@ -1414,7 +1418,7 @@ torch::Tensor dsv3_fused_mla_generation_cuda(torch::Tensor fused_q, torch::Tenso
     torch::Tensor kv_cache_pool, torch::Tensor quant_q_buffer, torch::Tensor mla_bmm1_scale,
     torch::Tensor mla_bmm2_scale, std::optional<torch::Tensor> kv_scale_orig_quant,
     std::optional<torch::Tensor> kv_scale_quant_orig, std::optional<torch::Tensor> spec_decoding_packed_mask,
-    double q_scaling)
+    double q_scaling, bool is_context, int64_t context_chunk_start)
 {
     // Set the active CUDA device to match fused_q so the launch uses the correct GPU.
     c10::cuda::CUDAGuard const deviceGuard{fused_q.device()};
@@ -1501,6 +1505,7 @@ torch::Tensor dsv3_fused_mla_generation_cuda(torch::Tensor fused_q, torch::Tenso
     // Number of int32 mask words per query token row.
     int const specMaskWords
         = spec_decoding_packed_mask.has_value() ? static_cast<int>(spec_decoding_packed_mask.value().size(-1)) : 0;
+    int const contextChunkStart = static_cast<int>(context_chunk_start);
 
     // Launch one CTA per [decode token, 64-key sparse split], matching TileRT's 32 CTAs/token for topK=2048.
     dim3 splitGrid(numTokens * numSplits);
@@ -1515,7 +1520,7 @@ torch::Tensor dsv3_fused_mla_generation_cuda(torch::Tensor fused_q, torch::Tenso
         syncScratch.data_ptr<int32_t>(), outputPtr, mla_bmm1_scale.data_ptr<float>(), mla_bmm2_scale.data_ptr<float>(),
         kvScaleOrigQuantPtr, kvScaleQuantOrigPtr, qNopeStrideToken, qNopeStrideHead, kBProjStrideHead, kBProjStrideDim,
         kBProjStrideReduction, qPeStrideToken, qPeStrideHead, numTokens, topK, numSplits, numTokens * numSplits,
-        hostScoreScale);
+        hostScoreScale, is_context, contextChunkStart);
 
     // Report any asynchronous CUDA error before returning to Python.
     sync_check_cuda_error(stream);

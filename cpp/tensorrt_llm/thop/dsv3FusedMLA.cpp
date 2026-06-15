@@ -40,7 +40,7 @@ torch::Tensor dsv3_fused_mla_generation_cuda(torch::Tensor fused_q, torch::Tenso
     torch::Tensor kv_cache_pool, torch::Tensor quant_q_buffer, torch::Tensor mla_bmm1_scale,
     torch::Tensor mla_bmm2_scale, std::optional<torch::Tensor> kv_scale_orig_quant,
     std::optional<torch::Tensor> kv_scale_quant_orig, std::optional<torch::Tensor> spec_decoding_packed_mask,
-    double q_scaling);
+    double q_scaling, bool is_context, int64_t context_chunk_start);
 } // namespace dsv3_fused_mla
 
 namespace tensorrt_llm
@@ -129,7 +129,7 @@ th::Tensor dsv3_fused_mla_generation(th::Tensor fused_q, th::Tensor q_nope, th::
     th::Tensor topk_indices_pool, th::Tensor kv_cache_pool, std::optional<th::Tensor> kv_scale_orig_quant,
     std::optional<th::Tensor> kv_scale_quant_orig, th::Tensor quant_q_buffer, th::Tensor mla_bmm1_scale,
     th::Tensor mla_bmm2_scale, std::optional<th::Tensor> spec_decoding_packed_mask, int64_t layer_idx,
-    int64_t tokens_per_block, int64_t quant_mode, double q_scaling)
+    int64_t tokens_per_block, int64_t quant_mode, double q_scaling, bool is_context, int64_t context_chunk_start)
 {
     TORCH_CHECK(fused_q.is_cuda(), "fused_q must be a CUDA tensor");
     TORCH_CHECK(q_nope.is_cuda(), "q_nope must be a CUDA tensor");
@@ -220,6 +220,7 @@ th::Tensor dsv3_fused_mla_generation(th::Tensor fused_q, th::Tensor q_nope, th::
     TORCH_CHECK(kv_cache_pool.stride(2) == 1, "kv_cache_pool last dimension must be contiguous");
     TORCH_CHECK(quant_q_buffer.stride(2) == 1, "quant_q_buffer last dimension must be contiguous");
     TORCH_CHECK(sequence_length.numel() == 1, "GLM-5 fused MLA generation currently expects one sequence");
+    TORCH_CHECK(!is_context || context_chunk_start >= 0, "context_chunk_start must be non-negative in context mode");
     TORCH_CHECK(
         topk_indices_pool.size(1) <= 4096, "topk_indices_pool top-k dimension is larger than the dev kernel supports");
 
@@ -239,8 +240,8 @@ th::Tensor dsv3_fused_mla_generation(th::Tensor fused_q, th::Tensor q_nope, th::
         std::move(k_b_proj_trans), std::move(q_pe), std::move(latent_cache), std::move(rotary_cos_sin),
         std::move(sequence_length), kvCacheBuffers.kvCacheBuffer, std::move(topk_indices), std::move(topk_indices_pool),
         std::move(kv_cache_pool), std::move(quant_q_buffer), std::move(mla_bmm1_scale), std::move(mla_bmm2_scale),
-        std::move(kv_scale_orig_quant), std::move(kv_scale_quant_orig), std::move(spec_decoding_packed_mask),
-        q_scaling);
+        std::move(kv_scale_orig_quant), std::move(kv_scale_quant_orig), std::move(spec_decoding_packed_mask), q_scaling,
+        is_context, context_chunk_start);
 }
 
 } // namespace torch_ext
@@ -261,7 +262,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "Tensor topk_indices_pool, Tensor(b!) kv_cache_pool, Tensor? kv_scale_orig_quant, Tensor? kv_scale_quant_orig, "
         "Tensor(c!) quant_q_buffer, Tensor(d!) mla_bmm1_scale, Tensor(e!) mla_bmm2_scale, "
         "Tensor? spec_decoding_packed_mask, int layer_idx, int tokens_per_block, int quant_mode, "
-        "float q_scaling) -> Tensor");
+        "float q_scaling, bool is_context, int context_chunk_start) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)

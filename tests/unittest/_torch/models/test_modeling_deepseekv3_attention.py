@@ -219,12 +219,13 @@ def _assert_context_attention_close(actual: torch.Tensor, expected: torch.Tensor
         raise AssertionError(message) from err
 
 
-def _build_decode_projected_query(
+def _build_projected_query(
     device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    num_tokens: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     q_for_split = (
         torch.randn(
-            _DECODE_NUM_TOKENS,
+            num_tokens,
             _LOCAL_NUM_HEADS,
             _QK_HEAD_DIM,
             dtype=torch.bfloat16,
@@ -232,7 +233,7 @@ def _build_decode_projected_query(
         )
         * 0.125
     )
-    q_nope, _ = q_for_split.split([_QK_NOPE_HEAD_DIM, _QK_ROPE_HEAD_DIM], dim=-1)
+    q_nope, q_pe = q_for_split.split([_QK_NOPE_HEAD_DIM, _QK_ROPE_HEAD_DIM], dim=-1)
     k_b_proj_trans = torch.zeros(
         _LOCAL_NUM_HEADS,
         _KV_LORA_RANK,
@@ -245,13 +246,20 @@ def _build_decode_projected_query(
     k_b_proj_trans[:, dim_indices, reduction_indices] = 1
 
     fused_q = torch.zeros(
-        _DECODE_NUM_TOKENS,
+        num_tokens,
         _LOCAL_NUM_HEADS,
         _HEAD_DIM,
         dtype=torch.bfloat16,
         device=device,
     )
     fused_q[..., :_KV_LORA_RANK] = q_nope.index_select(dim=-1, index=reduction_indices)
+    return fused_q, q_nope, q_pe, k_b_proj_trans
+
+
+def _build_decode_projected_query(
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    fused_q, q_nope, _, k_b_proj_trans = _build_projected_query(device, _DECODE_NUM_TOKENS)
     return fused_q, q_nope, k_b_proj_trans
 
 
@@ -289,6 +297,77 @@ def _custom_context_attention(
         int(attention.quant_mode),
         float(attention.q_scaling),
     )
+
+
+def _custom_context_attention_with_combined_kernel_chunks(
+    q_nope: torch.Tensor,
+    k_b_proj_trans: torch.Tensor,
+    q_pe: torch.Tensor,
+    latent_cache: torch.Tensor,
+    topk_indices: torch.Tensor,
+    attention: AttentionBackend,
+    metadata: AttentionMetadata,
+    chunk_size: int = _PREDICTED_TOKENS_PER_SEQ,
+) -> torch.Tensor:
+    attention._ensure_rope_table_size(metadata.max_seq_len)
+    topk_indices_pool, kv_cache_pool = transform_local_topk_and_prepare_pool_view(
+        topk_indices,
+        metadata,
+        layer_idx=attention.get_local_layer_idx(metadata),
+        is_generation=False,
+    )
+    cached_context_tokens = int(getattr(metadata, "num_ctx_cached_tokens", 0))
+    sequence_length = metadata.kv_lens_cuda_runtime
+    output = torch.empty(
+        topk_indices.shape[0],
+        _LOCAL_NUM_HEADS * _KV_LORA_RANK,
+        dtype=torch.bfloat16,
+        device=topk_indices.device,
+    )
+
+    for chunk_start in range(0, topk_indices.shape[0], chunk_size):
+        chunk_end = min(chunk_start + chunk_size, topk_indices.shape[0])
+        chunk_len = chunk_end - chunk_start
+        fused_q_chunk = torch.empty(
+            chunk_len,
+            _LOCAL_NUM_HEADS,
+            _HEAD_DIM,
+            dtype=torch.bfloat16,
+            device=topk_indices.device,
+        )
+        quant_q_buffer = torch.empty_like(fused_q_chunk, dtype=torch.uint8)
+        mla_bmm1_scale = torch.empty(2, dtype=torch.float32, device=topk_indices.device)
+        mla_bmm2_scale = torch.empty(1, dtype=torch.float32, device=topk_indices.device)
+
+        output[chunk_start:chunk_end] = torch.ops.trtllm.dsv3_fused_mla_generation(
+            fused_q_chunk,
+            q_nope[chunk_start:chunk_end],
+            k_b_proj_trans,
+            q_pe[chunk_start:chunk_end],
+            latent_cache[chunk_start:chunk_end],
+            attention.rotary_cos_sin,
+            sequence_length,
+            metadata.kv_cache_block_offsets,
+            metadata.kv_cache_manager.kv_cache_pool_pointers,
+            metadata.kv_cache_manager.kv_cache_pool_mapping,
+            topk_indices[chunk_start:chunk_end],
+            topk_indices_pool[chunk_start:chunk_end],
+            kv_cache_pool,
+            attention.kv_scale_orig_quant,
+            attention.kv_scale_quant_orig,
+            quant_q_buffer,
+            mla_bmm1_scale,
+            mla_bmm2_scale,
+            None,
+            attention.get_local_layer_idx(metadata),
+            metadata.kv_cache_manager.tokens_per_block,
+            int(attention.quant_mode),
+            float(attention.q_scaling),
+            True,
+            cached_context_tokens + chunk_start,
+        )
+
+    return output
 
 
 def _build_attention_and_metadata(
@@ -606,6 +685,8 @@ def _custom_decode_attention(
         metadata.kv_cache_manager.tokens_per_block,
         int(attention.quant_mode),
         float(attention.q_scaling),
+        False,
+        0,
     )
 
 
@@ -1117,6 +1198,69 @@ def test_glm5_fp8_decode_custom_op_handles_large_pool_indices() -> None:
         .to(torch.bfloat16)
     )
     _assert_context_attention_close(actual, expected)
+
+
+def test_glm5_fp8_context_combined_kernel_chunks_match_pytorch_reference() -> None:
+    _require_glm5_context_attention_runtime()
+    device = torch.device("cuda")
+    torch.manual_seed(789)
+    torch.cuda.manual_seed(789)
+
+    cached_sequence_length = 48
+    context_sequence_length = 16
+    attention, metadata, _ = _build_attention_and_metadata(
+        context_sequence_length=context_sequence_length,
+        cached_sequence_length=cached_sequence_length,
+    )
+    _set_kv_cache_scale(attention, dequant_scale=0.5)
+    _seed_context_cached_kv_cache(
+        attention,
+        metadata,
+        device,
+        cached_sequence_length,
+    )
+    fused_q, q_nope, q_pe, k_b_proj_trans = _build_projected_query(
+        device,
+        context_sequence_length,
+    )
+    latent_cache = (
+        torch.randn(
+            context_sequence_length,
+            _HEAD_DIM,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        * 0.125
+    )
+    topk_indices = _build_causal_topk(
+        device,
+        context_sequence_length=context_sequence_length,
+        cached_sequence_length=cached_sequence_length,
+    )
+
+    with torch.inference_mode():
+        expected = _torch_context_attention_reference(
+            fused_q,
+            q_pe,
+            latent_cache,
+            topk_indices,
+            attention,
+            metadata,
+        )
+        actual_latent_cache = latent_cache.clone()
+        latent_cache_before = actual_latent_cache.clone()
+        actual = _custom_context_attention_with_combined_kernel_chunks(
+            q_nope,
+            k_b_proj_trans,
+            q_pe,
+            actual_latent_cache,
+            topk_indices,
+            attention,
+            metadata,
+        )
+
+    _assert_context_attention_close(actual, expected)
+    torch.testing.assert_close(actual_latent_cache, latent_cache_before, rtol=0.0, atol=0.0)
 
 
 def test_glm5_fp8_context_custom_op_matches_pytorch_reference_with_strided_q_pe() -> None:

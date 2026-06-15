@@ -856,6 +856,7 @@ class FusedMLA(nn.Module):
         q_nope, q_pe = q.view([-1, self.num_heads_tp, self.qk_head_dim]).split(
             [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
         )
+        fused_mla_mode = get_fused_mla_mode()
 
         # fused_q contains 1) the result of the following bmm with shape [num_tokens, num_heads, kv_lora_rank]
         # 2) rope(q_pe) with shape [num_tokens, num_heads, qk_rope_head_dim]. rope is applied inside AttentionOp
@@ -996,6 +997,8 @@ class FusedMLA(nn.Module):
                     attn_metadata.kv_cache_manager.tokens_per_block,
                     int(self.mqa.quant_mode),
                     float(self.mqa.q_scaling),
+                    False,
+                    0,
                 )
         else:
             fused_q = fused_q.view(
@@ -1074,6 +1077,7 @@ class FusedMLA(nn.Module):
         q_nope, q_pe = q.view([-1, self.num_heads_tp, self.qk_head_dim]).split(
             [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
         )
+        fused_mla_mode = get_fused_mla_mode()
 
         # fused_q contains 1) the result of the following bmm with shape [num_tokens, num_heads, kv_lora_rank]
         # 2) rope(q_pe) with shape [num_tokens, num_heads, qk_rope_head_dim]. rope is applied inside AttentionOp
@@ -1083,7 +1087,9 @@ class FusedMLA(nn.Module):
             device=q.device,
         )
 
-        if self.k_b_proj_trans.dtype == torch.bfloat16:
+        if fused_mla_mode == FUSED_MLA_MODE_WIP:
+            assert self.k_b_proj_trans.dtype == torch.bfloat16
+        elif self.k_b_proj_trans.dtype == torch.bfloat16:
             # [num_heads, num_tokens, self.qk_nope_head_dim]
             q_nope_t = q_nope.transpose(0, 1)
             # [num_heads, num_tokens, self.kv_lora_rank]
@@ -1141,8 +1147,6 @@ class FusedMLA(nn.Module):
 
         position_ids_lifetime = position_ids
 
-        fused_mla_mode = get_fused_mla_mode()
-
         assert self.num_heads_tp == 8
         assert self.num_heads_tp_cp == self.num_heads_tp
         assert self.kv_lora_rank == 512
@@ -1173,25 +1177,68 @@ class FusedMLA(nn.Module):
                     self.mqa,
                 )
             else:
-                attn_out_latent = torch.ops.trtllm.dsv3_fused_mla_context(
-                    fused_q,
-                    q_pe,
-                    latent_cache,
-                    topk_indices_pool,
-                    topk_indices,
-                    kv_cache_pool,
-                    self.mqa.rotary_cos_sin,
-                    attn_metadata.ctx_cached_token_indptr,
-                    attn_metadata.kv_cache_block_offsets,
-                    attn_metadata.kv_cache_manager.kv_cache_pool_pointers,
-                    attn_metadata.kv_cache_manager.kv_cache_pool_mapping,
-                    self.mqa.kv_scale_orig_quant,
-                    self.mqa.kv_scale_quant_orig,
-                    layer_idx,
-                    attn_metadata.kv_cache_manager.tokens_per_block,
-                    int(self.mqa.quant_mode),
-                    float(self.mqa.q_scaling),
+                attn_out_latent = torch.empty(
+                    [num_tokens, self.num_heads_tp * self.kv_lora_rank],
+                    dtype=q.dtype,
+                    device=q.device,
                 )
+                cached_context_tokens = int(getattr(attn_metadata, "num_ctx_cached_tokens", 0))
+                sequence_length = getattr(attn_metadata, "kv_lens_cuda_runtime", None)
+                if sequence_length is None:
+                    sequence_length = torch.empty(1, dtype=torch.int32, device=q.device)
+                chunk_size = self.predicted_tokens_per_seq
+                for chunk_start in range(0, num_tokens, chunk_size):
+                    chunk_end = min(chunk_start + chunk_size, num_tokens)
+                    chunk_len = chunk_end - chunk_start
+                    fused_q_chunk = torch.empty(
+                        [
+                            chunk_len,
+                            self.num_heads_tp,
+                            self.kv_lora_rank + self.qk_rope_head_dim,
+                        ],
+                        dtype=q.dtype,
+                        device=q.device,
+                    )
+                    quant_q_buffer_chunk = torch.empty(
+                        [
+                            chunk_len,
+                            self.num_heads_tp,
+                            self.kv_lora_rank + self.qk_rope_head_dim,
+                        ],
+                        dtype=torch.uint8,
+                        device=q.device,
+                    )
+                    mla_bmm1_scale = torch.empty(2, dtype=torch.float32, device=q.device)
+                    mla_bmm2_scale = torch.empty(1, dtype=torch.float32, device=q.device)
+                    attn_out_latent[chunk_start:chunk_end] = (
+                        torch.ops.trtllm.dsv3_fused_mla_generation(
+                            fused_q_chunk,
+                            q_nope[chunk_start:chunk_end],
+                            self.k_b_proj_trans,
+                            q_pe[chunk_start:chunk_end],
+                            latent_cache[chunk_start:chunk_end],
+                            self.mqa.rotary_cos_sin,
+                            sequence_length,
+                            attn_metadata.kv_cache_block_offsets,
+                            attn_metadata.kv_cache_manager.kv_cache_pool_pointers,
+                            attn_metadata.kv_cache_manager.kv_cache_pool_mapping,
+                            topk_indices[chunk_start:chunk_end],
+                            topk_indices_pool[chunk_start:chunk_end],
+                            kv_cache_pool,
+                            self.mqa.kv_scale_orig_quant,
+                            self.mqa.kv_scale_quant_orig,
+                            quant_q_buffer_chunk,
+                            mla_bmm1_scale,
+                            mla_bmm2_scale,
+                            None,
+                            layer_idx,
+                            attn_metadata.kv_cache_manager.tokens_per_block,
+                            int(self.mqa.quant_mode),
+                            float(self.mqa.q_scaling),
+                            True,
+                            cached_context_tokens + chunk_start,
+                        )
+                    )
         else:  # baseline mode
             fused_q = fused_q.view(
                 [num_tokens, self.num_heads_tp * (self.kv_lora_rank + self.qk_rope_head_dim)]
