@@ -34,12 +34,13 @@ torch::Tensor dsv3_fused_mla_context_cuda(torch::Tensor fused_q, torch::Tensor q
     torch::Tensor rotary_cos_sin, torch::Tensor ctx_cached_token_indptr, tensorrt_llm::kernels::KVBlockArray kv_cache,
     std::optional<torch::Tensor> kv_scale_orig_quant, std::optional<torch::Tensor> kv_scale_quant_orig,
     bool has_fp8_kv_cache, double q_scaling);
-torch::Tensor dsv3_fused_mla_generation_cuda(torch::Tensor fused_q, torch::Tensor q_pe, torch::Tensor latent_cache,
-    torch::Tensor rotary_cos_sin, torch::Tensor sequence_length, tensorrt_llm::kernels::KVBlockArray kv_cache,
-    torch::Tensor topk_indices, torch::Tensor topk_indices_pool, torch::Tensor kv_cache_pool,
-    torch::Tensor quant_q_buffer, torch::Tensor mla_bmm1_scale, torch::Tensor mla_bmm2_scale,
-    std::optional<torch::Tensor> kv_scale_orig_quant, std::optional<torch::Tensor> kv_scale_quant_orig,
-    std::optional<torch::Tensor> spec_decoding_packed_mask, double q_scaling);
+torch::Tensor dsv3_fused_mla_generation_cuda(torch::Tensor fused_q, torch::Tensor q_nope, torch::Tensor k_b_proj_trans,
+    torch::Tensor q_pe, torch::Tensor latent_cache, torch::Tensor rotary_cos_sin, torch::Tensor sequence_length,
+    tensorrt_llm::kernels::KVBlockArray kv_cache, torch::Tensor topk_indices, torch::Tensor topk_indices_pool,
+    torch::Tensor kv_cache_pool, torch::Tensor quant_q_buffer, torch::Tensor mla_bmm1_scale,
+    torch::Tensor mla_bmm2_scale, std::optional<torch::Tensor> kv_scale_orig_quant,
+    std::optional<torch::Tensor> kv_scale_quant_orig, std::optional<torch::Tensor> spec_decoding_packed_mask,
+    double q_scaling);
 } // namespace dsv3_fused_mla
 
 namespace tensorrt_llm
@@ -122,8 +123,8 @@ th::Tensor dsv3_fused_mla_context(th::Tensor fused_q, th::Tensor q_pe, th::Tenso
         std::move(kv_scale_orig_quant), std::move(kv_scale_quant_orig), quantMode.hasFp8KvCache(), q_scaling);
 }
 
-th::Tensor dsv3_fused_mla_generation(th::Tensor fused_q, th::Tensor q_pe, th::Tensor latent_cache,
-    th::Tensor rotary_cos_sin, th::Tensor sequence_length, th::Tensor kv_cache_block_offsets,
+th::Tensor dsv3_fused_mla_generation(th::Tensor fused_q, th::Tensor q_nope, th::Tensor k_b_proj_trans, th::Tensor q_pe,
+    th::Tensor latent_cache, th::Tensor rotary_cos_sin, th::Tensor sequence_length, th::Tensor kv_cache_block_offsets,
     th::Tensor host_kv_cache_pool_pointers, th::Tensor host_kv_cache_pool_mapping, th::Tensor topk_indices,
     th::Tensor topk_indices_pool, th::Tensor kv_cache_pool, std::optional<th::Tensor> kv_scale_orig_quant,
     std::optional<th::Tensor> kv_scale_quant_orig, th::Tensor quant_q_buffer, th::Tensor mla_bmm1_scale,
@@ -131,6 +132,8 @@ th::Tensor dsv3_fused_mla_generation(th::Tensor fused_q, th::Tensor q_pe, th::Te
     int64_t tokens_per_block, int64_t quant_mode, double q_scaling)
 {
     TORCH_CHECK(fused_q.is_cuda(), "fused_q must be a CUDA tensor");
+    TORCH_CHECK(q_nope.is_cuda(), "q_nope must be a CUDA tensor");
+    TORCH_CHECK(k_b_proj_trans.is_cuda(), "k_b_proj_trans must be a CUDA tensor");
     TORCH_CHECK(q_pe.is_cuda(), "q_pe must be a CUDA tensor");
     TORCH_CHECK(latent_cache.is_cuda(), "latent_cache must be a CUDA tensor");
     TORCH_CHECK(rotary_cos_sin.is_cuda(), "rotary_cos_sin must be a CUDA tensor");
@@ -160,6 +163,9 @@ th::Tensor dsv3_fused_mla_generation(th::Tensor fused_q, th::Tensor q_pe, th::Te
     }
 
     TORCH_CHECK(fused_q.scalar_type() == torch::kBFloat16, "GLM-5 fused MLA generation expects bf16 fused_q");
+    TORCH_CHECK(q_nope.scalar_type() == torch::kBFloat16, "GLM-5 fused MLA generation expects bf16 q_nope");
+    TORCH_CHECK(
+        k_b_proj_trans.scalar_type() == torch::kBFloat16, "GLM-5 fused MLA generation expects bf16 k_b_proj_trans");
     TORCH_CHECK(q_pe.scalar_type() == torch::kBFloat16, "GLM-5 fused MLA generation expects bf16 q_pe");
     TORCH_CHECK(latent_cache.scalar_type() == torch::kBFloat16, "GLM-5 fused MLA generation expects bf16 latent_cache");
     TORCH_CHECK(rotary_cos_sin.scalar_type() == torch::kFloat32, "rotary_cos_sin must be fp32");
@@ -173,6 +179,8 @@ th::Tensor dsv3_fused_mla_generation(th::Tensor fused_q, th::Tensor q_pe, th::Te
     TORCH_CHECK(mla_bmm2_scale.scalar_type() == torch::kFloat32, "mla_bmm2_scale must be float32");
 
     TORCH_CHECK(fused_q.dim() == 3, "fused_q must have shape [tokens, heads, 576]");
+    TORCH_CHECK(q_nope.dim() == 3, "q_nope must have shape [tokens, heads, 192]");
+    TORCH_CHECK(k_b_proj_trans.dim() == 3, "k_b_proj_trans must have shape [heads, 512, 192]");
     TORCH_CHECK(q_pe.dim() == 3, "q_pe must have shape [tokens, heads, 64]");
     TORCH_CHECK(latent_cache.dim() == 2, "latent_cache must have shape [tokens, 576]");
     TORCH_CHECK(topk_indices.dim() == 2, "topk_indices must have shape [tokens, topk]");
@@ -180,6 +188,7 @@ th::Tensor dsv3_fused_mla_generation(th::Tensor fused_q, th::Tensor q_pe, th::Te
     TORCH_CHECK(kv_cache_pool.dim() == 3, "kv_cache_pool must have shape [pool_tokens, 1, 576]");
     TORCH_CHECK(quant_q_buffer.dim() == 3, "quant_q_buffer must have shape [tokens, heads, 576]");
     TORCH_CHECK(fused_q.size(0) == q_pe.size(0), "fused_q and q_pe token dimensions must match");
+    TORCH_CHECK(fused_q.size(0) == q_nope.size(0), "fused_q and q_nope token dimensions must match");
     TORCH_CHECK(fused_q.size(0) == latent_cache.size(0), "fused_q and latent_cache token dimensions must match");
     TORCH_CHECK(fused_q.size(0) == topk_indices.size(0), "fused_q and topk_indices token dimensions must match");
     TORCH_CHECK(fused_q.size(0) == quant_q_buffer.size(0), "fused_q and quant_q_buffer token dimensions must match");
@@ -188,15 +197,22 @@ th::Tensor dsv3_fused_mla_generation(th::Tensor fused_q, th::Tensor q_pe, th::Te
     TORCH_CHECK(
         topk_indices.size(1) == topk_indices_pool.size(1), "topk_indices and topk_indices_pool top-k must match");
     TORCH_CHECK(fused_q.size(1) == 8, "GLM-5 TP=8 fused MLA generation expects 8 local heads");
+    TORCH_CHECK(q_nope.size(1) == 8, "GLM-5 TP=8 fused MLA generation expects 8 q_nope heads");
+    TORCH_CHECK(k_b_proj_trans.size(0) == 8, "GLM-5 TP=8 fused MLA generation expects 8 k_b_proj heads");
     TORCH_CHECK(q_pe.size(1) == 8, "GLM-5 TP=8 fused MLA generation expects 8 q_pe heads");
     TORCH_CHECK(quant_q_buffer.size(1) == 8, "GLM-5 TP=8 fused MLA generation expects 8 local heads");
     TORCH_CHECK(fused_q.size(2) == 576, "GLM-5 fused MLA generation expects fused head size 576");
+    TORCH_CHECK(q_nope.size(2) == 192, "GLM-5 fused MLA generation expects q_nope head size 192");
+    TORCH_CHECK(k_b_proj_trans.size(1) == 512, "GLM-5 fused MLA generation expects k_b_proj dim 512");
+    TORCH_CHECK(k_b_proj_trans.size(2) == 192, "GLM-5 fused MLA generation expects k_b_proj reduction dim 192");
     TORCH_CHECK(q_pe.size(2) == 64, "GLM-5 fused MLA generation expects q_pe head size 64");
     TORCH_CHECK(latent_cache.size(1) == 576, "GLM-5 fused MLA generation expects latent cache head size 576");
     TORCH_CHECK(quant_q_buffer.size(2) == 576, "GLM-5 fused MLA generation expects fused head size 576");
     TORCH_CHECK(kv_cache_pool.size(1) == 1, "GLM-5 fused MLA generation expects one KV head in kv_cache_pool");
     TORCH_CHECK(kv_cache_pool.size(2) == 576, "GLM-5 fused MLA generation expects kv_cache_pool head size 576");
     TORCH_CHECK(fused_q.stride(2) == 1, "fused_q last dimension must be contiguous");
+    TORCH_CHECK(q_nope.stride(2) == 1, "q_nope last dimension must be contiguous");
+    TORCH_CHECK(k_b_proj_trans.stride(2) == 1, "k_b_proj_trans last dimension must be contiguous");
     TORCH_CHECK(q_pe.stride(2) == 1, "q_pe last dimension must be contiguous");
     TORCH_CHECK(latent_cache.stride(1) == 1, "latent_cache last dimension must be contiguous");
     TORCH_CHECK(topk_indices.stride(1) == 1, "topk_indices last dimension must be contiguous");
@@ -219,11 +235,12 @@ th::Tensor dsv3_fused_mla_generation(th::Tensor fused_q, th::Tensor q_pe, th::Te
         /*sink_token_length=*/0, /*beam_width=*/1, /*seq_offset=*/0, /*is_mla_enable=*/true, fused_q.element_size());
     TORCH_CHECK(kvCacheBuffers.kvCacheBuffer.data != nullptr, "KV cache block offsets are required");
 
-    return dsv3_fused_mla::dsv3_fused_mla_generation_cuda(std::move(fused_q), std::move(q_pe), std::move(latent_cache),
-        std::move(rotary_cos_sin), std::move(sequence_length), kvCacheBuffers.kvCacheBuffer, std::move(topk_indices),
-        std::move(topk_indices_pool), std::move(kv_cache_pool), std::move(quant_q_buffer), std::move(mla_bmm1_scale),
-        std::move(mla_bmm2_scale), std::move(kv_scale_orig_quant), std::move(kv_scale_quant_orig),
-        std::move(spec_decoding_packed_mask), q_scaling);
+    return dsv3_fused_mla::dsv3_fused_mla_generation_cuda(std::move(fused_q), std::move(q_nope),
+        std::move(k_b_proj_trans), std::move(q_pe), std::move(latent_cache), std::move(rotary_cos_sin),
+        std::move(sequence_length), kvCacheBuffers.kvCacheBuffer, std::move(topk_indices), std::move(topk_indices_pool),
+        std::move(kv_cache_pool), std::move(quant_q_buffer), std::move(mla_bmm1_scale), std::move(mla_bmm2_scale),
+        std::move(kv_scale_orig_quant), std::move(kv_scale_quant_orig), std::move(spec_decoding_packed_mask),
+        q_scaling);
 }
 
 } // namespace torch_ext
@@ -238,10 +255,10 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "Tensor host_kv_cache_pool_mapping, Tensor? kv_scale_orig_quant, Tensor? kv_scale_quant_orig, "
         "int layer_idx, int tokens_per_block, int quant_mode, float q_scaling) -> Tensor");
     m.def(
-        "dsv3_fused_mla_generation(Tensor(a!) fused_q, Tensor q_pe, Tensor latent_cache, Tensor rotary_cos_sin, "
-        "Tensor sequence_length, Tensor kv_cache_block_offsets, Tensor host_kv_cache_pool_pointers, "
-        "Tensor host_kv_cache_pool_mapping, Tensor topk_indices, Tensor topk_indices_pool, "
-        "Tensor(b!) kv_cache_pool, Tensor? kv_scale_orig_quant, Tensor? kv_scale_quant_orig, "
+        "dsv3_fused_mla_generation(Tensor(a!) fused_q, Tensor q_nope, Tensor k_b_proj_trans, Tensor q_pe, "
+        "Tensor latent_cache, Tensor rotary_cos_sin, Tensor sequence_length, Tensor kv_cache_block_offsets, "
+        "Tensor host_kv_cache_pool_pointers, Tensor host_kv_cache_pool_mapping, Tensor topk_indices, "
+        "Tensor topk_indices_pool, Tensor(b!) kv_cache_pool, Tensor? kv_scale_orig_quant, Tensor? kv_scale_quant_orig, "
         "Tensor(c!) quant_q_buffer, Tensor(d!) mla_bmm1_scale, Tensor(e!) mla_bmm2_scale, "
         "Tensor? spec_decoding_packed_mask, int layer_idx, int tokens_per_block, int quant_mode, "
         "float q_scaling) -> Tensor");

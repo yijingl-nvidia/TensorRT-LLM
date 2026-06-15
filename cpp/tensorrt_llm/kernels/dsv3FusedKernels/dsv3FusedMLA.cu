@@ -35,6 +35,7 @@ namespace
 
 constexpr int kLocalHeads = 8;
 constexpr int kKvLoraRank = 512;
+constexpr int kQkNopeHeadDim = 192;
 constexpr int kRopeDim = 64;
 constexpr int kHeadDim = kKvLoraRank + kRopeDim;
 constexpr int kThreads = 256;
@@ -48,6 +49,7 @@ constexpr int kMaxTopK = 4096;
 // The constants above are part of that specialization:
 // - kLocalHeads is the tensor-parallel local attention head count on TP=8.
 // - kKvLoraRank is the absorbed latent KV/V dimension used by MLA.
+// - kQkNopeHeadDim is the unabsorbed q_nope dimension before multiplying by k_b_proj.
 // - kRopeDim is the per-head RoPE suffix dimension.
 // - kHeadDim is the full latent attention dimension, [latent KV/V, RoPE] == 512 + 64.
 // - kThreads is the fixed CTA width used by the context path and combine reductions.
@@ -698,7 +700,10 @@ __global__ void contextAttentionKernel(__nv_bfloat16 const* fusedQ, __nv_fp8_e4m
 // launch grid-syncs and the first eight split CTAs for each token combine one local-head output each.
 //
 // Inputs:
-// - fusedQ: mutable BF16 [numTokens, kLocalHeads, kHeadDim]. Dims [0, kKvLoraRank) already contain absorbed q_nope.
+// - fusedQ: mutable BF16 [numTokens, kLocalHeads, kHeadDim]. The kernel writes dims [0, kKvLoraRank) with
+//   q_nope absorbed by k_b_proj and dims [kKvLoraRank, kHeadDim) with rotated Q RoPE.
+// - qNope: BF16 [numTokens, kLocalHeads, kQkNopeHeadDim]. Unabsorbed query prefix from q_a/q_b projection.
+// - kBProjTrans: BF16 [kLocalHeads, kKvLoraRank, kQkNopeHeadDim]. Per-head absorbed-K projection weight.
 // - qPe: BF16 [numTokens, kLocalHeads, kRopeDim]. Unrotated per-head Q RoPE suffix.
 // - latentCache: BF16 [numTokens, kHeadDim]. Dims [0, kKvLoraRank) are latent KV/V; dims [kKvLoraRank, kHeadDim)
 //   are unrotated shared K RoPE.
@@ -717,6 +722,8 @@ __global__ void contextAttentionKernel(__nv_bfloat16 const* fusedQ, __nv_fp8_e4m
 // - bmm2Scale: optional FP32 [1]. The append phase writes the dequantization scale for FP8 V values.
 // - kvScaleOrigQuant: optional FP32 [1]. Original-domain to FP8 scale for Q and appended KV.
 // - kvScaleQuantOrig: optional FP32 [1]. FP8 to original-domain dequant scale.
+// - qNopeStrideToken/qNopeStrideHead: runtime strides for qNope because it is a split view of Q.
+// - kBProjStrideHead/kBProjStrideDim/kBProjStrideReduction: runtime strides for kBProjTrans.
 // - qPeStrideToken/qPeStrideHead: runtime strides for qPe because it can be a non-contiguous split view.
 // - numTokens: int, number of decode/MTP tokens in this call.
 // - topK: int, sparse candidate count per query token.
@@ -731,17 +738,18 @@ __global__ void contextAttentionKernel(__nv_bfloat16 const* fusedQ, __nv_fp8_e4m
 // - output: BF16 [numTokens, kLocalHeads * kKvLoraRank], logically [numTokens, 8, 512].
 //
 // Side effects:
-// - Writes fusedQ's RoPE suffix, quantQ, bmm1Scale, bmm2Scale, the paged KV cache, splitLse, splitOutput,
-//   syncScratch, and output.
+// - Writes fusedQ's absorbed prefix and RoPE suffix, quantQ, bmm1Scale, bmm2Scale, the paged KV cache, splitLse,
+//   splitOutput, syncScratch, and output.
 // - Uses dynamic shared memory [kLocalHeads, kSparseSplitSize] floats for per-head split scores/probabilities.
-__global__ void generationAttentionCombinedKernel(__nv_bfloat16* fusedQ, __nv_bfloat16 const* qPe,
-    __nv_bfloat16 const* latentCache, float2 const* rotaryCosSin, tensorrt_llm::kernels::KVBlockArray kvCache,
-    __nv_fp8_e4m3* quantQ, __nv_fp8_e4m3 const* kvCachePool, int32_t const* topkIndicesPool,
-    int32_t const* topkIndicesLocal, int32_t const* sequenceLength, int32_t const* specDecodingPackedMask,
-    int specMaskWords, float* splitLse, float* splitOutput, int32_t* syncScratch, __nv_bfloat16* output,
-    float* bmm1Scale, float* bmm2Scale, float const* kvScaleOrigQuant, float const* kvScaleQuantOrig,
-    int64_t qPeStrideToken, int64_t qPeStrideHead, int numTokens, int topK, int numSplits, int expectedCtas,
-    float hostScoreScale)
+__global__ void generationAttentionCombinedKernel(__nv_bfloat16* fusedQ, __nv_bfloat16 const* qNope,
+    __nv_bfloat16 const* kBProjTrans, __nv_bfloat16 const* qPe, __nv_bfloat16 const* latentCache,
+    float2 const* rotaryCosSin, tensorrt_llm::kernels::KVBlockArray kvCache, __nv_fp8_e4m3* quantQ,
+    __nv_fp8_e4m3 const* kvCachePool, int32_t const* topkIndicesPool, int32_t const* topkIndicesLocal,
+    int32_t const* sequenceLength, int32_t const* specDecodingPackedMask, int specMaskWords, float* splitLse,
+    float* splitOutput, int32_t* syncScratch, __nv_bfloat16* output, float* bmm1Scale, float* bmm2Scale,
+    float const* kvScaleOrigQuant, float const* kvScaleQuantOrig, int64_t qNopeStrideToken, int64_t qNopeStrideHead,
+    int64_t kBProjStrideHead, int64_t kBProjStrideDim, int64_t kBProjStrideReduction, int64_t qPeStrideToken,
+    int64_t qPeStrideHead, int numTokens, int topK, int numSplits, int expectedCtas, float hostScoreScale)
 {
     // Dynamic shared memory is partitioned as [head, split_offset]. Lane 0 in each consumer warp first writes
     // log2 scores, then rewrites the same slots as split-local normalized probabilities.
@@ -823,13 +831,34 @@ __global__ void generationAttentionCombinedKernel(__nv_bfloat16* fusedQ, __nv_bf
     // smaller unit-test topK values, the available split CTAs stride over all heads.
     for (int appendHeadIdx = splitIdx; appendHeadIdx < kLocalHeads; appendHeadIdx += numSplits)
     {
-        // Quantize the absorbed q_nope prefix [0, 512) from fusedQ into quantQ.
+        // Project q_nope through k_b_proj_trans and quantize the absorbed prefix [0, 512).
         for (int dim = tid; dim < kKvLoraRank; dim += blockDim.x)
         {
             // Flattened [token, head, dim] offset for both fusedQ and quantQ.
             int const qOffset = (tokenIdx * kLocalHeads + appendHeadIdx) * kHeadDim + dim;
-            // The BMM wrote BF16 q_nope into fusedQ; convert original-domain BF16 to scaled FP8.
-            quantQ[qOffset] = __nv_fp8_e4m3(toFloat(fusedQ[qOffset]) * quantScale);
+            // Accumulate one BF16 GEMV output element in FP32:
+            // fusedQ[token, head, dim] = sum_r qNope[token, head, r] * kBProjTrans[head, dim, r].
+            float projected = 0.0F;
+            // Base offset for qNope[token, head, 0]. qNope is a split view, so strides are runtime values.
+            int64_t const qNopeBaseOffset = tokenIdx * qNopeStrideToken + appendHeadIdx * qNopeStrideHead;
+            // Base offset for kBProjTrans[head, dim, 0].
+            int64_t const kBProjBaseOffset = appendHeadIdx * kBProjStrideHead + dim * kBProjStrideDim;
+            // Reduction over the unabsorbed q_nope dimension, fixed to 192 for GLM-5.
+            for (int reduceDim = 0; reduceDim < kQkNopeHeadDim; ++reduceDim)
+            {
+                // Load q_nope[token, head, reduceDim] as FP32.
+                float const qValue = toFloat(qNope[qNopeBaseOffset + reduceDim]);
+                // Load k_b_proj_trans[head, dim, reduceDim] as FP32.
+                float const kValue = toFloat(kBProjTrans[kBProjBaseOffset + reduceDim * kBProjStrideReduction]);
+                // Add this BF16 x BF16 product to the FP32 accumulator.
+                projected += qValue * kValue;
+            }
+            // Round the absorbed query value to BF16 to match the dtype of the previous BMM output tensor.
+            __nv_bfloat16 const projectedBf16 = toBfloat16(projected);
+            // Keep fusedQ readable for debug comparisons and for parity with the old Python-side BMM path.
+            fusedQ[qOffset] = projectedBf16;
+            // Convert original-domain BF16 projected Q to scaled FP8 for the attention dot product.
+            quantQ[qOffset] = __nv_fp8_e4m3(toFloat(projectedBf16) * quantScale);
         }
 
         // Rotate and quantize the per-head Q RoPE suffix [512, 576).
@@ -1258,8 +1287,10 @@ torch::Tensor dsv3_fused_mla_context_cuda(torch::Tensor fused_q, torch::Tensor q
 // Fused GLM-5/DeepSeek-V3 sparse MLA generation/decode path.
 //
 // Inputs:
-// - fused_q: mutable BF16 [numTokens, 8, 576]. Dims [0, 512) contain absorbed q_nope from the BMM; the combined
-//   kernel fills dims [512, 576).
+// - fused_q: mutable BF16 [numTokens, 8, 576]. The combined kernel fills dims [0, 512) with q_nope absorbed
+//   by k_b_proj_trans and dims [512, 576) with rotated Q RoPE.
+// - q_nope: BF16 [numTokens, 8, 192]. Unabsorbed query prefix from the Q projection split view.
+// - k_b_proj_trans: BF16 [8, 512, 192]. Per-head K absorption projection weight.
 // - q_pe: BF16 [numTokens, 8, 64]. Unrotated per-head Q RoPE suffix.
 // - latent_cache: BF16 [numTokens, 576]. Current decode/MTP latent KV/V plus unrotated shared K RoPE.
 // - rotary_cos_sin: FP32 float2 RoPE table.
@@ -1280,15 +1311,16 @@ torch::Tensor dsv3_fused_mla_context_cuda(torch::Tensor fused_q, torch::Tensor q
 // - Returns BF16 [numTokens, 8 * 512], logically [numTokens, 8, 512].
 //
 // Side effects:
-// - Mutates fused_q suffix for debug visibility.
+// - Mutates fused_q absorbed prefix and RoPE suffix for debug visibility.
 // - Mutates quant_q_buffer, mla_bmm1_scale, mla_bmm2_scale, and kv_cache before running attention.
 // - Writes the returned output tensor.
-torch::Tensor dsv3_fused_mla_generation_cuda(torch::Tensor fused_q, torch::Tensor q_pe, torch::Tensor latent_cache,
-    torch::Tensor rotary_cos_sin, torch::Tensor sequence_length, tensorrt_llm::kernels::KVBlockArray kv_cache,
-    torch::Tensor topk_indices, torch::Tensor topk_indices_pool, torch::Tensor kv_cache_pool,
-    torch::Tensor quant_q_buffer, torch::Tensor mla_bmm1_scale, torch::Tensor mla_bmm2_scale,
-    std::optional<torch::Tensor> kv_scale_orig_quant, std::optional<torch::Tensor> kv_scale_quant_orig,
-    std::optional<torch::Tensor> spec_decoding_packed_mask, double q_scaling)
+torch::Tensor dsv3_fused_mla_generation_cuda(torch::Tensor fused_q, torch::Tensor q_nope, torch::Tensor k_b_proj_trans,
+    torch::Tensor q_pe, torch::Tensor latent_cache, torch::Tensor rotary_cos_sin, torch::Tensor sequence_length,
+    tensorrt_llm::kernels::KVBlockArray kv_cache, torch::Tensor topk_indices, torch::Tensor topk_indices_pool,
+    torch::Tensor kv_cache_pool, torch::Tensor quant_q_buffer, torch::Tensor mla_bmm1_scale,
+    torch::Tensor mla_bmm2_scale, std::optional<torch::Tensor> kv_scale_orig_quant,
+    std::optional<torch::Tensor> kv_scale_quant_orig, std::optional<torch::Tensor> spec_decoding_packed_mask,
+    double q_scaling)
 {
     // Set the active CUDA device to match fused_q so the launch uses the correct GPU.
     c10::cuda::CUDAGuard const deviceGuard{fused_q.device()};
@@ -1311,12 +1343,26 @@ torch::Tensor dsv3_fused_mla_generation_cuda(torch::Tensor fused_q, torch::Tenso
     auto* rotaryCosSinPtr = reinterpret_cast<float2 const*>(rotary_cos_sin.data_ptr());
     // Raw BF16 fused Q pointer [numTokens, 8, 576].
     auto* fusedQPtr = static_cast<__nv_bfloat16*>(fused_q.data_ptr());
+    // Raw BF16 q_nope pointer [numTokens, 8, 192]. It may be a strided split view.
+    auto* qNopePtr = static_cast<__nv_bfloat16 const*>(q_nope.data_ptr());
+    // Raw BF16 k_b_proj_trans pointer [8, 512, 192].
+    auto* kBProjTransPtr = static_cast<__nv_bfloat16 const*>(k_b_proj_trans.data_ptr());
     // Raw BF16 qPe pointer. It may be a strided view.
     auto* qPePtr = static_cast<__nv_bfloat16 const*>(q_pe.data_ptr());
     // Raw BF16 latent cache pointer [numTokens, 576].
     auto* latentCachePtr = static_cast<__nv_bfloat16 const*>(latent_cache.data_ptr());
     // quant_q_buffer is a uint8 tensor whose bytes are FP8 E4M3 values.
     auto* quantQPtr = reinterpret_cast<__nv_fp8_e4m3*>(quant_q_buffer.data_ptr());
+    // q_nope may be a split view, so pass runtime strides.
+    int64_t const qNopeStrideToken = q_nope.stride(0);
+    // Head stride for q_nope.
+    int64_t const qNopeStrideHead = q_nope.stride(1);
+    // Head stride for k_b_proj_trans.
+    int64_t const kBProjStrideHead = k_b_proj_trans.stride(0);
+    // Output-dimension stride for k_b_proj_trans.
+    int64_t const kBProjStrideDim = k_b_proj_trans.stride(1);
+    // Reduction-dimension stride for k_b_proj_trans.
+    int64_t const kBProjStrideReduction = k_b_proj_trans.stride(2);
     // q_pe may be a split view, so pass runtime strides.
     int64_t const qPeStrideToken = q_pe.stride(0);
     // Head stride for q_pe.
@@ -1368,12 +1414,14 @@ torch::Tensor dsv3_fused_mla_generation_cuda(torch::Tensor fused_q, torch::Tenso
     size_t const splitSharedBytes = kLocalHeads * kSparseSplitSize * sizeof(float);
     // The combined launch first performs RoPE/Q quantization/KV append, grid-syncs, computes split-local partials,
     // grid-syncs again, and then combines into final latent outputs.
-    generationAttentionCombinedKernel<<<splitGrid, kTileRtThreads, splitSharedBytes, stream>>>(fusedQPtr, qPePtr,
-        latentCachePtr, rotaryCosSinPtr, kv_cache, quantQPtr, kvCachePoolPtr, topk_indices_pool.data_ptr<int32_t>(),
-        topk_indices.data_ptr<int32_t>(), sequence_length.data_ptr<int32_t>(), specDecodingPackedMaskPtr, specMaskWords,
-        splitLse.data_ptr<float>(), splitOutput.data_ptr<float>(), syncScratch.data_ptr<int32_t>(), outputPtr,
-        mla_bmm1_scale.data_ptr<float>(), mla_bmm2_scale.data_ptr<float>(), kvScaleOrigQuantPtr, kvScaleQuantOrigPtr,
-        qPeStrideToken, qPeStrideHead, numTokens, topK, numSplits, numTokens * numSplits, hostScoreScale);
+    generationAttentionCombinedKernel<<<splitGrid, kTileRtThreads, splitSharedBytes, stream>>>(fusedQPtr, qNopePtr,
+        kBProjTransPtr, qPePtr, latentCachePtr, rotaryCosSinPtr, kv_cache, quantQPtr, kvCachePoolPtr,
+        topk_indices_pool.data_ptr<int32_t>(), topk_indices.data_ptr<int32_t>(), sequence_length.data_ptr<int32_t>(),
+        specDecodingPackedMaskPtr, specMaskWords, splitLse.data_ptr<float>(), splitOutput.data_ptr<float>(),
+        syncScratch.data_ptr<int32_t>(), outputPtr, mla_bmm1_scale.data_ptr<float>(), mla_bmm2_scale.data_ptr<float>(),
+        kvScaleOrigQuantPtr, kvScaleQuantOrigPtr, qNopeStrideToken, qNopeStrideHead, kBProjStrideHead, kBProjStrideDim,
+        kBProjStrideReduction, qPeStrideToken, qPeStrideHead, numTokens, topK, numSplits, numTokens * numSplits,
+        hostScoreScale);
 
     // Report any asynchronous CUDA error before returning to Python.
     sync_check_cuda_error(stream);

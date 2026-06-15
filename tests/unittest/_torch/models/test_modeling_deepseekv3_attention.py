@@ -219,6 +219,42 @@ def _assert_context_attention_close(actual: torch.Tensor, expected: torch.Tensor
         raise AssertionError(message) from err
 
 
+def _build_decode_projected_query(
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    q_for_split = (
+        torch.randn(
+            _DECODE_NUM_TOKENS,
+            _LOCAL_NUM_HEADS,
+            _QK_HEAD_DIM,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        * 0.125
+    )
+    q_nope, _ = q_for_split.split([_QK_NOPE_HEAD_DIM, _QK_ROPE_HEAD_DIM], dim=-1)
+    k_b_proj_trans = torch.zeros(
+        _LOCAL_NUM_HEADS,
+        _KV_LORA_RANK,
+        _QK_NOPE_HEAD_DIM,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    dim_indices = torch.arange(_KV_LORA_RANK, device=device)
+    reduction_indices = dim_indices % _QK_NOPE_HEAD_DIM
+    k_b_proj_trans[:, dim_indices, reduction_indices] = 1
+
+    fused_q = torch.zeros(
+        _DECODE_NUM_TOKENS,
+        _LOCAL_NUM_HEADS,
+        _HEAD_DIM,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    fused_q[..., :_KV_LORA_RANK] = q_nope.index_select(dim=-1, index=reduction_indices)
+    return fused_q, q_nope, k_b_proj_trans
+
+
 def _custom_context_attention(
     fused_q: torch.Tensor,
     q_pe: torch.Tensor,
@@ -527,6 +563,8 @@ def _seed_decode_history_kv_cache(
 
 def _custom_decode_attention(
     fused_q: torch.Tensor,
+    q_nope: torch.Tensor,
+    k_b_proj_trans: torch.Tensor,
     q_pe: torch.Tensor,
     latent_cache: torch.Tensor,
     topk_indices: torch.Tensor,
@@ -546,6 +584,8 @@ def _custom_decode_attention(
     attention._ensure_rope_table_size(metadata.max_seq_len)
     return torch.ops.trtllm.dsv3_fused_mla_generation(
         fused_q,
+        q_nope,
+        k_b_proj_trans,
         q_pe,
         latent_cache,
         attention.rotary_cos_sin,
@@ -741,16 +781,7 @@ def test_glm5_fp8_decode_custom_op_matches_pytorch_reference_with_spec_mask() ->
         device,
         context_sequence_length=_BENCH_CONTEXT_SEQUENCE_LENGTH,
     )
-    fused_q = (
-        torch.randn(
-            _DECODE_NUM_TOKENS,
-            _LOCAL_NUM_HEADS,
-            _HEAD_DIM,
-            dtype=torch.bfloat16,
-            device=device,
-        )
-        * 0.125
-    )
+    fused_q, q_nope, k_b_proj_trans = _build_decode_projected_query(device)
     q_pe = (
         torch.randn(
             _DECODE_NUM_TOKENS,
@@ -825,6 +856,8 @@ def test_glm5_fp8_decode_custom_op_matches_pytorch_reference_with_spec_mask() ->
         )
         actual = _custom_decode_attention(
             fused_q,
+            q_nope,
+            k_b_proj_trans,
             q_pe,
             latent_cache,
             topk_indices,
@@ -859,16 +892,7 @@ def test_glm5_fp8_decode_custom_op_cuda_graph_replay_infers_stale_sequence_lengt
         device,
         context_sequence_length=_BENCH_CONTEXT_SEQUENCE_LENGTH,
     )
-    fused_q = (
-        torch.randn(
-            _DECODE_NUM_TOKENS,
-            _LOCAL_NUM_HEADS,
-            _HEAD_DIM,
-            dtype=torch.bfloat16,
-            device=device,
-        )
-        * 0.125
-    )
+    fused_q, q_nope, k_b_proj_trans = _build_decode_projected_query(device)
     q_pe = (
         torch.randn(
             _DECODE_NUM_TOKENS,
@@ -927,6 +951,8 @@ def test_glm5_fp8_decode_custom_op_cuda_graph_replay_infers_stale_sequence_lengt
     )
     _custom_decode_attention(
         fused_q,
+        q_nope,
+        k_b_proj_trans,
         q_pe,
         latent_cache,
         topk_indices,
@@ -948,6 +974,8 @@ def test_glm5_fp8_decode_custom_op_cuda_graph_replay_infers_stale_sequence_lengt
     with torch.cuda.graph(graph):
         actual = _custom_decode_attention(
             fused_q,
+            q_nope,
+            k_b_proj_trans,
             q_pe,
             latent_cache,
             topk_indices,
@@ -1025,6 +1053,20 @@ def test_glm5_fp8_decode_custom_op_handles_large_pool_indices() -> None:
         dtype=torch.bfloat16,
         device=device,
     )
+    q_nope = torch.zeros(
+        _DECODE_NUM_TOKENS,
+        _LOCAL_NUM_HEADS,
+        _QK_NOPE_HEAD_DIM,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    k_b_proj_trans = torch.zeros(
+        _LOCAL_NUM_HEADS,
+        _KV_LORA_RANK,
+        _QK_NOPE_HEAD_DIM,
+        dtype=torch.bfloat16,
+        device=device,
+    )
     q_pe = torch.zeros(
         _DECODE_NUM_TOKENS,
         _LOCAL_NUM_HEADS,
@@ -1049,6 +1091,8 @@ def test_glm5_fp8_decode_custom_op_handles_large_pool_indices() -> None:
     with torch.inference_mode():
         actual = _custom_decode_attention(
             fused_q,
+            q_nope,
+            k_b_proj_trans,
             q_pe,
             latent_cache,
             topk_indices,

@@ -933,11 +933,7 @@ class FusedMLA(nn.Module):
                 quant_q_buffer,
             )
 
-        if fused_mla_mode == FUSED_MLA_MODE_WIP:
-            self._bmm_bf16_out(
-                q_nope_t, self.k_b_proj_trans, self.k_b_proj_trans.transpose(1, 2), q_nope_out
-            )
-        else:
+        if fused_mla_mode != FUSED_MLA_MODE_WIP:
             maybe_execute_in_parallel(
                 lambda: self._bmm_bf16_out(
                     q_nope_t,
@@ -978,6 +974,8 @@ class FusedMLA(nn.Module):
             else:
                 attn_out_latent = torch.ops.trtllm.dsv3_fused_mla_generation(
                     fused_q,
+                    q_nope,
+                    self.k_b_proj_trans,
                     q_pe,
                     latent_cache,
                     self.mqa.rotary_cos_sin,
