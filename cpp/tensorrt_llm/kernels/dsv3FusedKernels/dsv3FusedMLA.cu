@@ -23,6 +23,7 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
+#include <cuda_runtime_api.h>
 #include <torch/extension.h>
 
 // #include <cmath>
@@ -37,6 +38,10 @@ constexpr int kKvLoraRank = 512;
 constexpr int kRopeDim = 64;
 constexpr int kHeadDim = kKvLoraRank + kRopeDim;
 constexpr int kThreads = 256;
+constexpr int kTileRtThreads = 384;
+constexpr int kTileRtConsumerThreads = 256;
+constexpr int kSparseSplitSize = 64;
+constexpr int kTileRtMaxResidentSplitCtas = 128;
 constexpr int kMaxTopK = 4096;
 
 // This file is intentionally specialized to the GLM-5/DeepSeek-V3 fused MLA shape used by the WIP Python path.
@@ -45,7 +50,12 @@ constexpr int kMaxTopK = 4096;
 // - kKvLoraRank is the absorbed latent KV/V dimension used by MLA.
 // - kRopeDim is the per-head RoPE suffix dimension.
 // - kHeadDim is the full latent attention dimension, [latent KV/V, RoPE] == 512 + 64.
-// - kThreads is the fixed CTA width used for reductions and strided vector loops.
+// - kThreads is the fixed CTA width used by the context path and combine reductions.
+// - kTileRtThreads is the TileRT-style generation split CTA width: 12 warps.
+// - kTileRtConsumerThreads is the TileRT-style consumer group: 8 warps, one local head per warp.
+// - kSparseSplitSize is TileRT's 64 selected-KV-row split size, giving 32 splits for topK=2048.
+// - kTileRtMaxResidentSplitCtas is the currently supported split-CTA grid cap for the combined generation kernel.
+//   The in-kernel global rendezvous below requires all launched split CTAs to be resident concurrently.
 // - kMaxTopK bounds dynamic shared memory for sparse top-k attention weights.
 //
 //
@@ -166,6 +176,132 @@ __device__ __forceinline__ float blockReduceSum(float value, float* shared)
     }
     // shared[0] holds the CTA-wide sum; every thread returns it for uniform control flow.
     return shared[0];
+}
+
+// Sum one scalar contribution across the current warp.
+//
+// Inputs:
+// - value: float scalar contribution owned by the calling lane.
+//
+// Output:
+// - float scalar equal to the sum of value over all 32 lanes in the warp.
+//
+// Side effects: none.
+__device__ __forceinline__ float warpReduceSum(float value)
+{
+    // All GLM-5 WIP decode attention CTAs use full warps for head-local reductions.
+    unsigned const mask = 0xFFFFFFFFU;
+    // Tree-reduce inside the warp: 32 -> 16 -> 8 -> 4 -> 2 -> 1 active values.
+    for (int offset = 16; offset > 0; offset >>= 1)
+    {
+        // Add the partner lane's contribution at the current tree distance.
+        value += __shfl_down_sync(mask, value, offset);
+    }
+    // Lane 0 receives the sum. Other lanes receive partial tree values that are ignored by callers.
+    return value;
+}
+
+// Check whether a selected sparse KV row is visible to a generation/MTP query token.
+//
+// Inputs:
+// - tokenIdx: int, query token row inside the current decode/MTP group.
+// - localKvIdx: int, selected local sequence position from topkIndicesLocal.
+// - currentGroupStart: int, first local position of the just-appended decode/MTP group.
+// - numTokens: int, number of rows in the current decode/MTP group.
+// - specDecodingPackedMask: optional INT32 [numTokens, specMaskWords] view for request 0.
+// - specMaskWords: int, number of packed int32 mask words per token.
+//
+// Output:
+// - bool, true when localKvIdx is historical or allowed by the current-group speculative/causal mask.
+//
+// Side effects: none.
+__device__ __forceinline__ bool isGenerationKvVisible(int tokenIdx, int localKvIdx, int currentGroupStart,
+    int numTokens, int32_t const* specDecodingPackedMask, int specMaskWords)
+{
+    // Offset 0 means the first token in the current MTP group; negative means historical KV.
+    int const currentGroupOffset = localKvIdx - currentGroupStart;
+    // Historical KV rows precede the current MTP group and are always visible when selected.
+    bool const historicalKv = localKvIdx >= 0 && localKvIdx < currentGroupStart;
+    // Current-group rows are the just-appended decode/MTP tokens.
+    bool const currentGroupKv = currentGroupOffset >= 0 && currentGroupOffset < numTokens;
+
+    // Historical rows do not need an intra-group visibility check.
+    if (historicalKv)
+    {
+        return true;
+    }
+    // Negative padding entries and rows outside the active group are invalid.
+    if (!currentGroupKv)
+    {
+        return false;
+    }
+
+    // Prefer explicit speculative/MTP visibility when the packed mask is available.
+    if (specDecodingPackedMask != nullptr && specMaskWords > 0)
+    {
+        // Select which int32 word contains the bit for this current-group offset.
+        int const wordIdx = currentGroupOffset / 32;
+        // Select the bit inside that int32 word.
+        int const bitIdx = currentGroupOffset % 32;
+        // The current custom path is restricted to one request, so the request dimension is implicit.
+        uint32_t const packed = static_cast<uint32_t>(specDecodingPackedMask[tokenIdx * specMaskWords + wordIdx]);
+        // A set bit means query tokenIdx may attend to this current-group KV row.
+        return ((packed >> bitIdx) & 1U) != 0U;
+    }
+
+    // No packed mask: fall back to local causal order inside the current group.
+    return currentGroupOffset <= tokenIdx;
+}
+
+// Synchronize all split CTAs in the single combined generation attention launch.
+//
+// Inputs:
+// - syncScratch: INT32 [2]. syncScratch[0] is the arrival counter, syncScratch[1] is the release flag.
+// - expectedCtas: int, exact number of split CTAs launched by the kernel grid.
+//
+// Output: none.
+//
+// Side effects:
+// - Uses global atomics and a spin wait to form a one-shot grid-wide barrier.
+// - Requires every launched CTA to be resident concurrently. The host path enforces this for the narrow GLM-5 WIP
+//   configuration by capping the split grid to kTileRtMaxResidentSplitCtas.
+__device__ __forceinline__ void generationGridBarrier(int32_t* syncScratch, int expectedCtas)
+{
+    // Ensure splitLse/splitOutput writes are visible to other CTAs before this CTA announces arrival.
+    __threadfence();
+
+    // Store whether this CTA is the last arrival so every thread can observe the decision after the CTA barrier.
+    __shared__ bool isLastCtaShared;
+    if (threadIdx.x == 0)
+    {
+        // Atomically reserve one arrival slot in the global counter.
+        int const arrival = atomicAdd(syncScratch, 1);
+        // The last CTA is responsible for releasing all waiting CTAs.
+        isLastCtaShared = arrival == expectedCtas - 1;
+    }
+    // Make the last-CTA decision visible to every thread in this CTA.
+    __syncthreads();
+
+    if (isLastCtaShared)
+    {
+        // Reset the counter for hygiene; this barrier is still only used once per kernel launch.
+        syncScratch[0] = 0;
+        // Ensure the reset and all prior split scratch writes are globally visible before releasing waiters.
+        __threadfence();
+        // Publish the release flag. Waiting CTAs observe this with atomicAdd(..., 0).
+        atomicExch(syncScratch + 1, 1);
+    }
+    else
+    {
+        // Wait until the last CTA publishes the release flag.
+        while (atomicAdd(syncScratch + 1, 0) == 0)
+        {
+            // Back off slightly while polling global memory.
+            __nanosleep(64U);
+        }
+    }
+    // Keep all threads in the CTA aligned before entering the combine phase.
+    __syncthreads();
 }
 
 // Preprocess one context token row before sparse MLA attention.
@@ -593,7 +729,7 @@ __global__ void generationRopeAppendKernel(__nv_bfloat16* fusedQ, __nv_bfloat16 
         float const bmm1ScaleValue = dequantScale * dequantScale * hostScoreScale;
         // Natural-log score scale.
         bmm1Scale[0] = bmm1ScaleValue;
-        // Log2-space score scale consumed by generationAttentionKernel.
+        // Log2-space score scale consumed by the generation split-attention kernel.
         bmm1Scale[1] = bmm1ScaleValue * kLog2e;
         // BMM2 dequantizes FP8 V. The generic op multiplies by out_scale when provided; WIP passes no out_scale.
         bmm2Scale[0] = dequantScale;
@@ -698,280 +834,314 @@ __global__ void generationRopeAppendKernel(__nv_bfloat16* fusedQ, __nv_bfloat16 
     }
 }
 
-// Generation/decode sparse MLA attention kernel.
+// Combined TileRT-style split and combine kernel for GLM-5 generation sparse MLA attention.
 //
-// This kernel computes the decode-stage latent attention output for the GLM-5 FP8 BS=1, MTP=3 path. The
-// RoPE/append kernel has already produced FP8 Q and has already appended the current decode/MTP-group latent KV
-// rows into the paged KV cache. This kernel only reads those buffers and performs sparse QK softmax and V
-// accumulation.
+// This kernel changes the decode attention work decomposition from one CTA per [token, head] to one CTA per
+// [token, sparse top-k split]. For the GLM-5 topK=2048 path, kSparseSplitSize=64 gives 32 CTAs per token, matching
+// TileRT's documented CTAID layout. Inside each CTA, consumer warps 0..7 map one warp to one local MLA head and
+// producer/control warps 8..11 are intentionally kept out of math so the CTA shape stays compatible with the
+// TileRT 12-warp design. After all split CTAs finish, the same launch grid-syncs and the first eight split CTAs
+// for each token combine one local-head output each.
 //
 // Inputs:
 // - quantQ: FP8 E4M3 [numTokens, kLocalHeads, kHeadDim]. Rotated and quantized Q from the prep op.
-// - kvCachePool: FP8 E4M3 [poolTokens, 1, kHeadDim], flattened as [poolTokens, kHeadDim]. This is the full
-//   primary KV-cache pool view across pages/layers, so pool row indices can be millions of rows.
+// - kvCachePool: FP8 E4M3 [poolTokens, 1, kHeadDim], flattened as [poolTokens, kHeadDim].
 // - topkIndicesPool: INT32 [numTokens, topK]. Global row indices into kvCachePool produced from local top-k.
-// - topkIndicesLocal: INT32 [numTokens, topK]. Local sequence positions used only to decide whether a candidate
-//   is valid for the current MTP token. Negative entries are padding.
-// - sequenceLength: INT32 [1]. Total KV length after the current numTokens decode group has been appended.
-// - specDecodingPackedMask: optional INT32 [maxRequests, numTokens, specMaskWords]. For current-group rows, bit
-//   currentGroupOffset tells whether query token tokenIdx can attend to that current-group KV row.
-// - specMaskWords: int number of packed int32 words per token row in specDecodingPackedMask.
-// - bmm1Scale: optional FP32 [2]. bmm1Scale[1] is the log2-space QK score scale used with exp2f.
+// - topkIndicesLocal: INT32 [numTokens, topK]. Local sequence positions for MTP visibility checks.
+// - sequenceLength: INT32 [1]. Total KV length after the current decode/MTP group has been appended.
+// - specDecodingPackedMask: optional INT32 [numTokens, specMaskWords] for request 0.
+// - specMaskWords: int, number of packed int32 mask words per query token.
+// - bmm1Scale: optional FP32 [2]. bmm1Scale[1] is the log2-space QK score scale.
 // - bmm2Scale: optional FP32 [1]. Dequantization scale for FP8 V values before BF16 output.
-// - numTokens: int, number of decode/MTP tokens in this call. For GLM-5 MTP=3 this is 4.
+// - numTokens: int, number of decode/MTP tokens in this call.
 // - topK: int, sparse candidate count per query token.
+// - numSplits: int, ceil(topK / kSparseSplitSize).
+// - expectedCtas: int, exact split CTA grid size used by the one-shot global barrier.
 //
-// Output:
+// Outputs:
+// - splitLse: FP32 [numTokens, kLocalHeads, numSplits]. Each element is log2(sum(exp2(score))) for one split.
+// - splitOutput: FP32 [numTokens, kLocalHeads, numSplits, kKvLoraRank]. Each element is the split-local
+//   softmax-normalized latent V output in raw FP8-cache units.
 // - output: BF16 [numTokens, kLocalHeads * kKvLoraRank], logically [numTokens, 8, 512].
 //
 // Side effects:
-// - Writes output only. It does not mutate Q, KV cache, or top-k tensors.
-// - Uses dynamic shared memory [kThreads + topK] floats for reductions and softmax weights.
-__global__ void generationAttentionKernel(__nv_fp8_e4m3 const* quantQ, __nv_fp8_e4m3 const* kvCachePool,
+// - Writes splitLse, splitOutput, syncScratch, and output. It does not mutate Q, KV cache, or top-k tensors.
+// - Uses dynamic shared memory [kLocalHeads, kSparseSplitSize] floats for per-head split scores/probabilities.
+__global__ void generationAttentionCombinedKernel(__nv_fp8_e4m3 const* quantQ, __nv_fp8_e4m3 const* kvCachePool,
     int32_t const* topkIndicesPool, int32_t const* topkIndicesLocal, int32_t const* sequenceLength,
-    int32_t const* specDecodingPackedMask, int specMaskWords, __nv_bfloat16* output, float const* bmm1Scale,
-    float const* bmm2Scale, int numTokens, int topK)
+    int32_t const* specDecodingPackedMask, int specMaskWords, float* splitLse, float* splitOutput, int32_t* syncScratch,
+    __nv_bfloat16* output, float const* bmm1Scale, float const* bmm2Scale, int numTokens, int topK, int numSplits,
+    int expectedCtas)
 {
-    // One CUDA block computes one (generation query token, local head) row.
-    // Current Python dispatch restricts this custom path to one generation sequence, but numTokens may be
-    // greater than one for MTP/spec decode. In that case each token row has a different causal KV end.
-    // Allocate dynamic shared memory provided by the launch.
-    extern __shared__ float shared[];
-    // The first kThreads floats are used by blockReduceSum for QK dot-product reductions.
-    float* reduce = shared;
-    // The remaining topK floats store log2 scores first, then unnormalized softmax weights.
-    float* weights = shared + blockDim.x;
+    // Dynamic shared memory is partitioned as [head, split_offset]. Lane 0 in each consumer warp first writes
+    // log2 scores, then rewrites the same slots as split-local normalized probabilities.
+    extern __shared__ float splitScores[];
 
-    // Decode/MTP token row selected by this CTA.
-    int const tokenIdx = static_cast<int>(blockIdx.x);
-    // Local attention head selected by this CTA.
-    int const headIdx = static_cast<int>(blockIdx.y);
-    // Thread lane id used for all strided loops in this CTA.
+    // blockIdx.x is a linearized [token, split] coordinate: token is the high component, split is the low one.
+    int const tokenIdx = static_cast<int>(blockIdx.x) / numSplits;
+    // Split id in [0, numSplits). For topK=2048 and split size 64 this is [0, 32).
+    int const splitIdx = static_cast<int>(blockIdx.x) - tokenIdx * numSplits;
+    // Thread id inside the 384-thread CTA.
     int const tid = threadIdx.x;
-    // sequenceLength is INT32 [1] after the prep op appended the entire numTokens decode chunk.
-    // Historical rows before currentGroupStart are always valid when selected by topK. Rows inside the current
-    // decode/MTP group are filtered either by the packed spec-decoding mask or by the local causal order.
-    // The group start is shared because all token/head CTAs in this launch use the same sequence.
+    // Warp id inside the CTA. Warps 0..7 are consumer warps, matching the 256-thread consumer group in TileRT.
+    int const warpIdx = tid / 32;
+    // Lane id inside the current warp.
+    int const laneIdx = tid & 31;
+
+    // The group start is shared by all warps in this CTA. It is derived once by thread 0.
     __shared__ int currentGroupStartShared;
-    // One lane computes the current decode/MTP group's first local sequence position.
     if (tid == 0)
     {
         // Normally: post-append length minus number of just-appended decode tokens.
         int currentGroupStart = sequenceLength[0] - numTokens;
-        // CUDA graph warmup can capture a dummy sequenceLength equal to numTokens. If the top-k tensor was
-        // replay-updated to real sequence positions, infer the group start from the max local selected index.
+        // CUDA graph warmup can capture a dummy sequenceLength equal to numTokens. If top-k was replay-updated to
+        // real positions, infer the group start from the maximum local selected index.
         if (sequenceLength[0] <= numTokens)
         {
             // Initialize to no valid top-k entries.
             int maxLocalIdx = -1;
-            // Scan the full [numTokens, topK] local-index tensor. This is only used for dummy-length graph cases.
+            // Scan all token rows; the group start is shared by the single supported generation request.
             for (int idx = 0; idx < numTokens * topK; ++idx)
             {
                 // Negative padding entries do not increase maxLocalIdx.
                 maxLocalIdx = max(maxLocalIdx, topkIndicesLocal[idx]);
             }
-            // If top-k contains real sequence positions, maxLocalIdx should be currentGroupStart + numTokens - 1.
+            // Recover the first local position of the current decode/MTP group.
             if (maxLocalIdx >= numTokens)
             {
-                // Recover the first local position of the current decode/MTP group.
                 currentGroupStart = maxLocalIdx - (numTokens - 1);
             }
         }
-        // Publish the group start to every lane in this CTA.
+        // Publish the group start to every warp.
         currentGroupStartShared = currentGroupStart;
     }
-    // Ensure every lane sees the group start before candidate validity checks.
+    // All 12 warps must observe currentGroupStartShared before consumer warps start validity checks.
     __syncthreads();
-    // Read the shared current-group start into a register.
-    int const currentGroupStart = currentGroupStartShared;
-    // bmm1Scale[1] is already in log2 space. Using exp2f() below matches TRTLLM-Gen's softmax convention.
-    // Null scale is a defensive fallback; production FP8 path passes a valid bmm1Scale tensor.
-    float const scoreScaleLog2 = bmm1Scale == nullptr ? 1.4426950408889634F : bmm1Scale[1];
-    // bmm2Scale[0] dequantizes FP8 V/cache values before storing BF16 latent output.
-    // Null scale is a defensive fallback; production FP8 path passes a valid bmm2Scale tensor.
-    float const outputScale = bmm2Scale == nullptr ? 1.0F : bmm2Scale[0];
 
-    // Defensive guard for padded launches. Current launch grid is exact.
-    if (tokenIdx >= numTokens || headIdx >= kLocalHeads)
+    // Defensive guard for padded launches. Current dispatch uses an exact grid.
+    if (tokenIdx >= numTokens || splitIdx >= numSplits)
     {
-        // This CTA owns no output row.
         return;
     }
 
-    // Track the largest log2 score for stable softmax.
-    float maxScore = -INFINITY;
-
-    // First pass over sparse candidates computes QK logits and the row maximum.
-    for (int topkIdx = 0; topkIdx < topK; ++topkIdx)
+    // Threads 256..383 correspond to TileRT's producer/control group. This WIP version does not issue TMA gather
+    // from them yet; they skip split math but stay alive so the CTA reaches the common grid barrier safely.
+    if (tid < kTileRtConsumerThreads)
     {
-        // topkIndicesPool: INT32 [numTokens, topK], converted global pool row for data loads.
-        // topkIndicesLocal: INT32 [numTokens, topK], original local KV position for causal validity.
-        // kvIdx is a global row in the flattened pool view. It can be large, so later offset math uses int64_t.
-        int const kvIdx = topkIndicesPool[tokenIdx * topK + topkIdx];
-        // localKvIdx is the local sequence position used to decide if tokenIdx may attend to this candidate.
-        int const localKvIdx = topkIndicesLocal[tokenIdx * topK + topkIdx];
-        // Offset 0 means the first token in the current MTP group; negative means historical KV.
-        int const currentGroupOffset = localKvIdx - currentGroupStart;
-        // Historical KV rows precede the current MTP group and are always visible when selected.
-        bool const historicalKv = localKvIdx >= 0 && localKvIdx < currentGroupStart;
-        // Current-group rows are the just-appended decode/MTP tokens
-        // [currentGroupStart, currentGroupStart + numTokens).
-        bool const currentGroupKv = currentGroupOffset >= 0 && currentGroupOffset < numTokens;
-        // Start as invalid; set true only when the current-group mask or causal rule allows it.
-        bool currentGroupValid = false;
-        // Only current-group candidates need an intra-group visibility check.
-        if (currentGroupKv)
+        // Each of the 8 consumer warps owns one local attention head.
+        int const headIdx = warpIdx;
+        // Each head gets 64 score/probability slots inside dynamic shared memory.
+        float* headScores = splitScores + headIdx * kSparseSplitSize;
+        // First top-k index owned by this sparse split.
+        int const splitStart = splitIdx * kSparseSplitSize;
+        // Current decode/MTP group's first local sequence position.
+        int const currentGroupStart = currentGroupStartShared;
+        // bmm1Scale[1] is already in log2 space. exp2f below therefore matches the existing generation path.
+        float const scoreScaleLog2 = bmm1Scale == nullptr ? 1.4426950408889634F : bmm1Scale[1];
+        // Full FP8 query vector for this token/head.
+        __nv_fp8_e4m3 const* qPtr = quantQ + (tokenIdx * kLocalHeads + headIdx) * kHeadDim;
+        // Track the largest log2 score inside this 64-key split.
+        float maxScore = -INFINITY;
+
+        // QK pass: one consumer warp computes all candidate scores for its head over this 64-key split.
+        for (int splitOffset = 0; splitOffset < kSparseSplitSize; ++splitOffset)
         {
-            // Spec/MTP path provides an explicit packed mask when available.
-            if (specDecodingPackedMask != nullptr && specMaskWords > 0)
+            // Convert split-local offset to global top-k index.
+            int const topkIdx = splitStart + splitOffset;
+            // Only indices inside topK are real. The tail of a non-multiple-of-64 split is invalid.
+            bool const inRange = topkIdx < topK;
+            // Load pool and local indices when in range; otherwise use invalid sentinels.
+            int const kvIdx = inRange ? topkIndicesPool[tokenIdx * topK + topkIdx] : -1;
+            // Local sequence position drives causal/speculative visibility checks.
+            int const localKvIdx = inRange ? topkIndicesLocal[tokenIdx * topK + topkIdx] : -1;
+            // Candidate must have a real pool row and be visible to this query token.
+            bool const validKv = kvIdx >= 0
+                && isGenerationKvVisible(
+                    tokenIdx, localKvIdx, currentGroupStart, numTokens, specDecodingPackedMask, specMaskWords);
+            // Each lane accumulates a strided slice of the 576-dim QK dot product.
+            float partial = 0.0F;
+            if (validKv)
             {
-                // Select which int32 word contains the bit for currentGroupOffset.
-                int const wordIdx = currentGroupOffset / 32;
-                // Select the bit inside that int32 word.
-                int const bitIdx = currentGroupOffset % 32;
-                // Load the packed mask word for this query token row.
-                uint32_t const packed
-                    = static_cast<uint32_t>(specDecodingPackedMask[tokenIdx * specMaskWords + wordIdx]);
-                // A set bit means query tokenIdx may attend to this current-group KV row.
-                currentGroupValid = ((packed >> bitIdx) & 1U) != 0U;
+                // Use 64-bit offset math because real pool row ids can be large in the benchmark.
+                int64_t const kvOffset = static_cast<int64_t>(kvIdx) * kHeadDim;
+                // Pointer to the selected FP8 latent KV row.
+                __nv_fp8_e4m3 const* kvPtr = kvCachePool + kvOffset;
+                // Stride the warp lanes over [0, 576).
+                for (int dim = laneIdx; dim < kHeadDim; dim += 32)
+                {
+                    // Accumulate q_fp8[dim] * k_fp8[dim] in FP32.
+                    partial += toFloat(qPtr[dim]) * toFloat(kvPtr[dim]);
+                }
+            }
+            // Warp-local reduction produces the dot product in lane 0.
+            float const dot = warpReduceSum(partial);
+            if (laneIdx == 0)
+            {
+                // Invalid candidates become -inf so their softmax contribution is exactly zero.
+                float const score = validKv ? dot * scoreScaleLog2 : -INFINITY;
+                // Store the log2 score in the split-local scratch row.
+                headScores[splitOffset] = score;
+                // Track the split-local maximum for stable exp2 softmax.
+                maxScore = fmaxf(maxScore, score);
+            }
+        }
+        // Make lane-0 score writes visible to the other lanes in this head warp.
+        __syncwarp();
+
+        // Lane 0 computes split-local denominator, normalizes probabilities, and publishes this split's LSE.
+        if (laneIdx == 0)
+        {
+            // Sum of exp2(score - maxScore) for valid candidates inside this split.
+            float denom = 0.0F;
+            if (maxScore != -INFINITY)
+            {
+                // Convert scores to normalized split-local probabilities in place.
+                for (int splitOffset = 0; splitOffset < kSparseSplitSize; ++splitOffset)
+                {
+                    // Subtracting maxScore keeps the largest exponent at exp2(0) == 1.
+                    float const unnormalized = exp2f(headScores[splitOffset] - maxScore);
+                    // Accumulate the split-local denominator.
+                    denom += unnormalized;
+                    // Temporarily store the unnormalized probability.
+                    headScores[splitOffset] = unnormalized;
+                }
+                // Normalize each probability and store log2 LSE for the combine phase.
+                float const invDenom = 1.0F / denom;
+                for (int splitOffset = 0; splitOffset < kSparseSplitSize; ++splitOffset)
+                {
+                    // headScores now stores split-local softmax probability.
+                    headScores[splitOffset] *= invDenom;
+                }
+                // LSE in log2 space: max + log2(sum(exp2(score - max))).
+                splitLse[(tokenIdx * kLocalHeads + headIdx) * numSplits + splitIdx] = maxScore + log2f(denom);
             }
             else
             {
-                // No packed mask: fall back to local causal order inside the current group.
-                currentGroupValid = currentGroupOffset <= tokenIdx;
-            }
-        }
-        // A candidate is valid only if it has a real pool row and is either historical or current-group-visible.
-        bool const validKv = kvIdx >= 0 && (historicalKv || (currentGroupKv && currentGroupValid));
-        // Each thread accumulates part of the QK dot product for this candidate.
-        float partial = 0.0F;
-        // Skip invalid candidates so padded or future rows produce -inf scores.
-        if (validKv)
-        {
-            // quantQ is FP8 [numTokens, 8, 576]. It was produced by the RoPE/KV-append prep op.
-            // qPtr points to the full 576-dim FP8 query vector for this token/head.
-            __nv_fp8_e4m3 const* qPtr = quantQ + (tokenIdx * kLocalHeads + headIdx) * kHeadDim;
-            // kvCachePool is FP8 [poolTokens, 1, 576] viewed as [poolTokens, 576].
-            // Use 64-bit offset math: real bench pool rows can exceed 7M, and kvIdx * 576 overflows int32.
-            int64_t const kvOffset = static_cast<int64_t>(kvIdx) * kHeadDim;
-            // kvPtr points to the full 576-dim FP8 key/value row selected by DSA top-k.
-            __nv_fp8_e4m3 const* kvPtr = kvCachePool + kvOffset;
-            // Stride the CTA lanes over the full QK dimension [latent 512 + RoPE 64].
-            for (int dim = tid; dim < kHeadDim; dim += blockDim.x)
-            {
-                // Accumulate q_fp8[dim] * k_fp8[dim] in FP32. Dequant scale is folded into scoreScaleLog2.
-                partial += toFloat(qPtr[dim]) * toFloat(kvPtr[dim]);
-            }
-        }
-        // Reduce this candidate's QK dot product across all lanes in the CTA.
-        float const dot = blockReduceSum(partial, reduce);
-        // One lane stores the candidate score and row maximum.
-        if (tid == 0)
-        {
-            // Invalid candidates become -inf so their softmax contribution is exactly zero.
-            float const score = validKv ? dot * scoreScaleLog2 : -INFINITY;
-            // Store log2-space score in shared memory.
-            weights[topkIdx] = score;
-            // Track max score for stable exp2 softmax.
-            maxScore = fmaxf(maxScore, score);
-        }
-        // Ensure the stored score and reduction scratch are stable before the next candidate.
-        __syncthreads();
-    }
-
-    // Shared denominator written by lane 0 and read by all lanes during V accumulation.
-    __shared__ float denomShared;
-    // Lane 0 converts log2 scores to unnormalized probabilities.
-    if (tid == 0)
-    {
-        // Sum of exp2(score - maxScore) over all valid sparse candidates.
-        float denom = 0.0F;
-        // Avoid NaN from -inf - -inf if every candidate is invalid.
-        if (maxScore != -INFINITY)
-        {
-            // Convert every candidate score to an unnormalized softmax weight.
-            for (int topkIdx = 0; topkIdx < topK; ++topkIdx)
-            {
-                // Subtracting the max keeps the largest exponent at exp2(0) == 1.
-                float const weight = exp2f(weights[topkIdx] - maxScore);
-                // Reuse the shared score slot as an unnormalized softmax weight.
-                weights[topkIdx] = weight;
-                // Accumulate denominator for later normalization.
-                denom += weight;
-            }
-        }
-        else
-        {
-            // No valid candidate means zero output.
-            for (int topkIdx = 0; topkIdx < topK; ++topkIdx)
-            {
-                // Clear all weights to avoid consuming stale shared memory values.
-                weights[topkIdx] = 0.0F;
-            }
-        }
-        // Publish the denominator to all lanes.
-        denomShared = denom;
-    }
-    // Wait for all weights and denomShared to be ready.
-    __syncthreads();
-
-    // Precompute reciprocal denominator. If denom is zero, all normalized weights are treated as zero.
-    float const invDenom = denomShared > 0.0F ? 1.0F / denomShared : 0.0F;
-    // Second pass computes output latent V dimensions [0, 512).
-    for (int dim = tid; dim < kKvLoraRank; dim += blockDim.x)
-    {
-        // Accumulator for output[tokenIdx, headIdx, dim].
-        float acc = 0.0F;
-        // Sum over sparse candidates using the already-computed softmax weights.
-        for (int topkIdx = 0; topkIdx < topK; ++topkIdx)
-        {
-            // Reload the global pool row for data loads.
-            int const kvIdx = topkIndicesPool[tokenIdx * topK + topkIdx];
-            // Reload local sequence position for the same visibility check used in the QK pass.
-            int const localKvIdx = topkIndicesLocal[tokenIdx * topK + topkIdx];
-            // Offset inside the current decode/MTP group.
-            int const currentGroupOffset = localKvIdx - currentGroupStart;
-            // Historical rows are before the current group.
-            bool const historicalKv = localKvIdx >= 0 && localKvIdx < currentGroupStart;
-            // Current-group rows are the just-appended decode/MTP rows.
-            bool const currentGroupKv = currentGroupOffset >= 0 && currentGroupOffset < numTokens;
-            // Visibility flag for current-group rows.
-            bool currentGroupValid = false;
-            // Current-group rows require packed-mask or causal filtering.
-            if (currentGroupKv)
-            {
-                // Prefer explicit spec/MTP packed mask when it is present.
-                if (specDecodingPackedMask != nullptr && specMaskWords > 0)
+                // No valid candidate in this split: probability is zero and LSE is -inf.
+                for (int splitOffset = 0; splitOffset < kSparseSplitSize; ++splitOffset)
                 {
-                    // Select mask word for this current-group offset.
-                    int const wordIdx = currentGroupOffset / 32;
-                    // Select mask bit inside the word.
-                    int const bitIdx = currentGroupOffset % 32;
-                    // Load the mask word for this query token row.
-                    uint32_t const packed
-                        = static_cast<uint32_t>(specDecodingPackedMask[tokenIdx * specMaskWords + wordIdx]);
-                    // A set bit allows this current-group KV row to contribute.
-                    currentGroupValid = ((packed >> bitIdx) & 1U) != 0U;
+                    headScores[splitOffset] = 0.0F;
+                }
+                // Mark this split as empty for the combine phase.
+                splitLse[(tokenIdx * kLocalHeads + headIdx) * numSplits + splitIdx] = -INFINITY;
+            }
+        }
+        // Make normalized probabilities visible to every lane in this head warp.
+        __syncwarp();
+
+        // AV pass: write split-local normalized latent output in raw FP8-cache units.
+        for (int dim = laneIdx; dim < kKvLoraRank; dim += 32)
+        {
+            // Accumulator for one latent V dimension for this [token, head, split].
+            float acc = 0.0F;
+            // Sum split-local probability times selected latent V value.
+            for (int splitOffset = 0; splitOffset < kSparseSplitSize; ++splitOffset)
+            {
+                // Convert split-local offset to global top-k index.
+                int const topkIdx = splitStart + splitOffset;
+                // Skip tail entries outside topK.
+                bool const inRange = topkIdx < topK;
+                // Load the selected pool row or invalid sentinel.
+                int const kvIdx = inRange ? topkIndicesPool[tokenIdx * topK + topkIdx] : -1;
+                // Load the local sequence position or invalid sentinel.
+                int const localKvIdx = inRange ? topkIndicesLocal[tokenIdx * topK + topkIdx] : -1;
+                // Reuse the exact same visibility rule as the QK pass.
+                bool const validKv = kvIdx >= 0
+                    && isGenerationKvVisible(
+                        tokenIdx, localKvIdx, currentGroupStart, numTokens, specDecodingPackedMask, specMaskWords);
+                if (validKv)
+                {
+                    // Flattened [pool row, latent dim] address. Only dims [0, 512) are latent V.
+                    int64_t const kvOffset = static_cast<int64_t>(kvIdx) * kHeadDim + dim;
+                    // Accumulate split-softmax probability times raw FP8-cache V value.
+                    acc += headScores[splitOffset] * toFloat(kvCachePool[kvOffset]);
+                }
+            }
+            // Store FP32 partial output for the combine phase. Layout is [token, head, split, dim].
+            splitOutput[((tokenIdx * kLocalHeads + headIdx) * numSplits + splitIdx) * kKvLoraRank + dim] = acc;
+        }
+    }
+
+    // Wait until every split CTA has published splitLse and splitOutput.
+    generationGridBarrier(syncScratch, expectedCtas);
+
+    // Reuse the split CTAs for each token as combine collectors. With the target topK=2048 case there are 32 split
+    // CTAs per token, so the first eight CTAs collect one local head each. Small-topK tests may have fewer than eight
+    // splits, so each available split CTA strides over the local-head dimension.
+    if (splitIdx < kLocalHeads)
+    {
+        // The global log2 LSE is scalar per [token, head].
+        __shared__ float globalLseShared;
+        for (int headIdx = splitIdx; headIdx < kLocalHeads; headIdx += numSplits)
+        {
+            if (tid == 0)
+            {
+                // First pass finds max split LSE for numerical stability.
+                float maxLse = -INFINITY;
+                for (int combineSplitIdx = 0; combineSplitIdx < numSplits; ++combineSplitIdx)
+                {
+                    // Load split LSE in log2 space.
+                    float const lse = splitLse[(tokenIdx * kLocalHeads + headIdx) * numSplits + combineSplitIdx];
+                    // Track the largest non-empty split.
+                    maxLse = fmaxf(maxLse, lse);
+                }
+
+                // If all splits are empty, mark the whole row empty.
+                if (maxLse == -INFINITY)
+                {
+                    globalLseShared = -INFINITY;
                 }
                 else
                 {
-                    // Fallback causal rule: token t may attend to current-group rows <= t.
-                    currentGroupValid = currentGroupOffset <= tokenIdx;
+                    // Sum exp2(lse - maxLse) over all splits.
+                    float denom = 0.0F;
+                    for (int combineSplitIdx = 0; combineSplitIdx < numSplits; ++combineSplitIdx)
+                    {
+                        // Empty splits have lse=-inf and contribute zero.
+                        float const lse = splitLse[(tokenIdx * kLocalHeads + headIdx) * numSplits + combineSplitIdx];
+                        denom += exp2f(lse - maxLse);
+                    }
+                    // Store global log2 LSE for every lane.
+                    globalLseShared = maxLse + log2f(denom);
                 }
             }
-            // Use exactly the same validity rule as the QK pass.
-            bool const validKv = kvIdx >= 0 && (historicalKv || (currentGroupKv && currentGroupValid));
-            // Only valid candidates contribute probability times value.
-            if (validKv)
+            // Ensure every thread in the collector CTA sees globalLseShared.
+            __syncthreads();
+
+            // bmm2Scale[0] dequantizes FP8 V/cache values before storing BF16 latent output.
+            float const outputScale = bmm2Scale == nullptr ? 1.0F : bmm2Scale[0];
+            // Read global log2 LSE into a register.
+            float const globalLse = globalLseShared;
+
+            // Each collector CTA writes the 512 latent V dimensions for one [token, head].
+            for (int dim = tid; dim < kKvLoraRank; dim += blockDim.x)
             {
-                // Compute the flattened [pool row, dim] address with 64-bit arithmetic to avoid overflow.
-                int64_t const kvOffset = static_cast<int64_t>(kvIdx) * kHeadDim + dim;
-                // Accumulate softmax(topkIdx) * V[dim] in FP32. V dequant scale is applied after the sum.
-                acc += weights[topkIdx] * invDenom * toFloat(kvCachePool[kvOffset]);
+                // Accumulator in raw FP8-cache units before applying outputScale.
+                float acc = 0.0F;
+                if (globalLse != -INFINITY)
+                {
+                    // Combine all split-local normalized outputs using exp(lse_s - global_lse).
+                    for (int combineSplitIdx = 0; combineSplitIdx < numSplits; ++combineSplitIdx)
+                    {
+                        // Load split LSE in log2 space.
+                        float const lse = splitLse[(tokenIdx * kLocalHeads + headIdx) * numSplits + combineSplitIdx];
+                        // Empty splits have zero combine weight.
+                        float const splitWeight = lse == -INFINITY ? 0.0F : exp2f(lse - globalLse);
+                        // Load split-local normalized latent output.
+                        float const splitValue
+                            = splitOutput[((tokenIdx * kLocalHeads + headIdx) * numSplits + combineSplitIdx)
+                                    * kKvLoraRank
+                                + dim];
+                        // Add this split's contribution to the global softmax output.
+                        acc += splitWeight * splitValue;
+                    }
+                }
+                // Dequantize the FP8 V sum to original units and round to BF16 output.
+                output[(tokenIdx * kLocalHeads + headIdx) * kKvLoraRank + dim] = toBfloat16(acc * outputScale);
             }
+            // Do not let thread 0 overwrite globalLseShared for the next head before every thread finishes this head.
+            __syncthreads();
         }
-        // Dequantize the FP8 V sum to original units and round to BF16 output.
-        output[(tokenIdx * kLocalHeads + headIdx) * kKvLoraRank + dim] = toBfloat16(acc * outputScale);
     }
 }
 
@@ -1242,6 +1412,30 @@ torch::Tensor dsv3_fused_mla_generation_cuda(torch::Tensor fused_q, torch::Tenso
 
     // Allocate BF16 output [numTokens, 8 * 512] on the same device as fused_q.
     auto output = torch::empty({numTokens, kLocalHeads * kKvLoraRank}, fused_q.options());
+    // TileRT splits topK=2048 into 32 chunks of 64 selected KV rows. Keep the same split size and support
+    // smaller/larger topK by rounding up while preserving the exact GLM-5 32-CTA/token case.
+    int const numSplits = (topK + kSparseSplitSize - 1) / kSparseSplitSize;
+    // The in-kernel global barrier is safe only while every split CTA can be resident concurrently. This WIP path
+    // assumes one resident split CTA per SM, so guard both the TileRT target cap and the actual GPU SM count.
+    cudaDeviceProp deviceProperties;
+    TLLM_CUDA_CHECK(cudaGetDeviceProperties(&deviceProperties, fused_q.get_device()));
+    int const safeResidentSplitCtas = deviceProperties.multiProcessorCount < kTileRtMaxResidentSplitCtas
+        ? deviceProperties.multiProcessorCount
+        : kTileRtMaxResidentSplitCtas;
+    TORCH_CHECK(numTokens * numSplits <= safeResidentSplitCtas,
+        "dsv3_fused_mla_generation combined kernel supports at most ", safeResidentSplitCtas,
+        " resident split CTAs on this GPU, got ", numTokens * numSplits);
+    // Global FP32 scratch mirrors TileRT's split-softmax scratch concept. The combined kernel writes partials,
+    // grid-syncs, and then reads them back from this scratch in the same launch.
+    auto const scratchOptions = fused_q.options().dtype(torch::kFloat32);
+    // splitLse: FP32 [numTokens, 8, numSplits], log2 LSE for each sparse split.
+    auto splitLse = torch::empty({numTokens, kLocalHeads, numSplits}, scratchOptions);
+    // splitOutput: FP32 [numTokens, 8, numSplits, 512], split-local normalized latent output.
+    auto splitOutput = torch::empty({numTokens, kLocalHeads, numSplits, kKvLoraRank}, scratchOptions);
+    // syncScratch: INT32 [2], [arrival counter, release flag] for the one-shot in-kernel grid barrier.
+    auto syncScratch = torch::empty({2}, fused_q.options().dtype(torch::kInt32));
+    // Start every combined launch with a clear barrier state.
+    TLLM_CUDA_CHECK(cudaMemsetAsync(syncScratch.data_ptr<int32_t>(), 0, 2 * sizeof(int32_t), stream));
     // kv_cache_pool is an FP8 E4M3 tensor [poolTokens, 1, 576].
     auto* kvCachePoolPtr = reinterpret_cast<__nv_fp8_e4m3 const*>(kv_cache_pool.data_ptr());
     // Raw BF16 output pointer [numTokens, 8 * 512].
@@ -1253,15 +1447,16 @@ torch::Tensor dsv3_fused_mla_generation_cuda(torch::Tensor fused_q, torch::Tenso
     int const specMaskWords
         = spec_decoding_packed_mask.has_value() ? static_cast<int>(spec_decoding_packed_mask.value().size(-1)) : 0;
 
-    // Launch one CTA per [decode token, local head] output row.
-    dim3 attentionGrid(numTokens, kLocalHeads);
-    // Shared memory stores kThreads reduction floats plus topK score/weight floats.
-    size_t const sharedBytes = (kThreads + topK) * sizeof(float);
-    // Compute sparse decode attention using FP8 Q, FP8 paged KV, and DSA top-k indices.
-    generationAttentionKernel<<<attentionGrid, kThreads, sharedBytes, stream>>>(quantQPtr, kvCachePoolPtr,
-        topk_indices_pool.data_ptr<int32_t>(), topk_indices.data_ptr<int32_t>(), sequence_length.data_ptr<int32_t>(),
-        specDecodingPackedMaskPtr, specMaskWords, outputPtr, mla_bmm1_scale.data_ptr<float>(),
-        mla_bmm2_scale.data_ptr<float>(), numTokens, topK);
+    // Launch one CTA per [decode token, 64-key sparse split], matching TileRT's 32 CTAs/token for topK=2048.
+    dim3 splitGrid(numTokens * numSplits);
+    // Shared memory stores [8 heads, 64 split candidates] score/probability slots.
+    size_t const splitSharedBytes = kLocalHeads * kSparseSplitSize * sizeof(float);
+    // Compute split-local partials, synchronize split CTAs, and combine into final latent outputs in one launch.
+    generationAttentionCombinedKernel<<<splitGrid, kTileRtThreads, splitSharedBytes, stream>>>(quantQPtr,
+        kvCachePoolPtr, topk_indices_pool.data_ptr<int32_t>(), topk_indices.data_ptr<int32_t>(),
+        sequence_length.data_ptr<int32_t>(), specDecodingPackedMaskPtr, specMaskWords, splitLse.data_ptr<float>(),
+        splitOutput.data_ptr<float>(), syncScratch.data_ptr<int32_t>(), outputPtr, mla_bmm1_scale.data_ptr<float>(),
+        mla_bmm2_scale.data_ptr<float>(), numTokens, topK, numSplits, numTokens * numSplits);
 
     // Report any asynchronous CUDA error before returning to Python.
     sync_check_cuda_error(stream);
