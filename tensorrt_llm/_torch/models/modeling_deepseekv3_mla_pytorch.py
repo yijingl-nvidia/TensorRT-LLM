@@ -407,8 +407,9 @@ def dsv3_mla_decode_pytorch(
     - mla_bmm2_scale: torch.Tensor, shape [1], float32, FP8 V dequantization
       scale for the latent output.
     - spec_decoding_packed_mask: Optional[torch.Tensor], shape
-      [max_requests, num_tokens, packed_words], int32, current-group attention
-      mask for speculative/MTP decode. Historical KV rows are always valid.
+      [max_requests, num_tokens, packed_words], int32, accepted for signature
+      parity with TRTLLM metadata but ignored by GLM-5 MLA generation.
+      Visibility is historical KV plus causal current-group order.
 
     Returns
     - torch.Tensor, shape [num_tokens, 4096], bfloat16, latent attention output
@@ -442,36 +443,18 @@ def dsv3_mla_decode_pytorch(
     historical_kv = topk_indices < current_group_start
     # [num_tokens, top_k], bool
     current_group_kv = (current_group_offset >= 0) & (current_group_offset < num_tokens)
-    if spec_decoding_packed_mask is None:
-        # [num_tokens], int32
-        token_positions = torch.arange(
-            num_tokens,
-            dtype=topk_indices.dtype,
-            device=topk_indices.device,
-        )
-        # [num_tokens, top_k], bool
-        current_group_valid = current_group_offset <= token_positions[:, None]
-    else:
-        # [num_tokens, packed_words], int32
-        packed_mask = spec_decoding_packed_mask[0, :num_tokens, :].to(topk_indices.dtype)
-        # [num_tokens, top_k], int32
-        packed_word_idx = torch.div(
-            current_group_offset.clamp_min(0),
-            32,
-            rounding_mode="floor",
-        )
-        # [num_tokens, top_k], int32
-        packed_bit_idx = current_group_offset.clamp(0, 31)
-        # [num_tokens, top_k], int32
-        packed_words = packed_mask.gather(
-            1,
-            packed_word_idx.clamp_max(packed_mask.shape[1] - 1).to(torch.long),
-        )
-        # [num_tokens, top_k], bool
-        current_group_valid = torch.bitwise_and(
-            torch.bitwise_right_shift(packed_words, packed_bit_idx),
-            1,
-        ).to(torch.bool)
+    # TRTLLM-Gen MLA generation does not consume 'spec_decoding_packed_mask';
+    # multi-token generation visibility is represented by causal current-group
+    # order and effective KV length.
+    _ = spec_decoding_packed_mask
+    # [num_tokens], int32
+    token_positions = torch.arange(
+        num_tokens,
+        dtype=topk_indices.dtype,
+        device=topk_indices.device,
+    )
+    # [num_tokens, top_k], bool
+    current_group_valid = current_group_offset <= token_positions[:, None]
 
     # [num_tokens, top_k], bool
     valid = (topk_indices_pool >= 0) & (historical_kv | (current_group_kv & current_group_valid))
