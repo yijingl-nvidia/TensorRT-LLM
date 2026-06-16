@@ -215,6 +215,45 @@ __device__ __forceinline__ uint32_t computeQbProjActivationScaleByte(
     return static_cast<uint32_t>(ue8m0Scale.__x);
 }
 
+// Compute the 1x128 dynamic FP8 activation scale used by the raw FP32 q_b scale path.
+//
+// Inputs:
+// - qBProjInput: BF16 [numTokens, kQLoraRank], normalized q_a output.
+// - qBProjStrideToken/qBProjStrideDim: runtime strides for qBProjInput.
+// - tokenIdx: token row to quantize.
+// - kBlock: 128-wide input block id.
+//
+// Output:
+// - float2 where x is the FP32 dequantization scale and y is the FP32 quantization multiplier for
+//   qBProjInput[tokenIdx, kBlock * 128:(kBlock + 1) * 128].
+//
+// Side effects: none.
+__device__ __forceinline__ float2 computeQbProjActivationScalesFp32(
+    __nv_bfloat16 const* qBProjInput, int64_t qBProjStrideToken, int64_t qBProjStrideDim, int tokenIdx, int kBlock)
+{
+    // First input dimension in this 1x128 quantization block.
+    int const kStart = kBlock * 128;
+    // Absolute max over the 128 BF16 input values.
+    float amax = 0.0F;
+    // Scan the full 128-wide block; kQLoraRank is fixed to 2048 so all blocks are complete.
+    for (int reduceDim = 0; reduceDim < 128; ++reduceDim)
+    {
+        // Load q_b_proj input as FP32 for amax calculation.
+        float const value = fabsf(toFloat(
+            qBProjInput[tokenIdx * qBProjStrideToken + static_cast<int64_t>(kStart + reduceDim) * qBProjStrideDim]));
+        // Track the largest absolute value in this activation block.
+        amax = fmaxf(amax, value);
+    }
+    // Match the non-UE8M0 fp8_quantize_1x128 path used by cute_dsl_fp8_gemm_blackwell with raw FP32 weight scales.
+    amax = fmaxf(amax, 1.0e-10F);
+    // The reference quantizer computes quant_scale first.
+    float const quantScale = 448.0F / amax;
+    // The scale tensor stores the dequant scale as the reciprocal of quant_scale.
+    float const dequantScale = 1.0F / quantScale;
+    // Return both values so the caller does not introduce an extra reciprocal rounding step.
+    return make_float2(dequantScale, quantScale);
+}
+
 // Load one packed UE8M0 weight scale from q_b_proj's post-load DeepGEMM layout.
 //
 // Inputs:
@@ -242,6 +281,53 @@ __device__ __forceinline__ float loadPackedUe8m0Scale(int32_t const* qBProjWeigh
     // A zero byte is the padded/zero UE8M0 value. Real scale bytes are positive powers of two with an FP32-style
     // exponent bias of 127.
     return decodeUe8m0Scale(static_cast<uint32_t>(biasedExponent));
+}
+
+// Load one FP32 weight scale from q_b_proj's original 128x128 block-scale layout.
+//
+// Inputs:
+// - qBProjWeightScale: FP32 logical [16, 16]. Rows index 128-output-row blocks, columns index 128-K blocks.
+// - qBProjScaleStrideRow/qBProjScaleStridePack: runtime logical strides.
+// - outputDim: q_b_proj output row in [0, 2048).
+// - kBlock: 128-wide input block id in [0, 16).
+//
+// Output:
+// - FP32 dequantization scale for the 128x128 weight block containing [outputDim, kBlock].
+//
+// Side effects: none.
+__device__ __forceinline__ float loadFp32BlockScale(float const* qBProjWeightScale, int64_t qBProjScaleStrideRow,
+    int64_t qBProjScaleStridePack, int outputDim, int kBlock)
+{
+    // Original block-scale checkpoints store one FP32 scale per 128 output rows.
+    int const outputBlock = outputDim / 128;
+    // Load using PyTorch strides so this also works if the tensor is a view.
+    return qBProjWeightScale[outputBlock * qBProjScaleStrideRow + kBlock * qBProjScaleStridePack];
+}
+
+// Load q_b_proj's weight scale from either the post-load UE8M0 layout or the saved original FP32 layout.
+//
+// Inputs:
+// - qBProjWeightScalePacked: optional INT32 logical [2048, 4], packed UE8M0.
+// - qBProjWeightScaleFp32: optional FP32 logical [16, 16], original block scales.
+// - qBProjScaleStrideRow/qBProjScaleStridePack: runtime strides for the active layout.
+// - outputDim: q_b_proj output row in [0, 2048).
+// - kBlock: 128-wide input block id in [0, 16).
+//
+// Output:
+// - FP32 dequantization scale for the selected q_b weight block.
+//
+// Side effects: none.
+__device__ __forceinline__ float loadQbProjWeightScale(int32_t const* qBProjWeightScalePacked,
+    float const* qBProjWeightScaleFp32, int64_t qBProjScaleStrideRow, int64_t qBProjScaleStridePack, int outputDim,
+    int kBlock)
+{
+    if (qBProjWeightScaleFp32 != nullptr)
+    {
+        return loadFp32BlockScale(
+            qBProjWeightScaleFp32, qBProjScaleStrideRow, qBProjScaleStridePack, outputDim, kBlock);
+    }
+    return loadPackedUe8m0Scale(
+        qBProjWeightScalePacked, qBProjScaleStrideRow, qBProjScaleStridePack, outputDim, kBlock);
 }
 
 // Apply one two-dimensional RoPE rotation.
@@ -419,7 +505,8 @@ __device__ __forceinline__ void generationGridBarrier(int32_t* syncScratch, int 
 // - qBProjScratch: mutable BF16 [numTokens, kLocalHeads, kQkHeadDim]. Stores q_b_proj output split by head.
 // - qBProjInput: BF16 [numTokens, kQLoraRank], q_a_layernorm output.
 // - qBProjWeight: FP8 E4M3 [kLocalHeads * kQkHeadDim, kQLoraRank], local q_b projection weight.
-// - qBProjWeightScale: INT32 packed UE8M0 logical [kLocalHeads * kQkHeadDim, kQLoraRank / 128 / 4].
+// - qBProjWeightScalePacked: optional INT32 packed UE8M0 logical [kLocalHeads * kQkHeadDim, kQLoraRank / 128 / 4].
+// - qBProjWeightScaleFp32: optional FP32 original block scales [kLocalHeads * kQkHeadDim / 128, kQLoraRank / 128].
 // - qBProjStrideToken/qBProjStrideDim: runtime strides for qBProjInput.
 // - qBProjWeightStrideRow/qBProjWeightStrideDim: runtime strides for qBProjWeight.
 // - qBProjScaleStrideRow/qBProjScaleStridePack: runtime strides for qBProjWeightScale.
@@ -432,24 +519,38 @@ __device__ __forceinline__ void generationGridBarrier(int32_t* syncScratch, int 
 // Side effects:
 // - Writes qBProjScratch[tokenIdx, :, :] for output dims covered by tileIdx.
 __device__ __forceinline__ void projectQbProjTile(__nv_bfloat16* qBProjScratch, __nv_bfloat16 const* qBProjInput,
-    __nv_fp8_e4m3 const* qBProjWeight, int32_t const* qBProjWeightScale, int64_t qBProjStrideToken,
-    int64_t qBProjStrideDim, int64_t qBProjWeightStrideRow, int64_t qBProjWeightStrideDim, int64_t qBProjScaleStrideRow,
-    int64_t qBProjScaleStridePack, int tokenIdx, int tileIdx, float* sharedTile)
+    __nv_fp8_e4m3 const* qBProjWeight, int32_t const* qBProjWeightScalePacked, float const* qBProjWeightScaleFp32,
+    int64_t qBProjStrideToken, int64_t qBProjStrideDim, int64_t qBProjWeightStrideRow, int64_t qBProjWeightStrideDim,
+    int64_t qBProjScaleStrideRow, int64_t qBProjScaleStridePack, int tokenIdx, int tileIdx, float* sharedTile)
 {
     // This CTA owns a fixed 64-column slice of the 2048-column local q_b_proj output.
     int const outputStart = tileIdx * kQbProjTileDim;
 
-    // Dynamic shared memory stores the raw UE8M0 activation scale byte for each 1x128 K block. Keeping the byte
-    // lets the scalar implementation reproduce the same reciprocal path used by fp8_quantize_1x128_packed_kernel_impl.
+    // Dynamic shared memory stores one activation scale per 1x128 K block. The packed DeepGEMM path stores raw UE8M0
+    // bytes, while the original-FP32-scale path stores FP32 dequant scales to match fp8_quantize_1x128.
     auto* actScaleBytes = reinterpret_cast<uint32_t*>(sharedTile);
+    float* actScaleFp32 = sharedTile;
+    float* actQuantScaleFp32 = sharedTile + kQbProjScaleBlocks;
+    bool const usesFp32ActivationScale = qBProjWeightScaleFp32 != nullptr;
 
-    // Compute all 16 activation scale bytes once per token. Only 16 threads are needed, but using the CTA keeps the
-    // code simple and leaves the same CTA contract for a later tensor-core implementation.
+    // Compute all 16 activation scales once per token. Only 16 threads are needed, but using the CTA keeps the code
+    // simple and leaves the same CTA contract for a later tensor-core implementation.
     for (int kBlock = static_cast<int>(threadIdx.x); kBlock < kQbProjScaleBlocks; kBlock += blockDim.x)
     {
-        // One raw UE8M0 byte per [token, 128 input dims] activation scale.
-        actScaleBytes[kBlock]
-            = computeQbProjActivationScaleByte(qBProjInput, qBProjStrideToken, qBProjStrideDim, tokenIdx, kBlock);
+        if (usesFp32ActivationScale)
+        {
+            // One FP32 dequant scale and one FP32 quant multiplier per [token, 128 input dims] activation scale.
+            float2 const scales
+                = computeQbProjActivationScalesFp32(qBProjInput, qBProjStrideToken, qBProjStrideDim, tokenIdx, kBlock);
+            actScaleFp32[kBlock] = scales.x;
+            actQuantScaleFp32[kBlock] = scales.y;
+        }
+        else
+        {
+            // One raw UE8M0 byte per [token, 128 input dims] activation scale.
+            actScaleBytes[kBlock]
+                = computeQbProjActivationScaleByte(qBProjInput, qBProjStrideToken, qBProjStrideDim, tokenIdx, kBlock);
+        }
     }
     __syncthreads();
 
@@ -465,15 +566,16 @@ __device__ __forceinline__ void projectQbProjTile(__nv_bfloat16* qBProjScratch, 
         // Traverse the same sixteen 1x128 K blocks used by the packed FP8 activation quantizer and weight scales.
         for (int kBlock = 0; kBlock < kQbProjScaleBlocks; ++kBlock)
         {
-            // Raw UE8M0 byte for this token's activation block.
-            uint32_t const actScaleByte = actScaleBytes[kBlock];
             // Dequant scale applied after raw FP8 products are accumulated.
-            float const actScale = decodeUe8m0Scale(actScaleByte);
+            float const actScale
+                = usesFp32ActivationScale ? actScaleFp32[kBlock] : decodeUe8m0Scale(actScaleBytes[kBlock]);
             // Reciprocal scale used to quantize BF16 activation values to FP8 E4M3.
-            float const quantScale = decodeUe8m0InverseScale(actScaleByte);
-            // Packed UE8M0 weight dequant scale for this output row and K block.
-            float const weightScale = loadPackedUe8m0Scale(
-                qBProjWeightScale, qBProjScaleStrideRow, qBProjScaleStridePack, outputDim, kBlock);
+            float const quantScale
+                = usesFp32ActivationScale ? actQuantScaleFp32[kBlock] : decodeUe8m0InverseScale(actScaleBytes[kBlock]);
+            // Weight dequant scale for this output row and K block. This can come from the resmoothed packed
+            // UE8M0 layout or from the saved original FP32 block-scale tensor.
+            float const weightScale = loadQbProjWeightScale(qBProjWeightScalePacked, qBProjWeightScaleFp32,
+                qBProjScaleStrideRow, qBProjScaleStridePack, outputDim, kBlock);
             // Raw FP32 accumulator for 128 FP8 x FP8 products before applying block scales.
             float rawBlockAccum = 0.0F;
             // First input dimension in the current 1x128 block.
@@ -1109,12 +1211,12 @@ __global__ void generationAttentionCombinedKernel(__nv_bfloat16* fusedQ, __nv_bf
     int32_t const* sequenceLength, int32_t const* specDecodingPackedMask, int specMaskWords, float* splitLse,
     float* splitOutput, int32_t* syncScratch, __nv_bfloat16* output, float* bmm1Scale, float* bmm2Scale,
     float const* kvScaleOrigQuant, float const* kvScaleQuantOrig, __nv_bfloat16* qBProjScratch,
-    __nv_bfloat16 const* qBProjInput, __nv_fp8_e4m3 const* qBProjWeight, int32_t const* qBProjWeightScale,
-    int64_t qNopeStrideToken, int64_t qNopeStrideHead, int64_t kBProjStrideHead, int64_t kBProjStrideDim,
-    int64_t kBProjStrideReduction, int64_t qPeStrideToken, int64_t qPeStrideHead, int64_t qBProjStrideToken,
-    int64_t qBProjStrideDim, int64_t qBProjWeightStrideRow, int64_t qBProjWeightStrideDim, int64_t qBProjScaleStrideRow,
-    int64_t qBProjScaleStridePack, int numTokens, int topK, int numSplits, int expectedCtas, float hostScoreScale,
-    bool isContext, int contextChunkStart)
+    __nv_bfloat16 const* qBProjInput, __nv_fp8_e4m3 const* qBProjWeight, int32_t const* qBProjWeightScalePacked,
+    float const* qBProjWeightScaleFp32, int64_t qNopeStrideToken, int64_t qNopeStrideHead, int64_t kBProjStrideHead,
+    int64_t kBProjStrideDim, int64_t kBProjStrideReduction, int64_t qPeStrideToken, int64_t qPeStrideHead,
+    int64_t qBProjStrideToken, int64_t qBProjStrideDim, int64_t qBProjWeightStrideRow, int64_t qBProjWeightStrideDim,
+    int64_t qBProjScaleStrideRow, int64_t qBProjScaleStridePack, int numTokens, int topK, int numSplits,
+    int expectedCtas, float hostScoreScale, bool isContext, int contextChunkStart)
 {
     // Dynamic shared memory is reused by the q_b projection phase and the later attention score phase. Declare it
     // as 16-byte-aligned bytes so it can hold either uint32 scale bytes or FP32 split scores.
@@ -1204,8 +1306,8 @@ __global__ void generationAttentionCombinedKernel(__nv_bfloat16* fusedQ, __nv_bf
         if (splitIdx * kQbProjTileDim < kLocalHeads * kQkHeadDim)
         {
             // Produce qBProjScratch[token, head, 0:256] from the normalized q_a vector and FP8 q_b weight.
-            projectQbProjTile(qBProjScratch, qBProjInput, qBProjWeight, qBProjWeightScale, qBProjStrideToken,
-                qBProjStrideDim, qBProjWeightStrideRow, qBProjWeightStrideDim, qBProjScaleStrideRow,
+            projectQbProjTile(qBProjScratch, qBProjInput, qBProjWeight, qBProjWeightScalePacked, qBProjWeightScaleFp32,
+                qBProjStrideToken, qBProjStrideDim, qBProjWeightStrideRow, qBProjWeightStrideDim, qBProjScaleStrideRow,
                 qBProjScaleStridePack, tokenIdx, splitIdx, splitScores);
         }
         // The setup phase below consumes q_nope/q_pe from qBProjScratch, so all 32 q_b tiles must finish first.
@@ -1638,7 +1740,8 @@ torch::Tensor dsv3_fused_mla_context_cuda(torch::Tensor fused_q, torch::Tensor q
 // - context_chunk_start: int64, first local KV position of the current context chunk when is_context is true.
 // - q_b_proj_input: optional BF16 [numTokens, 2048]. When present, the kernel computes q_b_proj internally.
 // - q_b_proj_weight: optional FP8 E4M3 [2048, 2048]. Local q_b projection weight.
-// - q_b_proj_weight_scale: optional INT32 [2048, 4] packed UE8M0 scale tensor from FP8BlockScalesLinearMethod.
+// - q_b_proj_weight_scale: optional INT32 [2048, 4] packed UE8M0 scale tensor from FP8BlockScalesLinearMethod,
+//   or FP32 [16, 16] saved original 128x128 block-scale tensor.
 //
 // Output:
 // - Returns BF16 [numTokens, 8 * 512], logically [numTokens, 8, 512].
@@ -1691,7 +1794,10 @@ torch::Tensor dsv3_fused_mla_generation_cuda(torch::Tensor fused_q, torch::Tenso
     auto* qBProjInputPtr = hasQbProj ? static_cast<__nv_bfloat16 const*>(q_b_proj_input.value().data_ptr()) : nullptr;
     auto* qBProjWeightPtr
         = hasQbProj ? reinterpret_cast<__nv_fp8_e4m3 const*>(q_b_proj_weight.value().data_ptr()) : nullptr;
-    auto* qBProjWeightScalePtr = hasQbProj ? q_b_proj_weight_scale.value().data_ptr<int32_t>() : nullptr;
+    bool const qBProjUsesFp32Scale = hasQbProj && q_b_proj_weight_scale.value().scalar_type() == torch::kFloat32;
+    auto* qBProjWeightScalePackedPtr
+        = hasQbProj && !qBProjUsesFp32Scale ? q_b_proj_weight_scale.value().data_ptr<int32_t>() : nullptr;
+    auto* qBProjWeightScaleFp32Ptr = qBProjUsesFp32Scale ? q_b_proj_weight_scale.value().data_ptr<float>() : nullptr;
     // q_nope may be a split view, so pass runtime strides.
     int64_t const qNopeStrideToken = q_nope.stride(0);
     // Head stride for q_nope.
@@ -1776,10 +1882,10 @@ torch::Tensor dsv3_fused_mla_generation_cuda(torch::Tensor fused_q, torch::Tenso
         specDecodingPackedMaskPtr, specMaskWords, splitLse.data_ptr<float>(), splitOutput.data_ptr<float>(),
         syncScratch.data_ptr<int32_t>(), outputPtr, mla_bmm1_scale.data_ptr<float>(), mla_bmm2_scale.data_ptr<float>(),
         kvScaleOrigQuantPtr, kvScaleQuantOrigPtr, qBProjScratchPtr, qBProjInputPtr, qBProjWeightPtr,
-        qBProjWeightScalePtr, qNopeStrideToken, qNopeStrideHead, kBProjStrideHead, kBProjStrideDim,
-        kBProjStrideReduction, qPeStrideToken, qPeStrideHead, qBProjStrideToken, qBProjStrideDim, qBProjWeightStrideRow,
-        qBProjWeightStrideDim, qBProjScaleStrideRow, qBProjScaleStridePack, numTokens, topK, numSplits,
-        numTokens * numSplits, hostScoreScale, is_context, contextChunkStart);
+        qBProjWeightScalePackedPtr, qBProjWeightScaleFp32Ptr, qNopeStrideToken, qNopeStrideHead, kBProjStrideHead,
+        kBProjStrideDim, kBProjStrideReduction, qPeStrideToken, qPeStrideHead, qBProjStrideToken, qBProjStrideDim,
+        qBProjWeightStrideRow, qBProjWeightStrideDim, qBProjScaleStrideRow, qBProjScaleStridePack, numTokens, topK,
+        numSplits, numTokens * numSplits, hostScoreScale, is_context, contextChunkStart);
 
     // Report any asynchronous CUDA error before returning to Python.
     sync_check_cuda_error(stream);

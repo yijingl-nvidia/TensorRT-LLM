@@ -195,8 +195,9 @@ th::Tensor dsv3_fused_mla_generation(th::Tensor fused_q, th::Tensor q_nope, th::
     {
         TORCH_CHECK(q_b_proj_input.value().scalar_type() == torch::kBFloat16, "q_b_proj_input must be bf16");
         TORCH_CHECK(q_b_proj_weight.value().scalar_type() == torch::kFloat8_e4m3fn, "q_b_proj_weight must be FP8 E4M3");
-        TORCH_CHECK(q_b_proj_weight_scale.value().scalar_type() == torch::kInt32,
-            "q_b_proj_weight_scale must be packed UE8M0 int32");
+        TORCH_CHECK(q_b_proj_weight_scale.value().scalar_type() == torch::kInt32
+                || q_b_proj_weight_scale.value().scalar_type() == torch::kFloat32,
+            "q_b_proj_weight_scale must be packed UE8M0 int32 or original FP32 block scales");
     }
 
     TORCH_CHECK(fused_q.dim() == 3, "fused_q must have shape [tokens, heads, 576]");
@@ -249,15 +250,26 @@ th::Tensor dsv3_fused_mla_generation(th::Tensor fused_q, th::Tensor q_nope, th::
         TORCH_CHECK(q_b_proj_input.value().dim() == 2, "q_b_proj_input must have shape [tokens, 2048]");
         TORCH_CHECK(q_b_proj_weight.value().dim() == 2, "q_b_proj_weight must have shape [2048, 2048]");
         TORCH_CHECK(q_b_proj_weight_scale.value().dim() == 2,
-            "q_b_proj_weight_scale must have shape [2048, 4] in packed UE8M0 layout");
+            "q_b_proj_weight_scale must have shape [2048, 4] packed UE8M0 or [16, 16] FP32 block scales");
         TORCH_CHECK(q_b_proj_input.value().size(0) == fused_q.size(0),
             "q_b_proj_input and fused_q token dimensions must match");
         TORCH_CHECK(q_b_proj_input.value().size(1) == 2048, "q_b_proj_input must have hidden size 2048");
         TORCH_CHECK(q_b_proj_weight.value().size(0) == 2048, "q_b_proj_weight must have 2048 output rows");
         TORCH_CHECK(q_b_proj_weight.value().size(1) == 2048, "q_b_proj_weight must have 2048 input columns");
-        TORCH_CHECK(q_b_proj_weight_scale.value().size(0) == 2048, "q_b_proj_weight_scale must have 2048 output rows");
-        TORCH_CHECK(q_b_proj_weight_scale.value().size(1) == 4,
-            "q_b_proj_weight_scale must pack 16 K-block scales into four int32 values");
+        if (q_b_proj_weight_scale.value().scalar_type() == torch::kInt32)
+        {
+            TORCH_CHECK(
+                q_b_proj_weight_scale.value().size(0) == 2048, "q_b_proj_weight_scale must have 2048 output rows");
+            TORCH_CHECK(q_b_proj_weight_scale.value().size(1) == 4,
+                "q_b_proj_weight_scale must pack 16 K-block scales into four int32 values");
+        }
+        else
+        {
+            TORCH_CHECK(
+                q_b_proj_weight_scale.value().size(0) == 16, "FP32 q_b_proj_weight_scale must have 16 output blocks");
+            TORCH_CHECK(
+                q_b_proj_weight_scale.value().size(1) == 16, "FP32 q_b_proj_weight_scale must have 16 K blocks");
+        }
         TORCH_CHECK(q_b_proj_input.value().stride(1) == 1, "q_b_proj_input last dimension must be contiguous");
         TORCH_CHECK(q_b_proj_weight.value().stride(1) == 1, "q_b_proj_weight last dimension must be contiguous");
     }

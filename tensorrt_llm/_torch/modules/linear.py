@@ -1245,6 +1245,11 @@ class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):
         if (is_sm_100f() and not (module.use_cute_dsl_blockscaling_mm
                                  or module.disable_deep_gemm)) or \
            get_sm_version() == 120:
+            if module.maintain_original_weight:
+                module.weight_orig = Parameter(module.weight.detach().clone(),
+                                               requires_grad=False)
+                module.weight_scale_orig = Parameter(
+                    module.weight_scale.detach().clone(), requires_grad=False)
             weight, weight_scale = resmooth_to_fp8_e8m0(module.weight,
                                                         module.weight_scale)
             transformed_scale = transform_sf_into_required_layout(
@@ -2759,6 +2764,7 @@ class Linear(nn.Module):
         force_dynamic_quantization: bool = False,
         use_cute_dsl_blockscaling_mm: bool = False,
         disable_deep_gemm: bool = False,
+        maintain_original_weight: bool = False,
         fused_weight_shard_indices_mapping: Optional[dict] = None,
         nvfp4_allowed_backends: Optional[List[str]] = None,
         enable_gemm_allreduce_fusion: bool = True,
@@ -2788,6 +2794,7 @@ class Linear(nn.Module):
         self.force_dynamic_quantization = force_dynamic_quantization
         self.use_cute_dsl_blockscaling_mm = use_cute_dsl_blockscaling_mm
         self.disable_deep_gemm = disable_deep_gemm
+        self.maintain_original_weight = maintain_original_weight
         self.fused_weight_shard_indices_mapping = fused_weight_shard_indices_mapping
         # Store NVFP4 GEMM allowed backends configuration
         # Read from model_extra_attrs if not explicitly provided (allows config via llm_api_options)
