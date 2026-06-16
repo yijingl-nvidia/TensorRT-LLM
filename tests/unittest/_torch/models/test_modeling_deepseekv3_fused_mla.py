@@ -770,6 +770,9 @@ def _run_fp8_block_scale_linear(
 def _build_fp8_block_scale_linear(
     weight: torch.Tensor,
     weight_scale: torch.Tensor,
+    *,
+    disable_deep_gemm: bool = False,
+    maintain_original_weight: bool = False,
 ) -> Linear:
     """
     Build a TensorRT-LLM FP8 block-scale Linear module from dumped weights.
@@ -784,6 +787,11 @@ def _build_fp8_block_scale_linear(
         quantized linear weight.
     - weight_scale: torch.Tensor, shape [ceil(out_features / 128),
         ceil(in_features / 128)], fp32, dumped block scale tensor.
+    - disable_deep_gemm: bool, whether to keep the raw FP32 block-scale layout
+        instead of post-load resmoothing for DeepGEMM.
+    - maintain_original_weight: bool, whether Linear should preserve the
+        pre-resmooth FP8 weight and FP32 scales as `weight_orig` and
+        `weight_scale_orig`.
 
     Returns
     - linear: Linear, CUDA eval-mode module with post-load FP8 block-scale
@@ -796,6 +804,8 @@ def _build_fp8_block_scale_linear(
         bias=False,
         dtype=torch.bfloat16,
         quant_config=QuantConfig(quant_algo=QuantAlgo.FP8_BLOCK_SCALES),
+        disable_deep_gemm=disable_deep_gemm,
+        maintain_original_weight=maintain_original_weight,
     )
     linear.cuda()
     linear.load_weights([{"weight": weight, "weight_scale": weight_scale}])
@@ -1489,6 +1499,61 @@ def _run_dump_decode_fused_q_b(
     return output, fused_q, quant_q_buffer, mla_bmm1_scale, mla_bmm2_scale
 
 
+def _with_original_q_b_weight_and_scale(
+    case: FusedMlaDumpDecodeCase,
+) -> FusedMlaDumpDecodeCase:
+    """
+    Replace a dump decode case with the raw original q_b weight-scale path.
+
+    The normal dump case uses the post-load resmoothed q_b tensors. This helper
+    reloads the raw FP8 E4M3 q_b weight and FP32 128x128 block scales, builds a
+    Linear with DeepGEMM resmoothing disabled, and computes the matching
+    preprojected q_nope/q_pe reference. The returned case can be passed to the
+    fused op to exercise q_b_proj_weight_scale as FP32 [16, 16].
+
+    Args
+    - case: FusedMlaDumpDecodeCase, dump-backed decode setup using the regular
+        post-load q_b tensors.
+
+    Returns
+    - original_case: FusedMlaDumpDecodeCase, same attention metadata and KV
+        cache as `case`, but with original q_b weight, original q_b FP32 scales,
+        and q_nope/q_pe derived from that original-scale Linear output.
+    """
+    # [num_heads_tp * qk_head_dim, q_lora_rank]
+    q_b_proj_weight = _load_tensor(case.group, "q_b_proj_weight")
+    # [ceil(out_features / 128), ceil(in_features / 128)]
+    q_b_proj_weight_scale = _load_tensor(case.group, "q_b_proj_weight_scale")
+    if q_b_proj_weight_scale.dtype != torch.float32:
+        pytest.skip("original q_b FP32 scale dump is not available")
+
+    q_b_linear = _build_fp8_block_scale_linear(
+        q_b_proj_weight,
+        q_b_proj_weight_scale,
+        disable_deep_gemm=True,
+    )
+
+    # [num_tokens, num_heads_tp * qk_head_dim]
+    q_b_proj_output = q_b_linear(case.q_b_proj_input.contiguous()).contiguous()
+    # [num_tokens, num_heads_tp, qk_head_dim]
+    q_heads = q_b_proj_output.view(
+        q_b_proj_output.shape[0],
+        _LOCAL_NUM_HEADS,
+        _QK_HEAD_DIM,
+    )
+    # q_nope: [num_tokens, num_heads_tp, qk_nope_head_dim]
+    # q_pe: [num_tokens, num_heads_tp, qk_rope_head_dim]
+    q_nope, q_pe = q_heads.split([_QK_NOPE_HEAD_DIM, _QK_ROPE_HEAD_DIM], dim=-1)
+    return replace(
+        case,
+        q_b_proj_output=q_b_proj_output,
+        q_b_proj_weight=q_b_linear.weight.detach(),
+        q_b_proj_weight_scale=q_b_linear.weight_scale.detach(),
+        q_nope=q_nope.contiguous(),
+        q_pe=q_pe.contiguous(),
+    )
+
+
 def _selector_k_b_proj_trans(device: torch.device) -> torch.Tensor:
     """
     Build a k_b projection tensor that exposes raw q_b output in fused_q.
@@ -1903,6 +1968,62 @@ def test_deepseekv3_fused_mla_dump_decode_q_b_proj_raw_output_matches_linear(
         values, and produces identical downstream fused_q/FP8 query buffers.
     """
     case = _build_dump_decode_q_b_case(rank)
+    selector_case = replace(
+        case,
+        k_b_proj_trans=_selector_k_b_proj_trans(case.q_b_proj_input.device),
+    )
+
+    with torch.inference_mode():
+        (
+            _,
+            fused_q_expected,
+            quant_q_buffer_expected,
+            mla_bmm1_scale_expected,
+            mla_bmm2_scale_expected,
+        ) = _run_dump_decode_preprojected(selector_case)
+        (
+            _,
+            fused_q_actual,
+            quant_q_buffer_actual,
+            mla_bmm1_scale_actual,
+            mla_bmm2_scale_actual,
+        ) = _run_dump_decode_fused_q_b(selector_case)
+
+    _assert_q_b_selector_prefix_close(fused_q_actual, case.q_b_proj_output)
+    torch.testing.assert_close(
+        fused_q_actual,
+        fused_q_expected,
+        rtol=0.0,
+        atol=0.0,
+    )
+    torch.testing.assert_close(mla_bmm1_scale_actual, mla_bmm1_scale_expected, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(mla_bmm2_scale_actual, mla_bmm2_scale_expected, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(quant_q_buffer_actual, quant_q_buffer_expected, rtol=0.0, atol=0.0)
+
+
+@pytest.mark.parametrize("rank", range(_NUM_RANKS))
+def test_deepseekv3_fused_mla_dump_decode_q_b_proj_original_scale_matches_linear(
+    rank: int,
+) -> None:
+    """
+    Compare fused q_b projection against the raw FP32 block-scale Linear path.
+
+    This test validates the experimental original-q_b branch used by the model
+    when `weight_orig` and `weight_scale_orig` are present. The reference keeps
+    q_b's original FP8 E4M3 weight and FP32 [16, 16] scale tensor by disabling
+    DeepGEMM post-load resmoothing, then uses the selector k_b projection to
+    expose q_b output directly in fused_q.
+
+    Args
+    - rank: int, tensor-parallel rank id selected by pytest parametrization.
+
+    Returns
+    - None: successful return means the fused op's FP32-scale q_b projection
+        reproduces the raw original-scale Linear output exactly for the exposed
+        q_nope values, and produces identical downstream fused_q/FP8 query
+        buffers.
+    """
+    case = _with_original_q_b_weight_and_scale(_build_dump_decode_q_b_case(rank))
     selector_case = replace(
         case,
         k_b_proj_trans=_selector_k_b_proj_trans(case.q_b_proj_input.device),
