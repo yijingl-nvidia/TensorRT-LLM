@@ -46,16 +46,9 @@ constexpr int kTileRtThreads = 384;
 constexpr int kTileRtConsumerThreads = 256;
 constexpr int kSparseSplitSize = 64;
 constexpr int kQbProjTileDim = 64;
-constexpr int kQbProjMmaM = 16;
-constexpr int kQbProjMmaN = 8;
-constexpr int kQbProjMmaBRows = 16;
-constexpr int kQbProjMmaK = 32;
-constexpr int kQbProjMmaKPerScaleBlock = 128;
-constexpr int kQbProjMmaWarps = kQbProjTileDim / kQbProjMmaN;
-constexpr int kQbProjMmaABytes = kQbProjMmaM * kQbProjMmaK * sizeof(__nv_fp8_e4m3);
-constexpr int kQbProjMmaBBytes = kQbProjMmaWarps * kQbProjMmaBRows * kQbProjMmaK * sizeof(__nv_fp8_e4m3);
-constexpr int kQbProjMmaSharedBytes = kQbProjMmaABytes + kQbProjMmaBBytes;
-constexpr int kQbProjMmaTotalSharedBytes = kQbProjMmaSharedBytes + sizeof(float);
+constexpr int kQbProjKPerScaleBlock = 128;
+constexpr int kQbProjScaleBlocks = kQLoraRank / kQbProjKPerScaleBlock;
+constexpr int kQbProjScalarSharedBytes = kQbProjScaleBlocks * sizeof(uint32_t);
 constexpr int kTileRtMaxResidentSplitCtas = 128;
 constexpr int kMaxTopK = 4096;
 
@@ -154,7 +147,38 @@ __device__ __forceinline__ float reciprocalApproximateFtz(float value)
     return reciprocal;
 }
 
-// Compute the 1x128 dynamic FP8 activation scale used by q_b_proj.
+// Decode one UE8M0 scale byte to its FP32 scale value.
+//
+// Inputs:
+// - biasedExponent: uint32_t, raw UE8M0 byte interpreted as an FP32 exponent field.
+//
+// Output:
+// - FP32 power-of-two scale. A zero byte is treated as the padded zero scale used by packed scale tensors.
+//
+// Side effects: none.
+__device__ __forceinline__ float decodeUe8m0Scale(uint32_t biasedExponent)
+{
+    // UE8M0 stores only the FP32 exponent byte. Recreate 2^(exp - bias).
+    return biasedExponent == 0U ? 0.0F : exp2f(static_cast<float>(biasedExponent) - 127.0F);
+}
+
+// Decode one UE8M0 scale byte to its reciprocal FP32 quantization multiplier.
+//
+// Inputs:
+// - biasedExponent: uint32_t, raw UE8M0 byte interpreted as an FP32 exponent field.
+//
+// Output:
+// - FP32 reciprocal power-of-two multiplier. A zero byte follows the packed quantizer's padded-row convention and
+//   returns 1.0 so multiplying a zero/padded value is harmless.
+//
+// Side effects: none.
+__device__ __forceinline__ float decodeUe8m0InverseScale(uint32_t biasedExponent)
+{
+    // The packed quantizer uses exp2(127 - scale_byte), not an approximate reciprocal of the decoded scale.
+    return biasedExponent == 0U ? 1.0F : exp2f(127.0F - static_cast<float>(biasedExponent));
+}
+
+// Compute the 1x128 dynamic FP8 activation scale byte used by q_b_proj.
 //
 // Inputs:
 // - qBProjInput: BF16 [numTokens, kQLoraRank], normalized q_a output.
@@ -163,10 +187,10 @@ __device__ __forceinline__ float reciprocalApproximateFtz(float value)
 // - kBlock: 128-wide input block id.
 //
 // Output:
-// - FP32 UE8M0 scale for qBProjInput[tokenIdx, kBlock * 128:(kBlock + 1) * 128].
+// - uint32_t holding the raw UE8M0 scale byte for qBProjInput[tokenIdx, kBlock * 128:(kBlock + 1) * 128].
 //
 // Side effects: none.
-__device__ __forceinline__ float computeQbProjActivationScale(
+__device__ __forceinline__ uint32_t computeQbProjActivationScaleByte(
     __nv_bfloat16 const* qBProjInput, int64_t qBProjStrideToken, int64_t qBProjStrideDim, int tokenIdx, int kBlock)
 {
     // First input dimension in this 1x128 quantization block.
@@ -187,8 +211,8 @@ __device__ __forceinline__ float computeQbProjActivationScale(
     // Convert with the hardware E8M0 primitive and round toward +inf, exactly like the packed quantizer.
     __nv_fp8_e8m0 ue8m0Scale;
     ue8m0Scale.__x = __nv_cvt_float_to_e8m0(scaleCandidate, __NV_SATFINITE, cudaRoundPosInf);
-    // Static cast decodes E8M0 back to FP32 scale for the local FP8 A conversion and post-MMA dequantization.
-    return static_cast<float>(ue8m0Scale);
+    // Return the raw byte so q_b uses the same reciprocal path as fp8_quantize_1x128_packed_kernel_impl.
+    return static_cast<uint32_t>(ue8m0Scale.__x);
 }
 
 // Load one packed UE8M0 weight scale from q_b_proj's post-load DeepGEMM layout.
@@ -217,61 +241,7 @@ __device__ __forceinline__ float loadPackedUe8m0Scale(int32_t const* qBProjWeigh
     int const biasedExponent = static_cast<int>((packed >> (8 * byteIdx)) & 0xFFU);
     // A zero byte is the padded/zero UE8M0 value. Real scale bytes are positive powers of two with an FP32-style
     // exponent bias of 127.
-    return biasedExponent == 0 ? 0.0F : exp2f(static_cast<float>(biasedExponent - 127));
-}
-
-// Load a 16x32 FP8 MMA operand fragment from shared memory.
-//
-// Inputs:
-// - row: shared-memory pointer to the lane-specific row/column address used by ldmatrix.
-//
-// Output:
-// - uint4 containing four 32-bit packed FP8 register fragments for mma.sync.m16n8k32.
-//
-// Side effects: none.
-__device__ __forceinline__ uint4 loadMmaFp8M16N8K32Shared(uint4 const* row)
-{
-    uint32_t reg0;
-    uint32_t reg1;
-    uint32_t reg2;
-    uint32_t reg3;
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 890
-    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
-                 : "=r"(reg0), "=r"(reg1), "=r"(reg2), "=r"(reg3)
-                 : "l"(__cvta_generic_to_shared(row))
-                 : "memory");
-#else
-    reg0 = 0;
-    reg1 = 0;
-    reg2 = 0;
-    reg3 = 0;
-#endif
-    return make_uint4(reg0, reg1, reg2, reg3);
-}
-
-// Execute one FP8 E4M3 x FP8 E4M3 MMA instruction with FP32 accumulation.
-//
-// Inputs:
-// - aRegs: four 32-bit packed FP8 A registers for an m16n8k32 row-major operand.
-// - bRegs: two 32-bit packed FP8 B registers for an m16n8k32 column-major operand.
-//
-// Outputs:
-// - acc: FP32 accumulator fragment updated in place. Each lane owns two rows by two columns of the 16x8 C tile.
-//
-// Side effects: none.
-__device__ __forceinline__ void mmaFp8M16N8K32(
-    float (&acc)[2][2], uint32_t const (&aRegs)[2][2], uint32_t const (&bRegs)[2])
-{
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 890
-    asm volatile(
-        "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 \n"
-        "    {%0, %1, %2, %3}, \n"
-        "    {%4, %5, %6, %7}, \n"
-        "    {%8, %9}, \n"
-        "    {%0, %1, %2, %3}; \n"
-        : "+f"(acc[0][0]), "+f"(acc[0][1]), "+f"(acc[1][0]), "+f"(acc[1][1])
-        : "r"(aRegs[0][0]), "r"(aRegs[0][1]), "r"(aRegs[1][0]), "r"(aRegs[1][1]), "r"(bRegs[0]), "r"(bRegs[1]));
-#endif
+    return decodeUe8m0Scale(static_cast<uint32_t>(biasedExponent));
 }
 
 // Apply one two-dimensional RoPE rotation.
@@ -455,7 +425,7 @@ __device__ __forceinline__ void generationGridBarrier(int32_t* syncScratch, int 
 // - qBProjScaleStrideRow/qBProjScaleStridePack: runtime strides for qBProjWeightScale.
 // - tokenIdx: token row selected by the grid.
 // - tileIdx: 64-column output tile id selected by the split CTA.
-// - sharedTile: dynamic shared-memory scratch, at least kQbProjMmaTotalSharedBytes bytes.
+// - sharedTile: dynamic shared-memory scratch, at least kQbProjScalarSharedBytes bytes.
 //
 // Outputs: none.
 //
@@ -469,131 +439,72 @@ __device__ __forceinline__ void projectQbProjTile(__nv_bfloat16* qBProjScratch, 
     // This CTA owns a fixed 64-column slice of the 2048-column local q_b_proj output.
     int const outputStart = tileIdx * kQbProjTileDim;
 
-    // Dynamic shared memory is reused before the attention score phase. The first region is the FP8 A tile
-    // [16, 32], the second region is eight FP8 B tiles [warp, 16, 32], and the last float stores the activation
-    // scale for the current 1x128 K block.
-    auto* sharedBytes = reinterpret_cast<uint8_t*>(sharedTile);
-    auto* aTile = reinterpret_cast<__nv_fp8_e4m3*>(sharedBytes);
-    auto* bTiles = reinterpret_cast<__nv_fp8_e4m3*>(sharedBytes + kQbProjMmaABytes);
-    auto* actScaleScratch = reinterpret_cast<float*>(sharedBytes + kQbProjMmaSharedBytes);
+    // Dynamic shared memory stores the raw UE8M0 activation scale byte for each 1x128 K block. Keeping the byte
+    // lets the scalar implementation reproduce the same reciprocal path used by fp8_quantize_1x128_packed_kernel_impl.
+    auto* actScaleBytes = reinterpret_cast<uint32_t*>(sharedTile);
 
-    // Warp 0..7 each owns one N=8 subtile inside the CTA's N=64 q_b output tile.
-    int const warpIdx = static_cast<int>(threadIdx.x) / 32;
-    int const laneIdx = static_cast<int>(threadIdx.x) & 31;
-
-    // Lanes 0..3 of each math warp receive row-0 output columns from the m16n8 accumulator fragment.
-    float projected0 = 0.0F;
-    float projected1 = 0.0F;
-
-    // q_b_proj uses 2048 input dims split into sixteen 1x128 FP8 activation-scale blocks.
-    for (int kBlock = 0; kBlock < kQLoraRank / kQbProjMmaKPerScaleBlock; ++kBlock)
+    // Compute all 16 activation scale bytes once per token. Only 16 threads are needed, but using the CTA keeps the
+    // code simple and leaves the same CTA contract for a later tensor-core implementation.
+    for (int kBlock = static_cast<int>(threadIdx.x); kBlock < kQbProjScaleBlocks; kBlock += blockDim.x)
     {
-        if (threadIdx.x == 0)
-        {
-            // Dynamic activation scale for this token and K block, rounded to UE8M0.
-            actScaleScratch[0]
-                = computeQbProjActivationScale(qBProjInput, qBProjStrideToken, qBProjStrideDim, tokenIdx, kBlock);
-        }
-        __syncthreads();
-
-        // All four K=32 MMA chunks in the current 1x128 scale block contribute raw FP8 products before scaling.
-        float rawAccum[2][2] = {{0.0F, 0.0F}, {0.0F, 0.0F}};
-        float const actScale = actScaleScratch[0];
-        float const invActScale = 1.0F / actScale;
-
-        for (int kChunk = 0; kChunk < kQbProjMmaKPerScaleBlock / kQbProjMmaK; ++kChunk)
-        {
-            int const chunkInputStart = kBlock * kQbProjMmaKPerScaleBlock + kChunk * kQbProjMmaK;
-
-            // Pack the A operand as [16, 32] FP8. Only row 0 is the real q_b input token; rows 1..15 are zero
-            // padding so the GEMV can use the m16n8k32 tensor-core instruction.
-            for (int idx = threadIdx.x; idx < kQbProjMmaM * kQbProjMmaK; idx += blockDim.x)
-            {
-                int const row = idx / kQbProjMmaK;
-                int const k = idx - row * kQbProjMmaK;
-                if (row == 0)
-                {
-                    int const inputDim = chunkInputStart + k;
-                    float const inputValue = toFloat(
-                        qBProjInput[tokenIdx * qBProjStrideToken + static_cast<int64_t>(inputDim) * qBProjStrideDim]);
-                    aTile[idx] = __nv_fp8_e4m3(inputValue * invActScale);
-                }
-                else
-                {
-                    aTile[idx] = __nv_fp8_e4m3(0.0F);
-                }
-            }
-
-            // Pack eight independent B operands as [warp, 16 rows, 32 K values]. Rows 0..7 are real output
-            // columns; rows 8..15 are zero padding required by ldmatrix.x4's 16-row access pattern.
-            for (int idx = threadIdx.x; idx < kQbProjMmaWarps * kQbProjMmaBRows * kQbProjMmaK; idx += blockDim.x)
-            {
-                int const warpTile = idx / (kQbProjMmaBRows * kQbProjMmaK);
-                int const inner = idx - warpTile * kQbProjMmaBRows * kQbProjMmaK;
-                int const n = inner / kQbProjMmaK;
-                int const k = inner - n * kQbProjMmaK;
-                int const outputDim = outputStart + warpTile * kQbProjMmaN + n;
-                int const inputDim = chunkInputStart + k;
-                bTiles[idx] = n < kQbProjMmaN && outputDim < kLocalHeads * kQkHeadDim
-                    ? qBProjWeight[outputDim * qBProjWeightStrideRow
-                        + static_cast<int64_t>(inputDim) * qBProjWeightStrideDim]
-                    : __nv_fp8_e4m3(0.0F);
-            }
-            __syncthreads();
-
-            if (warpIdx < kQbProjMmaWarps)
-            {
-                // A uses the row-major lane address pattern from the existing XQA m16n8k32 loader.
-                int const aRow = laneIdx % 16;
-                int const aColGroup = laneIdx / 16;
-                auto const* aTileU4 = reinterpret_cast<uint4 const*>(aTile);
-                uint4 const aPacked = loadMmaFp8M16N8K32Shared(aTileU4 + aRow * (kQbProjMmaK / 16) + aColGroup);
-                uint32_t const aRegs[2][2] = {{aPacked.x, aPacked.y}, {aPacked.z, aPacked.w}};
-
-                // B uses the column-major lane address pattern from the same XQA m16n8k32 path.
-                int const bRow = (laneIdx / 16) * 8 + laneIdx % 8;
-                int const bColGroup = (laneIdx % 16) / 8;
-                auto const* bTileU4 = reinterpret_cast<uint4 const*>(bTiles);
-                uint4 const bPacked = loadMmaFp8M16N8K32Shared(
-                    bTileU4 + warpIdx * (kQbProjMmaBRows * kQbProjMmaK / 16) + bRow * (kQbProjMmaK / 16) + bColGroup);
-                uint32_t const bRegs[2] = {bPacked.x, bPacked.y};
-
-                // Accumulate raw FP8 products for this K=32 chunk. The per-1x128 scales are applied below after
-                // all four chunks in the scale block have contributed.
-                mmaFp8M16N8K32(rawAccum, aRegs, bRegs);
-            }
-            __syncthreads();
-        }
-
-        if (warpIdx < kQbProjMmaWarps && laneIdx < 4)
-        {
-            int const outputDim0 = outputStart + warpIdx * kQbProjMmaN + laneIdx * 2;
-            int const outputDim1 = outputDim0 + 1;
-            float const weightScale0 = loadPackedUe8m0Scale(
-                qBProjWeightScale, qBProjScaleStrideRow, qBProjScaleStridePack, outputDim0, kBlock);
-            projected0 += rawAccum[0][0] * actScale * weightScale0;
-            if (outputDim1 < kLocalHeads * kQkHeadDim)
-            {
-                float const weightScale1 = loadPackedUe8m0Scale(
-                    qBProjWeightScale, qBProjScaleStrideRow, qBProjScaleStridePack, outputDim1, kBlock);
-                projected1 += rawAccum[0][1] * actScale * weightScale1;
-            }
-        }
+        // One raw UE8M0 byte per [token, 128 input dims] activation scale.
+        actScaleBytes[kBlock]
+            = computeQbProjActivationScaleByte(qBProjInput, qBProjStrideToken, qBProjStrideDim, tokenIdx, kBlock);
     }
+    __syncthreads();
 
-    if (warpIdx < kQbProjMmaWarps && laneIdx < 4)
+    // A correctness-first GEMV: the first 64 threads each compute one output row from this CTA's 64-wide tile.
+    // This intentionally does not call the standalone q_b Linear/DeepGEMM kernel, so later work can replace this
+    // function body with an optimized in-kernel UMMA implementation while preserving the fused MLA call site.
+    int const outputDim = outputStart + static_cast<int>(threadIdx.x);
+    if (threadIdx.x < kQbProjTileDim && outputDim < kLocalHeads * kQkHeadDim)
     {
-        int const outputDim0 = outputStart + warpIdx * kQbProjMmaN + laneIdx * 2;
-        int const outputDim1 = outputDim0 + 1;
-        int const headIdx0 = outputDim0 / kQkHeadDim;
-        int const dimInHead0 = outputDim0 - headIdx0 * kQkHeadDim;
-        qBProjScratch[(tokenIdx * kLocalHeads + headIdx0) * kQkHeadDim + dimInHead0] = toBfloat16(projected0);
-        if (outputDim1 < kLocalHeads * kQkHeadDim)
+        // FP32 accumulator for one q_b output element before BF16 epilogue.
+        float projected = 0.0F;
+
+        // Traverse the same sixteen 1x128 K blocks used by the packed FP8 activation quantizer and weight scales.
+        for (int kBlock = 0; kBlock < kQbProjScaleBlocks; ++kBlock)
         {
-            int const headIdx1 = outputDim1 / kQkHeadDim;
-            int const dimInHead1 = outputDim1 - headIdx1 * kQkHeadDim;
-            qBProjScratch[(tokenIdx * kLocalHeads + headIdx1) * kQkHeadDim + dimInHead1] = toBfloat16(projected1);
+            // Raw UE8M0 byte for this token's activation block.
+            uint32_t const actScaleByte = actScaleBytes[kBlock];
+            // Dequant scale applied after raw FP8 products are accumulated.
+            float const actScale = decodeUe8m0Scale(actScaleByte);
+            // Reciprocal scale used to quantize BF16 activation values to FP8 E4M3.
+            float const quantScale = decodeUe8m0InverseScale(actScaleByte);
+            // Packed UE8M0 weight dequant scale for this output row and K block.
+            float const weightScale = loadPackedUe8m0Scale(
+                qBProjWeightScale, qBProjScaleStrideRow, qBProjScaleStridePack, outputDim, kBlock);
+            // Raw FP32 accumulator for 128 FP8 x FP8 products before applying block scales.
+            float rawBlockAccum = 0.0F;
+            // First input dimension in the current 1x128 block.
+            int const inputStart = kBlock * kQbProjKPerScaleBlock;
+
+            for (int k = 0; k < kQbProjKPerScaleBlock; ++k)
+            {
+                // Input dimension within q_lora_rank.
+                int const inputDim = inputStart + k;
+                // BF16 activation value in original model units.
+                float const inputValue = toFloat(
+                    qBProjInput[tokenIdx * qBProjStrideToken + static_cast<int64_t>(inputDim) * qBProjStrideDim]);
+                // FP8 activation value after the same UE8M0 reciprocal scaling used by fp8_swap_ab_gemm.
+                __nv_fp8_e4m3 const inputFp8 = __nv_fp8_e4m3(inputValue * quantScale);
+                // FP8 weight value stored by the post-load q_b projection weight.
+                __nv_fp8_e4m3 const weightFp8 = qBProjWeight[outputDim * qBProjWeightStrideRow
+                    + static_cast<int64_t>(inputDim) * qBProjWeightStrideDim];
+                // Accumulate the raw FP8-domain products in FP32 before applying the two block scales.
+                rawBlockAccum = fmaf(toFloat(inputFp8), toFloat(weightFp8), rawBlockAccum);
+            }
+
+            // Convert the raw FP8-domain dot product back to original units for this 1x128 block.
+            projected = fmaf(rawBlockAccum, actScale * weightScale, projected);
         }
+
+        // Convert flattened q_b output row into [head, dim] inside the scratch tensor consumed by the setup phase.
+        int const headIdx = outputDim / kQkHeadDim;
+        // Dimension inside the selected 256-wide query head.
+        int const dimInHead = outputDim - headIdx * kQkHeadDim;
+        // BF16 [numTokens, kLocalHeads, kQkHeadDim] scratch q_b output.
+        qBProjScratch[(tokenIdx * kLocalHeads + headIdx) * kQkHeadDim + dimInHead] = toBfloat16(projected);
     }
 }
 
@@ -1205,8 +1116,8 @@ __global__ void generationAttentionCombinedKernel(__nv_bfloat16* fusedQ, __nv_bf
     int64_t qBProjScaleStridePack, int numTokens, int topK, int numSplits, int expectedCtas, float hostScoreScale,
     bool isContext, int contextChunkStart)
 {
-    // Dynamic shared memory is reused by the q_b MMA staging phase and the later attention score phase. Declare it
-    // as 16-byte-aligned bytes so ldmatrix sees aligned FP8 tiles, then reinterpret it as floats for split scores.
+    // Dynamic shared memory is reused by the q_b projection phase and the later attention score phase. Declare it
+    // as 16-byte-aligned bytes so it can hold either uint32 scale bytes or FP32 split scores.
     extern __shared__ __align__(16) uint8_t dynamicShared[];
     float* splitScores = reinterpret_cast<float*>(dynamicShared);
     // The baseline TRTLLM-Gen MLA path ignores the packed speculative mask. Keep these parameters only so the WIP op
@@ -1853,9 +1764,10 @@ torch::Tensor dsv3_fused_mla_generation_cuda(torch::Tensor fused_q, torch::Tenso
     // Launch one CTA per [decode token, 64-key sparse split], matching TileRT's 32 CTAs/token for topK=2048.
     dim3 splitGrid(numTokens * numSplits);
     // Shared memory stores [8 heads, 64 split candidates] score/probability slots in the attention phase. q_b
-    // fusion reuses the same dynamic shared memory before attention to stage FP8 m16n8k32 A/B operands.
+    // fusion reuses the same dynamic shared memory before attention to cache one UE8M0 activation scale byte per
+    // 1x128 input block.
     size_t const splitSharedBytes = std::max(static_cast<size_t>(kLocalHeads * kSparseSplitSize * sizeof(float)),
-        static_cast<size_t>(hasQbProj ? kQbProjMmaTotalSharedBytes : 0));
+        static_cast<size_t>(hasQbProj ? kQbProjScalarSharedBytes : 0));
     // The combined launch first performs RoPE/Q quantization/KV append, grid-syncs, computes split-local partials,
     // grid-syncs again, and then combines into final latent outputs.
     generationAttentionCombinedKernel<<<splitGrid, kTileRtThreads, splitSharedBytes, stream>>>(fusedQPtr, qNopePtr,
