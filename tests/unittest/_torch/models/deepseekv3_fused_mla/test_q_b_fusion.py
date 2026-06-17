@@ -139,6 +139,30 @@ def _matrix_min_max(tensor: torch.Tensor) -> tuple[float, float]:
     return tensor_float.amin().item(), tensor_float.amax().item()
 
 
+def _assert_tensors_identical(
+    actual: torch.Tensor,
+    expected: torch.Tensor,
+    message_prefix: str,
+) -> None:
+    if torch.equal(actual, expected):
+        return
+
+    mismatch = actual != expected
+    mismatch_indices = mismatch.nonzero()
+    first_index = tuple(mismatch_indices[0].tolist())
+    actual_float = actual.float()
+    expected_float = expected.float()
+    abs_diff = (actual_float - expected_float).abs()
+    raise AssertionError(
+        f"{message_prefix}: tensors differ exactly; "
+        f"num_mismatches={mismatch_indices.shape[0]} "
+        f"max_abs_diff={abs_diff.amax().item():.6g} "
+        f"first_mismatch_index={first_index} "
+        f"actual={actual[first_index].item()} "
+        f"expected={expected[first_index].item()}"
+    )
+
+
 @pytest.mark.parametrize("token_count", [1, 2, 3, 4])
 @pytest.mark.parametrize("q_b_proj_use_mma", [True, False])
 @pytest.mark.parametrize("rank", range(_NUM_RANKS))
@@ -180,4 +204,45 @@ def test_deepseekv3_fused_mla_q_b_proj(
         q_b_proj_expected,
         rtol=0.0,
         atol=0.0,
+    )
+
+
+@pytest.mark.parametrize("token_count", [1, 2, 3, 4])
+@pytest.mark.parametrize("rank", range(_NUM_RANKS))
+def test_deepseekv3_fused_mla_q_b_proj_mma_matches_scalar(
+    rank: int,
+    token_count: int,
+) -> None:
+    """
+    Compare MMA and scalar q_b projection on the same q_b input tensors.
+
+    This test intentionally compares the two fused-kernel q_b implementations
+    directly instead of comparing either one against Linear. The input tensors
+    are the dump-backed q_b projection inputs prepared by the shared decode
+    case builder.
+    """
+    case = _slice_case_tokens(_build_dump_decode_q_b_case(rank), token_count)
+
+    with torch.inference_mode():
+        q_b_proj_scalar = torch.empty_like(case.q_b_proj_output)
+        q_b_proj_mma = torch.empty_like(case.q_b_proj_output)
+        q_b_proj_scalar.fill_(float("nan"))
+        q_b_proj_mma.fill_(float("nan"))
+        _run_dump_decode_fused_q_b(
+            case,
+            q_b_proj_output=q_b_proj_scalar,
+            q_b_proj_use_mma=False,
+        )
+        _run_dump_decode_fused_q_b(
+            case,
+            q_b_proj_output=q_b_proj_mma,
+            q_b_proj_use_mma=True,
+        )
+
+    assert not torch.isnan(q_b_proj_scalar).any().item()
+    assert not torch.isnan(q_b_proj_mma).any().item()
+    _assert_tensors_identical(
+        q_b_proj_mma,
+        q_b_proj_scalar,
+        f"rank={rank} layer={case.group.layer_idx} token_count={token_count}",
     )
