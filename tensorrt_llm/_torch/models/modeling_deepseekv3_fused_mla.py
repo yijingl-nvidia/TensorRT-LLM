@@ -32,7 +32,7 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
-from ..attention_backend import AttentionForwardArgs, AttentionInputType, AttentionMetadata
+from ..attention_backend import AttentionForwardArgs, AttentionMetadata
 from ..attention_backend.interface import AttentionBackend, PositionalEmbeddingParams, RopeParams
 from ..attention_backend.sparse.dsa import transform_local_topk_and_prepare_pool_view
 from ..attention_backend.utils import create_attention
@@ -1084,84 +1084,6 @@ class FusedMLA(nn.Module):
             device=q_lor.device,
         )
 
-        def baseline_context() -> None:
-            if num_ctx_tokens == 0:
-                return
-            # [num_ctx_tokens, num_heads_tp * (kv_lora_rank + qk_rope_head_dim)]
-            context_fused_q = fused_q[context_slice].view(
-                [
-                    num_ctx_tokens,
-                    self.num_heads_tp * (self.kv_lora_rank + self.qk_rope_head_dim),
-                ]
-            )
-            # [num_ctx_tokens, num_heads_tp_cp * kv_lora_rank]
-            attn_out_latent[:num_ctx_tokens] = self.mqa.forward(
-                context_fused_q,
-                None,
-                None,
-                attn_metadata,
-                forward_args=AttentionForwardArgs(
-                    attention_input_type=AttentionInputType.context_only,
-                    out_scale=self.out_scale,
-                    output=None,
-                    latent_cache=latent_cache[context_slice],
-                    q_pe=q_pe[context_slice],
-                    quant_q_buffer=None,  # fused-FP8 path only
-                    quant_scale_qkv=None,  # fused-FP8 path only
-                    topk_indices=topk_indices[context_slice],
-                    is_generation=False,  # used by DSA attention
-                ),
-            )
-
-        def baseline_generation() -> None:
-            if num_generation_tokens == 0:
-                return
-            # [num_generation_tokens, top_k], int32
-            self.mqa.mla_rope_generation(
-                fused_q[generation_slice],
-                q_pe[generation_slice],
-                latent_cache[generation_slice],
-                attn_metadata,
-                cu_q_seqlens,
-                cu_kv_seqlens,
-                fmha_scheduler_counter,
-                mla_bmm1_scale,
-                mla_bmm2_scale,
-                quant_q_buffer,
-            )
-            # [num_generation_tokens, num_heads_tp_cp * kv_lora_rank]
-            attn_out_latent[num_ctx_tokens:num_tokens] = self.mqa.forward(
-                generation_fused_q.view(
-                    [
-                        num_generation_tokens,
-                        self.num_heads_tp * (self.kv_lora_rank + self.qk_rope_head_dim),
-                    ]
-                ),
-                None,
-                None,
-                attn_metadata,
-                forward_args=AttentionForwardArgs(
-                    attention_input_type=AttentionInputType.generation_only,
-                    out_scale=self.out_scale,
-                    output=None,
-                    latent_cache=latent_cache[generation_slice],  # kvcache and k_pe
-                    q_pe=q_pe[generation_slice],  # used by `invokeMLARopeGeneration`
-                    topk_indices=topk_indices[generation_slice],  # used by DSA attention
-                    is_generation=True,  # used by DSA attention
-                    cu_q_seqlens=cu_q_seqlens,  # used by `mlaGeneration`
-                    cu_kv_seqlens=cu_kv_seqlens,  # used by `mlaGeneration`
-                    fmha_scheduler_counter=fmha_scheduler_counter,  # used by `mlaGeneration`
-                    mla_bmm1_scale=mla_bmm1_scale,  # used by `mlaGeneration`
-                    mla_bmm2_scale=mla_bmm2_scale,  # used by `mlaGeneration`
-                    quant_q_buffer=quant_q_buffer,  # used by `mlaGeneration`
-                ),
-            )
-
-        # if num_tokens > self.predicted_tokens_per_seq:
-        #     # too many tokens, use baseline attention
-        #     # This could happen in a long prefill or warmup with long context or generation tokens
-        #     baseline_context()
-        #     baseline_generation()
         if fused_mla_mode == FUSED_MLA_MODE_WIP:
             q_b_proj_weight_for_kernel = self.q_b_proj.weight
             q_b_proj_weight_scale_for_kernel = self.q_b_proj.weight_scale
@@ -1251,6 +1173,7 @@ class FusedMLA(nn.Module):
                         q_b_proj_input=q_lor[chunk_slice],
                         q_b_proj_weight=q_b_proj_weight_for_kernel,
                         q_b_proj_weight_scale=q_b_proj_weight_scale_for_kernel,
+                        q_b_proj_output=None,
                     )
 
             if num_generation_tokens > 0:  # WIP
@@ -1374,6 +1297,7 @@ class FusedMLA(nn.Module):
                                 q_b_proj_input=q_lor[generation_chunk_slice],
                                 q_b_proj_weight=q_b_proj_weight_for_kernel,
                                 q_b_proj_weight_scale=q_b_proj_weight_scale_for_kernel,
+                                q_b_proj_output=None,
                             )
                         )
         else:  # pytorch path

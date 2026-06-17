@@ -11,8 +11,8 @@
 #
 #   scripts/test_dsv3_fused_mla_dev_in_session.sh \
 #     -q \
-#     tests/unittest/_torch/models/test_modeling_deepseekv3_fused_mla.py \
-#     ::test_deepseekv3_fused_mla_dump_projection_smoke[0] \
+#     tests/unittest/_torch/models/deepseekv3_fused_mla/test_projection_smoke.py \
+#     -k test_deepseekv3_fused_mla_dump_projection_smoke \
 #     -s -rs
 #
 #   TRTLLM_DEEPSEEKV3_FUSED_MLA_TEST_MAX_NUM_TOKENS=all \
@@ -124,7 +124,7 @@ while [ "$#" -gt 0 ]; do
 done
 
 if [ "${#PYTEST_ARGS[@]}" -eq 0 ]; then
-    PYTEST_ARGS=(-q tests/unittest/_torch/models/test_modeling_deepseekv3_fused_mla.py -s -rs)
+    PYTEST_ARGS=(-q tests/unittest/_torch/models/deepseekv3_fused_mla -s -rs)
 fi
 
 DEFAULT_DEBUG_OUTPUT_DIR="${HOME}/dev/mla-debug-output"

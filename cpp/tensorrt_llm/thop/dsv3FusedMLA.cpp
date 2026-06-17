@@ -41,7 +41,8 @@ torch::Tensor dsv3_fused_mla_generation_cuda(torch::Tensor fused_q, torch::Tenso
     torch::Tensor mla_bmm2_scale, std::optional<torch::Tensor> kv_scale_orig_quant,
     std::optional<torch::Tensor> kv_scale_quant_orig, std::optional<torch::Tensor> spec_decoding_packed_mask,
     double q_scaling, bool is_context, int64_t context_chunk_start, std::optional<torch::Tensor> q_b_proj_input,
-    std::optional<torch::Tensor> q_b_proj_weight, std::optional<torch::Tensor> q_b_proj_weight_scale);
+    std::optional<torch::Tensor> q_b_proj_weight, std::optional<torch::Tensor> q_b_proj_weight_scale,
+    std::optional<torch::Tensor> q_b_proj_output);
 } // namespace dsv3_fused_mla
 
 namespace tensorrt_llm
@@ -132,7 +133,7 @@ th::Tensor dsv3_fused_mla_generation(th::Tensor fused_q, th::Tensor q_nope, th::
     th::Tensor mla_bmm2_scale, std::optional<th::Tensor> spec_decoding_packed_mask, int64_t layer_idx,
     int64_t tokens_per_block, int64_t quant_mode, double q_scaling, bool is_context, int64_t context_chunk_start,
     std::optional<th::Tensor> q_b_proj_input, std::optional<th::Tensor> q_b_proj_weight,
-    std::optional<th::Tensor> q_b_proj_weight_scale)
+    std::optional<th::Tensor> q_b_proj_weight_scale, std::optional<th::Tensor> q_b_proj_output)
 {
     TORCH_CHECK(fused_q.is_cuda(), "fused_q must be a CUDA tensor");
     TORCH_CHECK(q_nope.is_cuda(), "q_nope must be a CUDA tensor");
@@ -175,6 +176,11 @@ th::Tensor dsv3_fused_mla_generation(th::Tensor fused_q, th::Tensor q_nope, th::
         TORCH_CHECK(q_b_proj_weight.value().is_cuda(), "q_b_proj_weight must be a CUDA tensor");
         TORCH_CHECK(q_b_proj_weight_scale.value().is_cuda(), "q_b_proj_weight_scale must be a CUDA tensor");
     }
+    if (q_b_proj_output.has_value())
+    {
+        TORCH_CHECK(hasQbProj, "q_b_proj_output requires q_b_proj_input, q_b_proj_weight, and q_b_proj_weight_scale");
+        TORCH_CHECK(q_b_proj_output.value().is_cuda(), "q_b_proj_output must be a CUDA tensor");
+    }
 
     TORCH_CHECK(fused_q.scalar_type() == torch::kBFloat16, "GLM-5 fused MLA generation expects bf16 fused_q");
     TORCH_CHECK(q_nope.scalar_type() == torch::kBFloat16, "GLM-5 fused MLA generation expects bf16 q_nope");
@@ -198,6 +204,10 @@ th::Tensor dsv3_fused_mla_generation(th::Tensor fused_q, th::Tensor q_nope, th::
         TORCH_CHECK(q_b_proj_weight_scale.value().scalar_type() == torch::kInt32
                 || q_b_proj_weight_scale.value().scalar_type() == torch::kFloat32,
             "q_b_proj_weight_scale must be packed UE8M0 int32 or original FP32 block scales");
+    }
+    if (q_b_proj_output.has_value())
+    {
+        TORCH_CHECK(q_b_proj_output.value().scalar_type() == torch::kBFloat16, "q_b_proj_output must be bf16");
     }
 
     TORCH_CHECK(fused_q.dim() == 3, "fused_q must have shape [tokens, heads, 576]");
@@ -273,6 +283,14 @@ th::Tensor dsv3_fused_mla_generation(th::Tensor fused_q, th::Tensor q_nope, th::
         TORCH_CHECK(q_b_proj_input.value().stride(1) == 1, "q_b_proj_input last dimension must be contiguous");
         TORCH_CHECK(q_b_proj_weight.value().stride(1) == 1, "q_b_proj_weight last dimension must be contiguous");
     }
+    if (q_b_proj_output.has_value())
+    {
+        TORCH_CHECK(q_b_proj_output.value().dim() == 2, "q_b_proj_output must have shape [tokens, 2048]");
+        TORCH_CHECK(q_b_proj_output.value().size(0) == fused_q.size(0),
+            "q_b_proj_output and fused_q token dimensions must match");
+        TORCH_CHECK(q_b_proj_output.value().size(1) == 2048, "q_b_proj_output must have hidden size 2048");
+        TORCH_CHECK(q_b_proj_output.value().stride(1) == 1, "q_b_proj_output last dimension must be contiguous");
+    }
 
     auto const quantMode = common::QuantMode{static_cast<uint32_t>(quant_mode)};
     TORCH_CHECK(quantMode.hasFp8KvCache(), "GLM-5 fused MLA generation currently expects FP8 KV cache");
@@ -292,7 +310,7 @@ th::Tensor dsv3_fused_mla_generation(th::Tensor fused_q, th::Tensor q_nope, th::
         std::move(kv_cache_pool), std::move(quant_q_buffer), std::move(mla_bmm1_scale), std::move(mla_bmm2_scale),
         std::move(kv_scale_orig_quant), std::move(kv_scale_quant_orig), std::move(spec_decoding_packed_mask), q_scaling,
         is_context, context_chunk_start, std::move(q_b_proj_input), std::move(q_b_proj_weight),
-        std::move(q_b_proj_weight_scale));
+        std::move(q_b_proj_weight_scale), std::move(q_b_proj_output));
 }
 
 } // namespace torch_ext
@@ -314,7 +332,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "Tensor(c!) quant_q_buffer, Tensor(d!) mla_bmm1_scale, Tensor(e!) mla_bmm2_scale, "
         "Tensor? spec_decoding_packed_mask, int layer_idx, int tokens_per_block, int quant_mode, "
         "float q_scaling, bool is_context, int context_chunk_start, Tensor? q_b_proj_input, "
-        "Tensor? q_b_proj_weight, Tensor? q_b_proj_weight_scale) -> Tensor");
+        "Tensor? q_b_proj_weight, Tensor? q_b_proj_weight_scale, Tensor? q_b_proj_output) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
