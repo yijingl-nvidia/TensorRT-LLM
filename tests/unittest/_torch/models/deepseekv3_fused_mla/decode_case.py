@@ -203,9 +203,10 @@ def _decode_runtime_buffers(
         buffer.
     """
     device = case.q_b_proj_input.device
+    num_tokens = case.q_b_proj_input.shape[0]
     num_seqs = case.metadata.kv_lens_cuda_runtime.size(0)
     fused_q = torch.empty(
-        _DECODE_NUM_TOKENS,
+        num_tokens,
         _LOCAL_NUM_HEADS,
         _HEAD_DIM,
         dtype=torch.bfloat16,
@@ -289,6 +290,7 @@ def _run_dump_decode_preprojected(
 def _run_dump_decode_fused_q_b(
     case: FusedMlaDumpDecodeCase,
     q_b_proj_output: torch.Tensor | None = None,
+    q_b_proj_use_mma: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Run the WIP decode op with q_b projection fused into the op.
@@ -324,6 +326,13 @@ def _run_dump_decode_fused_q_b(
         dtype=torch.uint32,
         device=case.q_b_proj_input.device,
     )
+    if q_b_proj_output is None:
+        q_b_proj_output = torch.empty(
+            case.q_b_proj_input.shape[0],
+            _LOCAL_NUM_HEADS * _QK_HEAD_DIM,
+            dtype=case.q_b_proj_input.dtype,
+            device=case.q_b_proj_input.device,
+        )
     output = _custom_decode_attention(
         fused_q,
         torch.empty_like(case.q_nope),
@@ -345,6 +354,7 @@ def _run_dump_decode_fused_q_b(
         q_b_proj_weight=case.q_b_proj_weight,
         q_b_proj_weight_scale=case.q_b_proj_weight_scale,
         q_b_proj_output=q_b_proj_output,
+        q_b_proj_use_mma=q_b_proj_use_mma,
     )
     return output, fused_q, quant_q_buffer, mla_bmm1_scale, mla_bmm2_scale
 

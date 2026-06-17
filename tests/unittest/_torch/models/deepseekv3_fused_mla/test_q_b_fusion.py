@@ -13,6 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from dataclasses import replace
+
 import pytest
 import torch
 from torch.nn import Parameter
@@ -30,6 +32,20 @@ from tests.unittest._torch.models.test_modeling_deepseekv3_attention import (
     _Q_LORA_RANK,
     _QK_HEAD_DIM,
 )
+
+
+def _slice_case_tokens(case, token_count: int):
+    assert 0 < token_count <= case.q_b_proj_input.shape[0]
+    return replace(
+        case,
+        q_b_proj_input=case.q_b_proj_input[:token_count].contiguous(),
+        q_b_proj_output=case.q_b_proj_output[:token_count].contiguous(),
+        q_nope=case.q_nope[:token_count].contiguous(),
+        q_pe=case.q_pe[:token_count].contiguous(),
+        latent_cache=case.latent_cache[:token_count].contiguous(),
+        topk_indices=case.topk_indices[:token_count].contiguous(),
+        topk_indices_pool=case.topk_indices_pool[:token_count].contiguous(),
+    )
 
 
 def _ensure_tma_col_major_int_scale(scale: torch.Tensor) -> torch.Tensor:
@@ -123,28 +139,38 @@ def _matrix_min_max(tensor: torch.Tensor) -> tuple[float, float]:
     return tensor_float.amin().item(), tensor_float.amax().item()
 
 
+@pytest.mark.parametrize("token_count", [1, 2, 3, 4])
+@pytest.mark.parametrize("q_b_proj_use_mma", [True, False])
 @pytest.mark.parametrize("rank", range(_NUM_RANKS))
 def test_deepseekv3_fused_mla_q_b_proj(
     rank: int,
+    q_b_proj_use_mma: bool,
+    token_count: int,
 ) -> None:
     """
     Compare q_b projection inside fused MLA kernel directly against
     existing TRTLLM Linear module.
     """
-    case = _build_dump_decode_q_b_case(rank)
+    case = _slice_case_tokens(_build_dump_decode_q_b_case(rank), token_count)
     q_b_proj = _build_local_q_b_proj(case.q_b_proj_weight, case.q_b_proj_weight_scale)
 
     with torch.inference_mode():
         q_b_proj_expected = q_b_proj(case.q_b_proj_input.contiguous()).contiguous()
         q_b_proj_actual = torch.empty_like(q_b_proj_expected)
         q_b_proj_actual.fill_(float("nan"))
-        _run_dump_decode_fused_q_b(case, q_b_proj_output=q_b_proj_actual)
+        _run_dump_decode_fused_q_b(
+            case,
+            q_b_proj_output=q_b_proj_actual,
+            q_b_proj_use_mma=q_b_proj_use_mma,
+        )
 
     assert not torch.isnan(q_b_proj_actual).any().item()
     ref_min, ref_max = _matrix_min_max(q_b_proj_expected)
     wip_min, wip_max = _matrix_min_max(q_b_proj_actual)
     print(
-        f"rank={rank} q_b_proj_ref_min={ref_min:.6g} "
+        f"rank={rank} token_count={token_count} "
+        f"q_b_proj_use_mma={q_b_proj_use_mma} "
+        f"q_b_proj_ref_min={ref_min:.6g} "
         f"q_b_proj_ref_max={ref_max:.6g} "
         f"q_b_proj_wip_min={wip_min:.6g} "
         f"q_b_proj_wip_max={wip_max:.6g}"

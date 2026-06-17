@@ -623,34 +623,34 @@ __device__ __forceinline__ bool useQbProjMmaMtp4(int32_t const* qBProjWeightScal
 #endif
 }
 
-// Compute one 16-row q_b_proj tile for all four MTP decode tokens with FP8 MMA.
+// Compute one 16-row q_b_proj tile for up to four tokens with FP8 MMA.
 //
 // Inputs:
-// - qBProjScratch: mutable BF16 [4, kLocalHeads, kQkHeadDim].
-// - qBProjOutput: optional mutable BF16 [4, kLocalHeads * kQkHeadDim] for exposing raw q_b_proj output.
-// - qBProjInput: BF16 [4, kQLoraRank], q_a_layernorm output.
+// - qBProjScratch: mutable BF16 [numTokens, kLocalHeads * kQkHeadDim] scratch/output from Python.
+// - qBProjInput: BF16 [numTokens, kQLoraRank], q_a_layernorm output.
 // - qBProjWeight: FP8 E4M3 [kLocalHeads * kQkHeadDim, kQLoraRank], local q_b projection weight.
 // - qBProjWeightScalePacked: INT32 packed UE8M0 logical [kLocalHeads * kQkHeadDim, kQLoraRank / 128 / 4].
 // - qBProjStrideToken/qBProjStrideDim: runtime strides for qBProjInput.
 // - qBProjWeightStrideRow/qBProjWeightStrideDim: runtime strides for qBProjWeight.
 // - qBProjScaleStrideRow/qBProjScaleStridePack: runtime strides for qBProjWeightScalePacked.
-// - qBProjOutputStrideToken/qBProjOutputStrideDim: runtime strides for qBProjOutput.
-// - outputTileIdx: linear CTA id in [0, 128), each CTA owns 16 output rows for all four tokens.
+// - qBProjScratchStrideToken/qBProjScratchStrideDim: runtime strides for qBProjScratch.
+// - numTokens: active token count, supported range [1, 4].
+// - outputTileIdx: linear CTA id in [0, 128), each CTA owns 16 output rows for all active tokens.
 //
 // Outputs: none.
 //
 // Side effects:
-// - Writes qBProjScratch[token, head, dim] for a 16-row output tile and all four tokens.
-// - Writes qBProjOutput[token, outputDim] for the same values when qBProjOutput is provided.
+// - Writes qBProjScratch[token, outputDim] for a 16-row output tile and each active token.
 // - Uses four GEMV-style MMA passes per K subtile. This intentionally reuses the proven N=0 fragment mapping from
 //   dsv3FusedExpertUp.cu until the full 8-column B/C mapping is validated independently.
-__device__ __forceinline__ void projectQbProjMmaMtp4Tile(__nv_bfloat16* qBProjScratch, __nv_bfloat16* qBProjOutput,
-    __nv_bfloat16 const* qBProjInput, __nv_fp8_e4m3 const* qBProjWeight, int32_t const* qBProjWeightScalePacked,
-    int64_t qBProjStrideToken, int64_t qBProjStrideDim, int64_t qBProjWeightStrideRow, int64_t qBProjWeightStrideDim,
-    int64_t qBProjScaleStrideRow, int64_t qBProjScaleStridePack, int64_t qBProjOutputStrideToken,
-    int64_t qBProjOutputStrideDim, int outputTileIdx)
+__device__ __forceinline__ void projectQbProjMmaTile(__nv_bfloat16* qBProjScratch, __nv_bfloat16 const* qBProjInput,
+    __nv_fp8_e4m3 const* qBProjWeight, int32_t const* qBProjWeightScalePacked, int64_t qBProjStrideToken,
+    int64_t qBProjStrideDim, int64_t qBProjWeightStrideRow, int64_t qBProjWeightStrideDim, int64_t qBProjScaleStrideRow,
+    int64_t qBProjScaleStridePack, int64_t qBProjScratchStrideToken, int64_t qBProjScratchStrideDim, int numTokens,
+    int outputTileIdx)
 {
-    if (threadIdx.x >= 32 || outputTileIdx >= kQbProjMmaOutputTiles)
+    int const validTokens = numTokens < kQbProjMmaTokens ? numTokens : kQbProjMmaTokens;
+    if (threadIdx.x >= 32 || outputTileIdx >= kQbProjMmaOutputTiles || validTokens <= 0)
     {
         return;
     }
@@ -667,7 +667,7 @@ __device__ __forceinline__ void projectQbProjMmaMtp4Tile(__nv_bfloat16* qBProjSc
     for (int kBlock = 0; kBlock < kQbProjScaleBlocks; ++kBlock)
     {
         uint32_t sourceScaleByte = 0U;
-        if (lane < kQbProjMmaTokens)
+        if (lane < validTokens)
         {
             sourceScaleByte
                 = computeQbProjActivationScaleByte(qBProjInput, qBProjStrideToken, qBProjStrideDim, lane, kBlock);
@@ -680,8 +680,8 @@ __device__ __forceinline__ void projectQbProjMmaMtp4Tile(__nv_bfloat16* qBProjSc
         for (int token = 0; token < kQbProjMmaTokens; ++token)
         {
             actScaleBytes[token] = __shfl_sync(0xFFFFFFFFU, sourceScaleByte, token);
-            actScales[token] = decodeUe8m0Scale(actScaleBytes[token]);
-            actQuantScales[token] = decodeUe8m0InverseScale(actScaleBytes[token]);
+            actScales[token] = token < validTokens ? decodeUe8m0Scale(actScaleBytes[token]) : 0.0F;
+            actQuantScales[token] = token < validTokens ? decodeUe8m0InverseScale(actScaleBytes[token]) : 0.0F;
         }
 
         float const weightScaleRow0
@@ -711,6 +711,11 @@ __device__ __forceinline__ void projectQbProjMmaMtp4Tile(__nv_bfloat16* qBProjSc
 #pragma unroll
             for (int token = 0; token < kQbProjMmaTokens; ++token)
             {
+                if (token >= validTokens)
+                {
+                    continue;
+                }
+
                 uint32_t bFrag[2] = {0U, 0U};
                 if (lane < 4)
                 {
@@ -739,23 +744,22 @@ __device__ __forceinline__ void projectQbProjMmaMtp4Tile(__nv_bfloat16* qBProjSc
 
     if ((lane & 3) == 0)
     {
-        int const head0 = row0 / kQkHeadDim;
-        int const dim0 = row0 - head0 * kQkHeadDim;
-        int const head1 = row1 / kQkHeadDim;
-        int const dim1 = row1 - head1 * kQkHeadDim;
-
 #pragma unroll
         for (int token = 0; token < kQbProjMmaTokens; ++token)
         {
+            if (token >= validTokens)
+            {
+                continue;
+            }
+
             __nv_bfloat16 const projected0 = toBfloat16(projectedRow0[token]);
             __nv_bfloat16 const projected1 = toBfloat16(projectedRow1[token]);
-            qBProjScratch[(token * kLocalHeads + head0) * kQkHeadDim + dim0] = projected0;
-            qBProjScratch[(token * kLocalHeads + head1) * kQkHeadDim + dim1] = projected1;
-            if (qBProjOutput != nullptr)
-            {
-                qBProjOutput[token * qBProjOutputStrideToken + row0 * qBProjOutputStrideDim] = projected0;
-                qBProjOutput[token * qBProjOutputStrideToken + row1 * qBProjOutputStrideDim] = projected1;
-            }
+            qBProjScratch[static_cast<int64_t>(token) * qBProjScratchStrideToken
+                + static_cast<int64_t>(row0) * qBProjScratchStrideDim]
+                = projected0;
+            qBProjScratch[static_cast<int64_t>(token) * qBProjScratchStrideToken
+                + static_cast<int64_t>(row1) * qBProjScratchStrideDim]
+                = projected1;
         }
     }
 }
@@ -763,8 +767,7 @@ __device__ __forceinline__ void projectQbProjMmaMtp4Tile(__nv_bfloat16* qBProjSc
 // Compute one 64-column q_b_proj tile for a single token.
 //
 // Inputs:
-// - qBProjScratch: mutable BF16 [numTokens, kLocalHeads, kQkHeadDim]. Stores q_b_proj output split by head.
-// - qBProjOutput: optional mutable BF16 [numTokens, kLocalHeads * kQkHeadDim] for exposing raw q_b_proj output.
+// - qBProjScratch: mutable BF16 [numTokens, kLocalHeads * kQkHeadDim] scratch/output from Python.
 // - qBProjInput: BF16 [numTokens, kQLoraRank], q_a_layernorm output.
 // - qBProjWeight: FP8 E4M3 [kLocalHeads * kQkHeadDim, kQLoraRank], local q_b projection weight.
 // - qBProjWeightScalePacked: optional INT32 packed UE8M0 logical [kLocalHeads * kQkHeadDim, kQLoraRank / 128 / 4].
@@ -772,7 +775,7 @@ __device__ __forceinline__ void projectQbProjMmaMtp4Tile(__nv_bfloat16* qBProjSc
 // - qBProjStrideToken/qBProjStrideDim: runtime strides for qBProjInput.
 // - qBProjWeightStrideRow/qBProjWeightStrideDim: runtime strides for qBProjWeight.
 // - qBProjScaleStrideRow/qBProjScaleStridePack: runtime strides for qBProjWeightScale.
-// - qBProjOutputStrideToken/qBProjOutputStrideDim: runtime strides for qBProjOutput.
+// - qBProjScratchStrideToken/qBProjScratchStrideDim: runtime strides for qBProjScratch.
 // - tokenIdx: token row selected by the grid.
 // - tileIdx: 64-column output tile id selected by the split CTA.
 // - sharedTile: dynamic shared-memory scratch, at least kQbProjScalarSharedBytes bytes.
@@ -780,13 +783,12 @@ __device__ __forceinline__ void projectQbProjMmaMtp4Tile(__nv_bfloat16* qBProjSc
 // Outputs: none.
 //
 // Side effects:
-// - Writes qBProjScratch[tokenIdx, :, :] for output dims covered by tileIdx.
-// - Writes qBProjOutput[tokenIdx, outputDim] for the same values when qBProjOutput is provided.
+// - Writes qBProjScratch[tokenIdx, outputDim] for output dims covered by tileIdx.
 __device__ __forceinline__ void projectQbProjTile(__nv_bfloat16* qBProjScratch, __nv_bfloat16 const* qBProjInput,
     __nv_fp8_e4m3 const* qBProjWeight, int32_t const* qBProjWeightScalePacked, float const* qBProjWeightScaleFp32,
-    __nv_bfloat16* qBProjOutput, int64_t qBProjStrideToken, int64_t qBProjStrideDim, int64_t qBProjWeightStrideRow,
-    int64_t qBProjWeightStrideDim, int64_t qBProjScaleStrideRow, int64_t qBProjScaleStridePack,
-    int64_t qBProjOutputStrideToken, int64_t qBProjOutputStrideDim, int tokenIdx, int tileIdx, float* sharedTile)
+    int64_t qBProjStrideToken, int64_t qBProjStrideDim, int64_t qBProjWeightStrideRow, int64_t qBProjWeightStrideDim,
+    int64_t qBProjScaleStrideRow, int64_t qBProjScaleStridePack, int64_t qBProjScratchStrideToken,
+    int64_t qBProjScratchStrideDim, int tokenIdx, int tileIdx, float* sharedTile)
 {
     // This CTA owns a fixed 64-column slice of the 2048-column local q_b_proj output.
     int const outputStart = tileIdx * kQbProjTileDim;
@@ -866,17 +868,55 @@ __device__ __forceinline__ void projectQbProjTile(__nv_bfloat16* qBProjScratch, 
             projected = fmaf(rawBlockAccum, actScale * weightScale, projected);
         }
 
-        // Convert flattened q_b output row into [head, dim] inside the scratch tensor consumed by the setup phase.
-        int const headIdx = outputDim / kQkHeadDim;
-        // Dimension inside the selected 256-wide query head.
-        int const dimInHead = outputDim - headIdx * kQkHeadDim;
-        // BF16 [numTokens, kLocalHeads, kQkHeadDim] scratch q_b output.
+        // BF16 q_b output stored by the same flat output dimension consumed later as [token, head, dim].
         __nv_bfloat16 const projectedBf16 = toBfloat16(projected);
-        qBProjScratch[(tokenIdx * kLocalHeads + headIdx) * kQkHeadDim + dimInHead] = projectedBf16;
-        if (qBProjOutput != nullptr)
+        qBProjScratch[static_cast<int64_t>(tokenIdx) * qBProjScratchStrideToken
+            + static_cast<int64_t>(outputDim) * qBProjScratchStrideDim]
+            = projectedBf16;
+    }
+}
+
+// Compute q_b_proj into the Python-provided scratch/output buffer before the combined attention kernel runs.
+//
+// Grid:
+// - MMA mode: blockIdx.x is the 16-row output tile coordinate in [0, 128).
+// - Scalar mode: blockIdx.x is the same linearized [token, split] coordinate as the combined generation kernel.
+//
+// Side effects:
+// - Writes qBProjScratch[token, outputDim] for every active token and local q_b output row.
+__global__ void qBProjProjectionKernel(__nv_bfloat16* qBProjScratch, __nv_bfloat16 const* qBProjInput,
+    __nv_fp8_e4m3 const* qBProjWeight, int32_t const* qBProjWeightScalePacked, float const* qBProjWeightScaleFp32,
+    int64_t qBProjStrideToken, int64_t qBProjStrideDim, int64_t qBProjWeightStrideRow, int64_t qBProjWeightStrideDim,
+    int64_t qBProjScaleStrideRow, int64_t qBProjScaleStridePack, int64_t qBProjScratchStrideToken,
+    int64_t qBProjScratchStrideDim, int numTokens, int numSplits, bool qBProjUseMma)
+{
+    extern __shared__ __align__(16) uint8_t dynamicShared[];
+    float* sharedTile = reinterpret_cast<float*>(dynamicShared);
+
+    if (qBProjUseMma)
+    {
+        int const outputTileIdx = static_cast<int>(blockIdx.x);
+        if (outputTileIdx < kQbProjMmaOutputTiles)
         {
-            qBProjOutput[tokenIdx * qBProjOutputStrideToken + outputDim * qBProjOutputStrideDim] = projectedBf16;
+            projectQbProjMmaTile(qBProjScratch, qBProjInput, qBProjWeight, qBProjWeightScalePacked, qBProjStrideToken,
+                qBProjStrideDim, qBProjWeightStrideRow, qBProjWeightStrideDim, qBProjScaleStrideRow,
+                qBProjScaleStridePack, qBProjScratchStrideToken, qBProjScratchStrideDim, numTokens, outputTileIdx);
         }
+        return;
+    }
+
+    int const tokenIdx = static_cast<int>(blockIdx.x) / numSplits;
+    int const splitIdx = static_cast<int>(blockIdx.x) - tokenIdx * numSplits;
+    if (tokenIdx >= numTokens || splitIdx >= numSplits)
+    {
+        return;
+    }
+
+    if (splitIdx * kQbProjTileDim < kLocalHeads * kQkHeadDim)
+    {
+        projectQbProjTile(qBProjScratch, qBProjInput, qBProjWeight, qBProjWeightScalePacked, qBProjWeightScaleFp32,
+            qBProjStrideToken, qBProjStrideDim, qBProjWeightStrideRow, qBProjWeightStrideDim, qBProjScaleStrideRow,
+            qBProjScaleStridePack, qBProjScratchStrideToken, qBProjScratchStrideDim, tokenIdx, splitIdx, sharedTile);
     }
 }
 
@@ -1455,7 +1495,7 @@ __global__ void contextAttentionKernel(__nv_bfloat16 const* fusedQ, __nv_fp8_e4m
 // - bmm2Scale: optional FP32 [1]. The append phase writes the dequantization scale for FP8 V values.
 // - kvScaleOrigQuant: optional FP32 [1]. Original-domain to FP8 scale for Q and appended KV.
 // - kvScaleQuantOrig: optional FP32 [1]. FP8 to original-domain dequant scale.
-// - qBProjOutput: optional BF16 [numTokens, kLocalHeads * kQkHeadDim] debug output for raw q_b_proj values.
+// - qBProjScratch: optional BF16 [numTokens, kLocalHeads * kQkHeadDim] q_b_proj scratch/output from Python.
 // - qNopeStrideToken/qNopeStrideHead: runtime strides for qNope because it is a split view of Q.
 // - kBProjStrideHead/kBProjStrideDim/kBProjStrideReduction: runtime strides for kBProjTrans.
 // - qPeStrideToken/qPeStrideHead: runtime strides for qPe because it can be a non-contiguous split view.
@@ -1473,7 +1513,7 @@ __global__ void contextAttentionKernel(__nv_bfloat16 const* fusedQ, __nv_fp8_e4m
 //
 // Side effects:
 // - Writes fusedQ's absorbed prefix and RoPE suffix, quantQ, bmm1Scale, bmm2Scale, the paged KV cache, splitLse,
-//   splitOutput, syncScratch, optional qBProjOutput, and output.
+//   splitOutput, syncScratch, optional qBProjScratch, and output.
 // - Uses dynamic shared memory [kLocalHeads, kSparseSplitSize] floats for per-head split scores/probabilities.
 __global__ void generationAttentionCombinedKernel(__nv_bfloat16* fusedQ, __nv_bfloat16 const* qNope,
     __nv_bfloat16 const* kBProjTrans, __nv_bfloat16 const* qPe, __nv_bfloat16 const* latentCache,
@@ -1482,13 +1522,13 @@ __global__ void generationAttentionCombinedKernel(__nv_bfloat16* fusedQ, __nv_bf
     int32_t const* sequenceLength, int32_t const* specDecodingPackedMask, int specMaskWords, float* splitLse,
     float* splitOutput, int32_t* syncScratch, __nv_bfloat16* output, float* bmm1Scale, float* bmm2Scale,
     float const* kvScaleOrigQuant, float const* kvScaleQuantOrig, __nv_bfloat16* qBProjScratch,
-    __nv_bfloat16* qBProjOutput, __nv_bfloat16 const* qBProjInput, __nv_fp8_e4m3 const* qBProjWeight,
-    int32_t const* qBProjWeightScalePacked, float const* qBProjWeightScaleFp32, int64_t qNopeStrideToken,
-    int64_t qNopeStrideHead, int64_t kBProjStrideHead, int64_t kBProjStrideDim, int64_t kBProjStrideReduction,
-    int64_t qPeStrideToken, int64_t qPeStrideHead, int64_t qBProjStrideToken, int64_t qBProjStrideDim,
-    int64_t qBProjWeightStrideRow, int64_t qBProjWeightStrideDim, int64_t qBProjScaleStrideRow,
-    int64_t qBProjScaleStridePack, int64_t qBProjOutputStrideToken, int64_t qBProjOutputStrideDim, int numTokens,
-    int topK, int numSplits, int expectedCtas, float hostScoreScale, bool isContext, int contextChunkStart)
+    __nv_bfloat16 const* qBProjInput, __nv_fp8_e4m3 const* qBProjWeight, int32_t const* qBProjWeightScalePacked,
+    float const* qBProjWeightScaleFp32, int64_t qNopeStrideToken, int64_t qNopeStrideHead, int64_t kBProjStrideHead,
+    int64_t kBProjStrideDim, int64_t kBProjStrideReduction, int64_t qPeStrideToken, int64_t qPeStrideHead,
+    int64_t qBProjStrideToken, int64_t qBProjStrideDim, int64_t qBProjWeightStrideRow, int64_t qBProjWeightStrideDim,
+    int64_t qBProjScaleStrideRow, int64_t qBProjScaleStridePack, int64_t qBProjScratchStrideToken,
+    int64_t qBProjScratchStrideDim, int numTokens, int topK, int numSplits, int expectedCtas, float hostScoreScale,
+    bool isContext, int contextChunkStart)
 {
     // Dynamic shared memory is reused by the q_b projection phase and the later attention score phase. Declare it
     // as 16-byte-aligned bytes so it can hold either uint32 scale bytes or FP32 split scores.
@@ -1581,17 +1621,18 @@ __global__ void generationAttentionCombinedKernel(__nv_bfloat16* fusedQ, __nv_bf
         if (useMmaQbProj)
         {
             // In the 4-token target launch blockIdx.x already spans exactly 128 CTAs, matching the 128 output tiles.
-            projectQbProjMmaMtp4Tile(qBProjScratch, qBProjOutput, qBProjInput, qBProjWeight, qBProjWeightScalePacked,
-                qBProjStrideToken, qBProjStrideDim, qBProjWeightStrideRow, qBProjWeightStrideDim, qBProjScaleStrideRow,
-                qBProjScaleStridePack, qBProjOutputStrideToken, qBProjOutputStrideDim, static_cast<int>(blockIdx.x));
+            projectQbProjMmaTile(qBProjScratch, qBProjInput, qBProjWeight, qBProjWeightScalePacked, qBProjStrideToken,
+                qBProjStrideDim, qBProjWeightStrideRow, qBProjWeightStrideDim, qBProjScaleStrideRow,
+                qBProjScaleStridePack, qBProjScratchStrideToken, qBProjScratchStrideDim, numTokens,
+                static_cast<int>(blockIdx.x));
         }
         else if (splitIdx * kQbProjTileDim < kLocalHeads * kQkHeadDim)
         {
             // Produce qBProjScratch[token, head, 0:256] from the normalized q_a vector and FP8 q_b weight.
             projectQbProjTile(qBProjScratch, qBProjInput, qBProjWeight, qBProjWeightScalePacked, qBProjWeightScaleFp32,
-                qBProjOutput, qBProjStrideToken, qBProjStrideDim, qBProjWeightStrideRow, qBProjWeightStrideDim,
-                qBProjScaleStrideRow, qBProjScaleStridePack, qBProjOutputStrideToken, qBProjOutputStrideDim, tokenIdx,
-                splitIdx, splitScores);
+                qBProjStrideToken, qBProjStrideDim, qBProjWeightStrideRow, qBProjWeightStrideDim, qBProjScaleStrideRow,
+                qBProjScaleStridePack, qBProjScratchStrideToken, qBProjScratchStrideDim, tokenIdx, splitIdx,
+                splitScores);
         }
         // The setup phase below consumes q_nope/q_pe from qBProjScratch, so all 32 q_b tiles must finish first.
         generationGridBarrier(syncScratch, expectedCtas);
@@ -2025,7 +2066,8 @@ torch::Tensor dsv3_fused_mla_context_cuda(torch::Tensor fused_q, torch::Tensor q
 // - q_b_proj_weight: optional FP8 E4M3 [2048, 2048]. Local q_b projection weight.
 // - q_b_proj_weight_scale: optional INT32 [2048, 4] packed UE8M0 scale tensor from FP8BlockScalesLinearMethod,
 //   or FP32 [16, 16] saved original 128x128 block-scale tensor.
-// - q_b_proj_output: optional BF16 [numTokens, 2048]. When present, receives raw q_b_proj output before splitting.
+// - q_b_proj_output: optional BF16 [numTokens, 2048]. Required with q_b_proj_input; used as q_b scratch/output.
+// - q_b_proj_use_mma: bool, true to use the packed-scale FP8 MMA q_b projection path when shape/device allow it.
 //
 // Output:
 // - Returns BF16 [numTokens, 8 * 512], logically [numTokens, 8, 512].
@@ -2033,7 +2075,7 @@ torch::Tensor dsv3_fused_mla_context_cuda(torch::Tensor fused_q, torch::Tensor q
 // Side effects:
 // - Mutates fused_q absorbed prefix and RoPE suffix for debug visibility.
 // - Mutates quant_q_buffer, mla_bmm1_scale, mla_bmm2_scale, and kv_cache before running attention.
-// - Mutates q_b_proj_output when provided.
+// - Mutates q_b_proj_output when q_b_proj_input is provided.
 // - Writes the returned output tensor.
 torch::Tensor dsv3_fused_mla_generation_cuda(torch::Tensor fused_q, torch::Tensor q_nope, torch::Tensor k_b_proj_trans,
     torch::Tensor q_pe, torch::Tensor latent_cache, torch::Tensor rotary_cos_sin, torch::Tensor sequence_length,
@@ -2043,7 +2085,7 @@ torch::Tensor dsv3_fused_mla_generation_cuda(torch::Tensor fused_q, torch::Tenso
     std::optional<torch::Tensor> kv_scale_quant_orig, std::optional<torch::Tensor> spec_decoding_packed_mask,
     double q_scaling, bool is_context, int64_t context_chunk_start, std::optional<torch::Tensor> q_b_proj_input,
     std::optional<torch::Tensor> q_b_proj_weight, std::optional<torch::Tensor> q_b_proj_weight_scale,
-    std::optional<torch::Tensor> q_b_proj_output)
+    std::optional<torch::Tensor> q_b_proj_output, bool q_b_proj_use_mma)
 {
     // Set the active CUDA device to match fused_q so the launch uses the correct GPU.
     c10::cuda::CUDAGuard const deviceGuard{fused_q.device()};
@@ -2076,7 +2118,12 @@ torch::Tensor dsv3_fused_mla_generation_cuda(torch::Tensor fused_q, torch::Tenso
     auto* latentCachePtr = static_cast<__nv_bfloat16 const*>(latent_cache.data_ptr());
     // quant_q_buffer is a uint8 tensor whose bytes are FP8 E4M3 values.
     auto* quantQPtr = reinterpret_cast<__nv_fp8_e4m3*>(quant_q_buffer.data_ptr());
-    bool const hasQbProj = q_b_proj_input.has_value();
+    bool const hasQbProj = q_b_proj_input.has_value() || q_b_proj_weight.has_value()
+        || q_b_proj_weight_scale.has_value() || q_b_proj_output.has_value();
+    TORCH_CHECK(!hasQbProj
+            || (q_b_proj_input.has_value() && q_b_proj_weight.has_value() && q_b_proj_weight_scale.has_value()
+                && q_b_proj_output.has_value()),
+        "q_b_proj_input, q_b_proj_weight, q_b_proj_weight_scale, and q_b_proj_output must be provided together");
     auto* qBProjInputPtr = hasQbProj ? static_cast<__nv_bfloat16 const*>(q_b_proj_input.value().data_ptr()) : nullptr;
     auto* qBProjWeightPtr
         = hasQbProj ? reinterpret_cast<__nv_fp8_e4m3 const*>(q_b_proj_weight.value().data_ptr()) : nullptr;
@@ -2084,8 +2131,7 @@ torch::Tensor dsv3_fused_mla_generation_cuda(torch::Tensor fused_q, torch::Tenso
     auto* qBProjWeightScalePackedPtr
         = hasQbProj && !qBProjUsesFp32Scale ? q_b_proj_weight_scale.value().data_ptr<int32_t>() : nullptr;
     auto* qBProjWeightScaleFp32Ptr = qBProjUsesFp32Scale ? q_b_proj_weight_scale.value().data_ptr<float>() : nullptr;
-    auto* qBProjOutputPtr
-        = q_b_proj_output.has_value() ? static_cast<__nv_bfloat16*>(q_b_proj_output.value().data_ptr()) : nullptr;
+    auto* qBProjScratchPtr = hasQbProj ? static_cast<__nv_bfloat16*>(q_b_proj_output.value().data_ptr()) : nullptr;
     // q_nope may be a split view, so pass runtime strides.
     int64_t const qNopeStrideToken = q_nope.stride(0);
     // Head stride for q_nope.
@@ -2106,8 +2152,8 @@ torch::Tensor dsv3_fused_mla_generation_cuda(torch::Tensor fused_q, torch::Tenso
     int64_t const qBProjWeightStrideDim = hasQbProj ? q_b_proj_weight.value().stride(1) : 0;
     int64_t const qBProjScaleStrideRow = hasQbProj ? q_b_proj_weight_scale.value().stride(0) : 0;
     int64_t const qBProjScaleStridePack = hasQbProj ? q_b_proj_weight_scale.value().stride(1) : 0;
-    int64_t const qBProjOutputStrideToken = q_b_proj_output.has_value() ? q_b_proj_output.value().stride(0) : 0;
-    int64_t const qBProjOutputStrideDim = q_b_proj_output.has_value() ? q_b_proj_output.value().stride(1) : 0;
+    int64_t const qBProjScratchStrideToken = hasQbProj ? q_b_proj_output.value().stride(0) : 0;
+    int64_t const qBProjScratchStrideDim = hasQbProj ? q_b_proj_output.value().stride(1) : 0;
     // Generic MLA RoPE uses 1 / (q_scaling * sqrt(qk_nope + qk_rope)); GLM-5 has 192 + 64.
     float const hostScoreScale = 1.0F / (static_cast<float>(q_scaling) * sqrtf(256.0F));
 
@@ -2136,10 +2182,7 @@ torch::Tensor dsv3_fused_mla_generation_cuda(torch::Tensor fused_q, torch::Tenso
     auto splitLse = torch::empty({numTokens, kLocalHeads, numSplits}, scratchOptions);
     // splitOutput: FP32 [numTokens, 8, numSplits, 512], split-local normalized latent output.
     auto splitOutput = torch::empty({numTokens, kLocalHeads, numSplits, kKvLoraRank}, scratchOptions);
-    // Optional q_b scratch stores BF16 [numTokens, 8, 256] q_b output before k_b absorption and Q RoPE.
-    auto qBProjScratch
-        = hasQbProj ? torch::empty({numTokens, kLocalHeads, kQkHeadDim}, fused_q.options()) : torch::Tensor();
-    auto* qBProjScratchPtr = hasQbProj ? static_cast<__nv_bfloat16*>(qBProjScratch.data_ptr()) : nullptr;
+    // q_b fusion reuses the Python-provided BF16 [numTokens, 2048] q_b output tensor as scratch.
     // syncScratch: INT32 [6]. Entries [0, 1] are q_b barrier state, [2, 3] are setup barrier state, and [4, 5] are
     // split-output barrier state.
     auto syncScratch = torch::empty({6}, fused_q.options().dtype(torch::kInt32));
@@ -2159,23 +2202,53 @@ torch::Tensor dsv3_fused_mla_generation_cuda(torch::Tensor fused_q, torch::Tenso
 
     // Launch one CTA per [decode token, 64-key sparse split], matching TileRT's 32 CTAs/token for topK=2048.
     dim3 splitGrid(numTokens * numSplits);
-    // Shared memory stores [8 heads, 64 split candidates] score/probability slots in the attention phase. q_b
-    // fusion reuses the same dynamic shared memory before attention to cache one UE8M0 activation scale byte per
-    // 1x128 input block.
-    size_t const splitSharedBytes = std::max(static_cast<size_t>(kLocalHeads * kSparseSplitSize * sizeof(float)),
-        static_cast<size_t>(hasQbProj ? kQbProjScalarSharedBytes : 0));
+    auto* qNopeForCombinedPtr = qNopePtr;
+    auto* qPeForCombinedPtr = qPePtr;
+    auto* qBProjInputForCombinedPtr = qBProjInputPtr;
+    int64_t qNopeStrideTokenForCombined = qNopeStrideToken;
+    int64_t qNopeStrideHeadForCombined = qNopeStrideHead;
+    int64_t qPeStrideTokenForCombined = qPeStrideToken;
+    int64_t qPeStrideHeadForCombined = qPeStrideHead;
+    if (hasQbProj)
+    {
+        // Run q_b projection in its own stream-ordered kernel launch. The combined attention kernel consumes this
+        // buffer after the kernel boundary and therefore no longer uses the in-kernel q_b grid barrier path.
+        bool const deviceSupportsFp8Mma
+            = deviceProperties.major > 8 || (deviceProperties.major == 8 && deviceProperties.minor >= 9);
+        bool const qBProjUseMma = q_b_proj_use_mma && deviceSupportsFp8Mma && qBProjWeightScalePackedPtr != nullptr
+            && qBProjWeightScaleFp32Ptr == nullptr && numTokens > 0 && numTokens <= kQbProjMmaTokens;
+        dim3 const qBProjGrid(qBProjUseMma ? kQbProjMmaOutputTiles : numTokens * numSplits);
+        size_t const qBProjSharedBytes = qBProjUseMma ? 0
+                                                      : std::max(static_cast<size_t>(kQbProjScalarSharedBytes),
+                                                          static_cast<size_t>(2 * kQbProjScaleBlocks * sizeof(float)));
+        qBProjProjectionKernel<<<qBProjGrid, kTileRtThreads, qBProjSharedBytes, stream>>>(qBProjScratchPtr,
+            qBProjInputPtr, qBProjWeightPtr, qBProjWeightScalePackedPtr, qBProjWeightScaleFp32Ptr, qBProjStrideToken,
+            qBProjStrideDim, qBProjWeightStrideRow, qBProjWeightStrideDim, qBProjScaleStrideRow, qBProjScaleStridePack,
+            qBProjScratchStrideToken, qBProjScratchStrideDim, numTokens, numSplits, qBProjUseMma);
+
+        qNopeForCombinedPtr = qBProjScratchPtr;
+        qPeForCombinedPtr = qBProjScratchPtr + static_cast<int64_t>(kQkNopeHeadDim) * qBProjScratchStrideDim;
+        qBProjInputForCombinedPtr = nullptr;
+        qNopeStrideTokenForCombined = qBProjScratchStrideToken;
+        qNopeStrideHeadForCombined = kQkHeadDim * qBProjScratchStrideDim;
+        qPeStrideTokenForCombined = qBProjScratchStrideToken;
+        qPeStrideHeadForCombined = kQkHeadDim * qBProjScratchStrideDim;
+    }
+    // Shared memory stores [8 heads, 64 split candidates] score/probability slots in the attention phase.
+    size_t const splitSharedBytes = static_cast<size_t>(kLocalHeads * kSparseSplitSize * sizeof(float));
     // The combined launch first performs RoPE/Q quantization/KV append, grid-syncs, computes split-local partials,
     // grid-syncs again, and then combines into final latent outputs.
-    generationAttentionCombinedKernel<<<splitGrid, kTileRtThreads, splitSharedBytes, stream>>>(fusedQPtr, qNopePtr,
-        kBProjTransPtr, qPePtr, latentCachePtr, rotaryCosSinPtr, kv_cache, quantQPtr, kvCachePoolPtr,
-        topk_indices_pool.data_ptr<int32_t>(), topk_indices.data_ptr<int32_t>(), sequence_length.data_ptr<int32_t>(),
-        specDecodingPackedMaskPtr, specMaskWords, splitLse.data_ptr<float>(), splitOutput.data_ptr<float>(),
-        syncScratch.data_ptr<int32_t>(), outputPtr, mla_bmm1_scale.data_ptr<float>(), mla_bmm2_scale.data_ptr<float>(),
-        kvScaleOrigQuantPtr, kvScaleQuantOrigPtr, qBProjScratchPtr, qBProjOutputPtr, qBProjInputPtr, qBProjWeightPtr,
-        qBProjWeightScalePackedPtr, qBProjWeightScaleFp32Ptr, qNopeStrideToken, qNopeStrideHead, kBProjStrideHead,
-        kBProjStrideDim, kBProjStrideReduction, qPeStrideToken, qPeStrideHead, qBProjStrideToken, qBProjStrideDim,
+    generationAttentionCombinedKernel<<<splitGrid, kTileRtThreads, splitSharedBytes, stream>>>(fusedQPtr,
+        qNopeForCombinedPtr, kBProjTransPtr, qPeForCombinedPtr, latentCachePtr, rotaryCosSinPtr, kv_cache, quantQPtr,
+        kvCachePoolPtr, topk_indices_pool.data_ptr<int32_t>(), topk_indices.data_ptr<int32_t>(),
+        sequence_length.data_ptr<int32_t>(), specDecodingPackedMaskPtr, specMaskWords, splitLse.data_ptr<float>(),
+        splitOutput.data_ptr<float>(), syncScratch.data_ptr<int32_t>(), outputPtr, mla_bmm1_scale.data_ptr<float>(),
+        mla_bmm2_scale.data_ptr<float>(), kvScaleOrigQuantPtr, kvScaleQuantOrigPtr, qBProjScratchPtr,
+        qBProjInputForCombinedPtr, qBProjWeightPtr, qBProjWeightScalePackedPtr, qBProjWeightScaleFp32Ptr,
+        qNopeStrideTokenForCombined, qNopeStrideHeadForCombined, kBProjStrideHead, kBProjStrideDim,
+        kBProjStrideReduction, qPeStrideTokenForCombined, qPeStrideHeadForCombined, qBProjStrideToken, qBProjStrideDim,
         qBProjWeightStrideRow, qBProjWeightStrideDim, qBProjScaleStrideRow, qBProjScaleStridePack,
-        qBProjOutputStrideToken, qBProjOutputStrideDim, numTokens, topK, numSplits, numTokens * numSplits,
+        qBProjScratchStrideToken, qBProjScratchStrideDim, numTokens, topK, numSplits, numTokens * numSplits,
         hostScoreScale, is_context, contextChunkStart);
 
     // Report any asynchronous CUDA error before returning to Python.

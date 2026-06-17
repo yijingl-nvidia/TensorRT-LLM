@@ -383,6 +383,7 @@ def _custom_context_attention_with_combined_kernel_chunks(
     q_b_proj_input: torch.Tensor | None = None,
     q_b_proj_weight: torch.Tensor | None = None,
     q_b_proj_weight_scale: torch.Tensor | None = None,
+    q_b_proj_use_mma: bool = True,
 ) -> torch.Tensor:
     attention._ensure_rope_table_size(metadata.max_seq_len)
     topk_indices_pool, kv_cache_pool = transform_local_topk_and_prepare_pool_view(
@@ -416,6 +417,16 @@ def _custom_context_attention_with_combined_kernel_chunks(
         q_b_proj_input_chunk = (
             q_b_proj_input[chunk_start:chunk_end] if q_b_proj_input is not None else None
         )
+        q_b_proj_output_chunk = (
+            torch.empty(
+                chunk_len,
+                _LOCAL_NUM_HEADS * _QK_HEAD_DIM,
+                dtype=q_b_proj_input_chunk.dtype,
+                device=q_b_proj_input_chunk.device,
+            )
+            if q_b_proj_input_chunk is not None
+            else None
+        )
 
         output[chunk_start:chunk_end] = torch.ops.trtllm.dsv3_fused_mla_generation(
             fused_q=fused_q_chunk,
@@ -446,7 +457,8 @@ def _custom_context_attention_with_combined_kernel_chunks(
             q_b_proj_input=q_b_proj_input_chunk,
             q_b_proj_weight=q_b_proj_weight,
             q_b_proj_weight_scale=q_b_proj_weight_scale,
-            q_b_proj_output=None,
+            q_b_proj_output=q_b_proj_output_chunk,
+            q_b_proj_use_mma=q_b_proj_use_mma,
         )
 
     return output
@@ -744,9 +756,17 @@ def _custom_decode_attention(
     q_b_proj_weight: torch.Tensor | None = None,
     q_b_proj_weight_scale: torch.Tensor | None = None,
     q_b_proj_output: torch.Tensor | None = None,
+    q_b_proj_use_mma: bool = True,
 ) -> torch.Tensor:
     _ = cu_q_seqlens, cu_kv_seqlens, fmha_scheduler_counter
     attention._ensure_rope_table_size(metadata.max_seq_len)
+    if q_b_proj_input is not None and q_b_proj_output is None:
+        q_b_proj_output = torch.empty(
+            q_b_proj_input.shape[0],
+            _LOCAL_NUM_HEADS * _QK_HEAD_DIM,
+            dtype=q_b_proj_input.dtype,
+            device=q_b_proj_input.device,
+        )
     return torch.ops.trtllm.dsv3_fused_mla_generation(
         fused_q=fused_q,
         q_nope=q_nope,
@@ -777,6 +797,7 @@ def _custom_decode_attention(
         q_b_proj_weight=q_b_proj_weight,
         q_b_proj_weight_scale=q_b_proj_weight_scale,
         q_b_proj_output=q_b_proj_output,
+        q_b_proj_use_mma=q_b_proj_use_mma,
     )
 
 

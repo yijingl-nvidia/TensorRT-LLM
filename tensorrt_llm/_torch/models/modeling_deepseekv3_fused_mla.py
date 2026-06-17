@@ -53,9 +53,12 @@ _FUSED_MLA_DUMP_Q_B_LAYERS_ENV = "TRTLLM_DEEPSEEKV3_FUSED_MLA_DUMP_Q_B_LAYERS"
 _FUSED_MLA_DUMP_Q_B_NUM_LAYERS_ENV = "TRTLLM_DEEPSEEKV3_FUSED_MLA_DUMP_Q_B_NUM_LAYERS"
 _FUSED_MLA_DUMP_Q_B_LAYER_SEED_ENV = "TRTLLM_DEEPSEEKV3_FUSED_MLA_DUMP_Q_B_LAYER_SEED"
 _FUSED_MLA_DUMP_Q_B_RANKS_ENV = "TRTLLM_DEEPSEEKV3_FUSED_MLA_DUMP_Q_B_RANKS"
+_FUSED_MLA_Q_B_PROJ_IMPL_ENV = "TRTLLM_DEEPSEEKV3_FUSED_MLA_Q_B_PROJ_IMPL"
 FUSED_MLA_MODE_BASELINE = "baseline"
 FUSED_MLA_MODE_PYTORCH = "pytorch"
 FUSED_MLA_MODE_WIP = "wip"
+FUSED_MLA_Q_B_PROJ_IMPL_MMA = "mma"
+FUSED_MLA_Q_B_PROJ_IMPL_SCALAR = "scalar"
 
 
 def get_fused_mla_mode() -> str:
@@ -88,6 +91,32 @@ def get_fused_mla_mode() -> str:
             f"Unsupported {_FUSED_MLA_MODE_ENV}={mode!r}; expected one of: {allowed_modes}"
         )
     return mode_aliases[mode]
+
+
+def _get_fused_mla_q_b_proj_impl() -> str:
+    impl = os.environ.get(_FUSED_MLA_Q_B_PROJ_IMPL_ENV, "").strip().lower()
+    if not impl:
+        return FUSED_MLA_Q_B_PROJ_IMPL_MMA
+
+    impl_aliases = {
+        "1": FUSED_MLA_Q_B_PROJ_IMPL_MMA,
+        "true": FUSED_MLA_Q_B_PROJ_IMPL_MMA,
+        "on": FUSED_MLA_Q_B_PROJ_IMPL_MMA,
+        "mma": FUSED_MLA_Q_B_PROJ_IMPL_MMA,
+        "tc": FUSED_MLA_Q_B_PROJ_IMPL_MMA,
+        "tensorcore": FUSED_MLA_Q_B_PROJ_IMPL_MMA,
+        "tensor_core": FUSED_MLA_Q_B_PROJ_IMPL_MMA,
+        "0": FUSED_MLA_Q_B_PROJ_IMPL_SCALAR,
+        "false": FUSED_MLA_Q_B_PROJ_IMPL_SCALAR,
+        "off": FUSED_MLA_Q_B_PROJ_IMPL_SCALAR,
+        "scalar": FUSED_MLA_Q_B_PROJ_IMPL_SCALAR,
+    }
+    if impl not in impl_aliases:
+        allowed_impls = ", ".join((FUSED_MLA_Q_B_PROJ_IMPL_MMA, FUSED_MLA_Q_B_PROJ_IMPL_SCALAR))
+        raise ValueError(
+            f"Unsupported {_FUSED_MLA_Q_B_PROJ_IMPL_ENV}={impl!r}; expected one of: {allowed_impls}"
+        )
+    return impl_aliases[impl]
 
 
 def _is_env_enabled(env_name: str, default: bool = True) -> bool:
@@ -1089,6 +1118,7 @@ class FusedMLA(nn.Module):
             q_b_proj_weight_scale_for_kernel = self.q_b_proj.weight_scale
             assert q_b_proj_weight_for_kernel.dtype == torch.float8_e4m3fn
             assert q_b_proj_weight_scale_for_kernel.dtype in (torch.int32, torch.float32)
+            q_b_proj_use_mma = _get_fused_mla_q_b_proj_impl() == FUSED_MLA_Q_B_PROJ_IMPL_MMA
 
             # [num_tokens, num_heads_tp, qk_nope_head_dim]
             q_nope = q_lor.new_empty([num_tokens, self.num_heads_tp, self.qk_nope_head_dim])
@@ -1139,6 +1169,11 @@ class FusedMLA(nn.Module):
                         dtype=torch.uint8,
                         device=q_lor.device,
                     )
+                    q_b_proj_output_chunk = torch.empty(
+                        [chunk_len, self.num_heads_tp * self.qk_head_dim],
+                        dtype=q_lor.dtype,
+                        device=q_lor.device,
+                    )
                     # [chunk_len, num_heads_tp * kv_lora_rank]
                     attn_out_latent[chunk_slice] = torch.ops.trtllm.dsv3_fused_mla_generation(
                         fused_q=fused_q_chunk,
@@ -1173,7 +1208,8 @@ class FusedMLA(nn.Module):
                         q_b_proj_input=q_lor[chunk_slice],
                         q_b_proj_weight=q_b_proj_weight_for_kernel,
                         q_b_proj_weight_scale=q_b_proj_weight_scale_for_kernel,
-                        q_b_proj_output=None,
+                        q_b_proj_output=q_b_proj_output_chunk,
+                        q_b_proj_use_mma=q_b_proj_use_mma,
                     )
 
             if num_generation_tokens > 0:  # WIP
@@ -1262,6 +1298,11 @@ class FusedMLA(nn.Module):
                             dtype=torch.uint8,
                             device=q_lor.device,
                         )
+                        q_b_proj_output_chunk = torch.empty(
+                            [chunk_len, self.num_heads_tp * self.qk_head_dim],
+                            dtype=q_lor.dtype,
+                            device=q_lor.device,
+                        )
                         # [chunk_len, num_heads_tp * kv_lora_rank]
                         attn_out_latent[generation_chunk_slice] = (
                             torch.ops.trtllm.dsv3_fused_mla_generation(
@@ -1297,7 +1338,8 @@ class FusedMLA(nn.Module):
                                 q_b_proj_input=q_lor[generation_chunk_slice],
                                 q_b_proj_weight=q_b_proj_weight_for_kernel,
                                 q_b_proj_weight_scale=q_b_proj_weight_scale_for_kernel,
-                                q_b_proj_output=None,
+                                q_b_proj_output=q_b_proj_output_chunk,
+                                q_b_proj_use_mma=q_b_proj_use_mma,
                             )
                         )
         else:  # pytorch path
