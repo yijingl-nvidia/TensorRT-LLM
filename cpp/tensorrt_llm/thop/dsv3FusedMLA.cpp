@@ -42,7 +42,8 @@ torch::Tensor dsv3_fused_mla_generation_cuda(torch::Tensor fused_q, torch::Tenso
     std::optional<torch::Tensor> kv_scale_quant_orig, std::optional<torch::Tensor> spec_decoding_packed_mask,
     double q_scaling, bool is_context, int64_t context_chunk_start, std::optional<torch::Tensor> q_b_proj_input,
     std::optional<torch::Tensor> q_b_proj_weight, std::optional<torch::Tensor> q_b_proj_weight_scale,
-    std::optional<torch::Tensor> q_b_proj_output, int64_t q_b_proj_impl);
+    std::optional<torch::Tensor> q_b_proj_output, int64_t q_b_proj_impl,
+    std::optional<torch::Tensor> kv_a_layernorm_weight, double kv_a_layernorm_eps);
 torch::Tensor dsv3_fused_mla_q_b_proj_cuda(torch::Tensor q_b_proj_input, torch::Tensor q_b_proj_weight,
     torch::Tensor q_b_proj_weight_scale, int64_t q_b_proj_impl);
 } // namespace dsv3_fused_mla
@@ -154,7 +155,8 @@ th::Tensor dsv3_fused_mla_generation(th::Tensor fused_q, th::Tensor q_nope, th::
     th::Tensor mla_bmm2_scale, std::optional<th::Tensor> spec_decoding_packed_mask, int64_t layer_idx,
     int64_t tokens_per_block, int64_t quant_mode, double q_scaling, bool is_context, int64_t context_chunk_start,
     std::optional<th::Tensor> q_b_proj_input, std::optional<th::Tensor> q_b_proj_weight,
-    std::optional<th::Tensor> q_b_proj_weight_scale, std::optional<th::Tensor> q_b_proj_output, int64_t q_b_proj_impl)
+    std::optional<th::Tensor> q_b_proj_weight_scale, std::optional<th::Tensor> q_b_proj_output, int64_t q_b_proj_impl,
+    std::optional<th::Tensor> kv_a_layernorm_weight, double kv_a_layernorm_eps)
 {
     checkQbProjImpl(q_b_proj_impl);
     TORCH_CHECK(fused_q.is_cuda(), "fused_q must be a CUDA tensor");
@@ -200,6 +202,10 @@ th::Tensor dsv3_fused_mla_generation(th::Tensor fused_q, th::Tensor q_nope, th::
         TORCH_CHECK(q_b_proj_weight_scale.value().is_cuda(), "q_b_proj_weight_scale must be a CUDA tensor");
         TORCH_CHECK(q_b_proj_output.value().is_cuda(), "q_b_proj_output must be a CUDA tensor");
     }
+    if (kv_a_layernorm_weight.has_value())
+    {
+        TORCH_CHECK(kv_a_layernorm_weight.value().is_cuda(), "kv_a_layernorm_weight must be a CUDA tensor");
+    }
 
     TORCH_CHECK(fused_q.scalar_type() == torch::kBFloat16, "GLM-5 fused MLA generation expects bf16 fused_q");
     TORCH_CHECK(q_nope.scalar_type() == torch::kBFloat16, "GLM-5 fused MLA generation expects bf16 q_nope");
@@ -225,6 +231,11 @@ th::Tensor dsv3_fused_mla_generation(th::Tensor fused_q, th::Tensor q_nope, th::
             "q_b_proj_weight_scale must be packed UE8M0 int32 or original FP32 block scales");
         TORCH_CHECK(q_b_proj_output.value().scalar_type() == torch::kBFloat16, "q_b_proj_output must be bf16");
     }
+    if (kv_a_layernorm_weight.has_value())
+    {
+        TORCH_CHECK(
+            kv_a_layernorm_weight.value().scalar_type() == torch::kBFloat16, "kv_a_layernorm_weight must be bf16");
+    }
 
     TORCH_CHECK(fused_q.dim() == 3, "fused_q must have shape [tokens, heads, 576]");
     TORCH_CHECK(q_nope.dim() == 3, "q_nope must have shape [tokens, heads, 192]");
@@ -235,6 +246,12 @@ th::Tensor dsv3_fused_mla_generation(th::Tensor fused_q, th::Tensor q_nope, th::
     TORCH_CHECK(topk_indices_pool.dim() == 2, "topk_indices_pool must have shape [tokens, topk]");
     TORCH_CHECK(kv_cache_pool.dim() == 3, "kv_cache_pool must have shape [pool_tokens, 1, 576]");
     TORCH_CHECK(quant_q_buffer.dim() == 3, "quant_q_buffer must have shape [tokens, heads, 576]");
+    if (kv_a_layernorm_weight.has_value())
+    {
+        TORCH_CHECK(kv_a_layernorm_weight.value().dim() == 1, "kv_a_layernorm_weight must have shape [512]");
+        TORCH_CHECK(kv_a_layernorm_weight.value().size(0) == 512, "kv_a_layernorm_weight must have hidden size 512");
+        TORCH_CHECK(kv_a_layernorm_weight.value().stride(0) == 1, "kv_a_layernorm_weight must be contiguous");
+    }
     TORCH_CHECK(fused_q.size(0) == q_pe.size(0), "fused_q and q_pe token dimensions must match");
     TORCH_CHECK(fused_q.size(0) == q_nope.size(0), "fused_q and q_nope token dimensions must match");
     TORCH_CHECK(fused_q.size(0) == latent_cache.size(0), "fused_q and latent_cache token dimensions must match");
@@ -324,7 +341,8 @@ th::Tensor dsv3_fused_mla_generation(th::Tensor fused_q, th::Tensor q_nope, th::
         std::move(kv_cache_pool), std::move(quant_q_buffer), std::move(mla_bmm1_scale), std::move(mla_bmm2_scale),
         std::move(kv_scale_orig_quant), std::move(kv_scale_quant_orig), std::move(spec_decoding_packed_mask), q_scaling,
         is_context, context_chunk_start, std::move(q_b_proj_input), std::move(q_b_proj_weight),
-        std::move(q_b_proj_weight_scale), std::move(q_b_proj_output), q_b_proj_impl);
+        std::move(q_b_proj_weight_scale), std::move(q_b_proj_output), q_b_proj_impl, std::move(kv_a_layernorm_weight),
+        kv_a_layernorm_eps);
 }
 
 th::Tensor dsv3_fused_mla_q_b_proj(
@@ -385,14 +403,14 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "int layer_idx, int tokens_per_block, int quant_mode, float q_scaling) -> Tensor");
     m.def(
         "dsv3_fused_mla_generation(Tensor(a!) fused_q, Tensor q_nope, Tensor k_b_proj_trans, Tensor q_pe, "
-        "Tensor latent_cache, Tensor rotary_cos_sin, Tensor sequence_length, Tensor kv_cache_block_offsets, "
+        "Tensor(f!) latent_cache, Tensor rotary_cos_sin, Tensor sequence_length, Tensor kv_cache_block_offsets, "
         "Tensor host_kv_cache_pool_pointers, Tensor host_kv_cache_pool_mapping, Tensor topk_indices, "
         "Tensor topk_indices_pool, Tensor(b!) kv_cache_pool, Tensor? kv_scale_orig_quant, Tensor? kv_scale_quant_orig, "
         "Tensor(c!) quant_q_buffer, Tensor(d!) mla_bmm1_scale, Tensor(e!) mla_bmm2_scale, "
         "Tensor? spec_decoding_packed_mask, int layer_idx, int tokens_per_block, int quant_mode, "
         "float q_scaling, bool is_context, int context_chunk_start, Tensor? q_b_proj_input, "
         "Tensor? q_b_proj_weight, Tensor? q_b_proj_weight_scale, Tensor? q_b_proj_output, "
-        "int q_b_proj_impl) -> Tensor");
+        "int q_b_proj_impl, Tensor? kv_a_layernorm_weight=None, float kv_a_layernorm_eps=0.0) -> Tensor");
     m.def(
         "dsv3_fused_mla_q_b_proj(Tensor q_b_proj_input, Tensor q_b_proj_weight, "
         "Tensor q_b_proj_weight_scale, bool q_b_proj_use_mma) -> Tensor");

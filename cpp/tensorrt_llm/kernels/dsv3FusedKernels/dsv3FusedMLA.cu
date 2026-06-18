@@ -49,6 +49,9 @@ constexpr int kRopeDim = 64;
 constexpr int kQkHeadDim = kQkNopeHeadDim + kRopeDim;
 constexpr int kHeadDim = kKvLoraRank + kRopeDim;
 constexpr int kThreads = 256;
+constexpr int kCompressedKvRmsNormRowsPerCta = 4;
+constexpr int kCompressedKvRmsNormThreadsPerRow = 32;
+constexpr int kCompressedKvRmsNormThreads = kCompressedKvRmsNormRowsPerCta * kCompressedKvRmsNormThreadsPerRow;
 constexpr int kTileRtThreads = 384;
 constexpr int kTileRtConsumerThreads = 256;
 constexpr int kSparseSplitSize = 64;
@@ -434,6 +437,74 @@ __device__ __forceinline__ float blockReduceSum(float value, float* shared)
     }
     // shared[0] holds the CTA-wide sum; every thread returns it for uniform control flow.
     return shared[0];
+}
+
+// Normalize the compressed latent KV/V prefix in-place before the fused MLA generation kernel appends it.
+//
+// Grid:
+// - blockIdx.x selects a group of four token rows.
+// - Each warp owns one token row and mirrors FlashInfer's H=512 RMSNorm geometry.
+//
+// Inputs and mutable tensors:
+// - latentCache: BF16 [numTokens, 576]. Dims [0, 512) are raw compressed KV/V on entry and normalized on exit.
+//   Dims [512, 576) are the unrotated shared K RoPE suffix and are left unchanged.
+// - normWeight: BF16 [512], kv_a_layernorm scale parameter.
+// - latentCacheStrideToken/latentCacheStrideDim: runtime strides for latentCache because callers pass sliced views.
+// - eps: RMSNorm epsilon from the Python module.
+//
+// Side effects:
+// - Mutates latentCache[token, 0:512] in place.
+__global__ void compressedKvRmsNormKernel(__nv_bfloat16* latentCache, __nv_bfloat16 const* normWeight,
+    int64_t latentCacheStrideToken, int64_t latentCacheStrideDim, int numTokens, float eps)
+{
+    int const lane = threadIdx.x & (kCompressedKvRmsNormThreadsPerRow - 1);
+    int const rowInCta = threadIdx.x / kCompressedKvRmsNormThreadsPerRow;
+    int const tokenIdx = static_cast<int>(blockIdx.x) * kCompressedKvRmsNormRowsPerCta + rowInCta;
+    if (tokenIdx >= numTokens)
+    {
+        return;
+    }
+
+    // Base offset for latentCache[tokenIdx, 0].
+    int64_t const tokenBase = static_cast<int64_t>(tokenIdx) * latentCacheStrideToken;
+    // Accumulate sum(x^2) in FP32 over the fixed 512-wide compressed-KV row.
+    float localSumSquares = 0.0F;
+    constexpr int kVectorElements = 8;
+    constexpr int kElementsPerWarpBlock = kCompressedKvRmsNormThreadsPerRow * kVectorElements;
+    for (int block = 0; block < kKvLoraRank / kElementsPerWarpBlock; ++block)
+    {
+        int const dimBase = block * kElementsPerWarpBlock + lane * kVectorElements;
+        for (int elem = 0; elem < kVectorElements; ++elem)
+        {
+            int const dim = dimBase + elem;
+            float const value = toFloat(latentCache[tokenBase + static_cast<int64_t>(dim) * latentCacheStrideDim]);
+            localSumSquares += value * value;
+        }
+    }
+
+    // Match FlashInfer CuTe RMSNorm's single-warp row reduction for H=512.
+    unsigned const mask = 0xFFFFFFFFU;
+    float sumSquares = localSumSquares;
+    for (int offset = 1; offset < kCompressedKvRmsNormThreadsPerRow; offset <<= 1)
+    {
+        sumSquares += __shfl_xor_sync(mask, sumSquares, offset, kCompressedKvRmsNormThreadsPerRow);
+    }
+    // RMSNorm scale: 1 / sqrt(mean(x^2) + eps).
+    float const invRms = rsqrtf(sumSquares / static_cast<float>(kKvLoraRank) + eps);
+
+    // Apply the learned scale and round each output back to BF16 in-place.
+    for (int block = 0; block < kKvLoraRank / kElementsPerWarpBlock; ++block)
+    {
+        int const dimBase = block * kElementsPerWarpBlock + lane * kVectorElements;
+        for (int elem = 0; elem < kVectorElements; ++elem)
+        {
+            int const dim = dimBase + elem;
+            int64_t const offset = tokenBase + static_cast<int64_t>(dim) * latentCacheStrideDim;
+            float const value = toFloat(latentCache[offset]);
+            float const weight = toFloat(normWeight[dim]);
+            latentCache[offset] = toBfloat16(value * invRms * weight);
+        }
+    }
 }
 
 // Sum one scalar contribution across the current warp.
@@ -2613,12 +2684,16 @@ torch::Tensor dsv3_fused_mla_q_b_proj_cuda(torch::Tensor q_b_proj_input, torch::
 //   or FP32 [16, 16] saved original 128x128 block-scale tensor.
 // - q_b_proj_output: optional BF16 [numTokens, 2048]. Required with q_b_proj_input; used as q_b scratch/output.
 // - q_b_proj_impl: 0=scalar, 1=old warp-MMA, 2=UMMA slot.
+// - kv_a_layernorm_weight: optional BF16 [512]. When provided, latent_cache dims [0, 512) are raw compressed KV/V
+//   values and are normalized in-place before any downstream fused attention work reads them.
+// - kv_a_layernorm_eps: RMSNorm epsilon for kv_a_layernorm.
 //
 // Output:
 // - Returns BF16 [numTokens, 8 * 512], logically [numTokens, 8, 512].
 //
 // Side effects:
 // - Mutates fused_q absorbed prefix and RoPE suffix for debug visibility.
+// - Mutates latent_cache's compressed-KV prefix when kv_a_layernorm_weight is provided.
 // - Mutates quant_q_buffer, mla_bmm1_scale, mla_bmm2_scale, and kv_cache before running attention.
 // - Mutates q_b_proj_output when q_b_proj_input is provided.
 // - Writes the returned output tensor.
@@ -2630,7 +2705,8 @@ torch::Tensor dsv3_fused_mla_generation_cuda(torch::Tensor fused_q, torch::Tenso
     std::optional<torch::Tensor> kv_scale_quant_orig, std::optional<torch::Tensor> spec_decoding_packed_mask,
     double q_scaling, bool is_context, int64_t context_chunk_start, std::optional<torch::Tensor> q_b_proj_input,
     std::optional<torch::Tensor> q_b_proj_weight, std::optional<torch::Tensor> q_b_proj_weight_scale,
-    std::optional<torch::Tensor> q_b_proj_output, int64_t q_b_proj_impl)
+    std::optional<torch::Tensor> q_b_proj_output, int64_t q_b_proj_impl,
+    std::optional<torch::Tensor> kv_a_layernorm_weight, double kv_a_layernorm_eps)
 {
     // Set the active CUDA device to match fused_q so the launch uses the correct GPU.
     c10::cuda::CUDAGuard const deviceGuard{fused_q.device()};
@@ -2659,8 +2735,11 @@ torch::Tensor dsv3_fused_mla_generation_cuda(torch::Tensor fused_q, torch::Tenso
     auto* kBProjTransPtr = static_cast<__nv_bfloat16 const*>(k_b_proj_trans.data_ptr());
     // Raw BF16 qPe pointer. It may be a strided view.
     auto* qPePtr = static_cast<__nv_bfloat16 const*>(q_pe.data_ptr());
-    // Raw BF16 latent cache pointer [numTokens, 576].
-    auto* latentCachePtr = static_cast<__nv_bfloat16 const*>(latent_cache.data_ptr());
+    // Raw BF16 latent cache pointer [numTokens, 576]. It is mutable when this op owns kv_a_layernorm.
+    auto* latentCachePtr = static_cast<__nv_bfloat16*>(latent_cache.data_ptr());
+    auto* kvALayerNormWeightPtr = kv_a_layernorm_weight.has_value()
+        ? static_cast<__nv_bfloat16 const*>(kv_a_layernorm_weight.value().data_ptr())
+        : nullptr;
     // quant_q_buffer is a uint8 tensor whose bytes are FP8 E4M3 values.
     auto* quantQPtr = reinterpret_cast<__nv_fp8_e4m3*>(quant_q_buffer.data_ptr());
     bool const hasQbProj = q_b_proj_input.has_value() || q_b_proj_weight.has_value()
@@ -2691,6 +2770,8 @@ torch::Tensor dsv3_fused_mla_generation_cuda(torch::Tensor fused_q, torch::Tenso
     int64_t const qPeStrideToken = q_pe.stride(0);
     // Head stride for q_pe.
     int64_t const qPeStrideHead = q_pe.stride(1);
+    int64_t const latentCacheStrideToken = latent_cache.stride(0);
+    int64_t const latentCacheStrideDim = latent_cache.stride(1);
     int64_t const qBProjStrideToken = hasQbProj ? q_b_proj_input.value().stride(0) : 0;
     int64_t const qBProjStrideDim = hasQbProj ? q_b_proj_input.value().stride(1) : 0;
     int64_t const qBProjWeightStrideRow = hasQbProj ? q_b_proj_weight.value().stride(0) : 0;
@@ -2775,6 +2856,14 @@ torch::Tensor dsv3_fused_mla_generation_cuda(torch::Tensor fused_q, torch::Tenso
         qNopeStrideHeadForCombined = kQkHeadDim * qBProjScratchStrideDim;
         qPeStrideTokenForCombined = qBProjScratchStrideToken;
         qPeStrideHeadForCombined = kQkHeadDim * qBProjScratchStrideDim;
+    }
+    if (kvALayerNormWeightPtr != nullptr)
+    {
+        int const compressedKvRmsNormCtas
+            = (numTokens + kCompressedKvRmsNormRowsPerCta - 1) / kCompressedKvRmsNormRowsPerCta;
+        compressedKvRmsNormKernel<<<compressedKvRmsNormCtas, kCompressedKvRmsNormThreads, 0, stream>>>(latentCachePtr,
+            kvALayerNormWeightPtr, latentCacheStrideToken, latentCacheStrideDim, numTokens,
+            static_cast<float>(kv_a_layernorm_eps));
     }
     // Shared memory stores [8 heads, 64 split candidates] score/probability slots in the attention phase.
     size_t const splitSharedBytes = static_cast<size_t>(kLocalHeads * kSparseSplitSize * sizeof(float));

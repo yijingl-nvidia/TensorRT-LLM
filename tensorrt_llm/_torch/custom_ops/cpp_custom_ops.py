@@ -1202,6 +1202,8 @@ def _register_fake():
         q_b_proj_weight_scale: Optional[torch.Tensor],
         q_b_proj_output: Optional[torch.Tensor],
         q_b_proj_impl: int,
+        kv_a_layernorm_weight: Optional[torch.Tensor] = None,
+        kv_a_layernorm_eps: float = 0.0,
     ) -> torch.Tensor:
         del (
             q_nope,
@@ -1233,6 +1235,8 @@ def _register_fake():
             q_b_proj_weight_scale,
             q_b_proj_output,
             q_b_proj_impl,
+            kv_a_layernorm_weight,
+            kv_a_layernorm_eps,
         )
         return fused_q.new_empty((fused_q.shape[0], fused_q.shape[1] * 512))
 

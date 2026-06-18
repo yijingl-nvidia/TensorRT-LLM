@@ -908,15 +908,20 @@ class FusedMLA(nn.Module):
             [self.q_lora_rank, self.kv_lora_rank, self.qk_rope_head_dim], -1
         )
 
-        # q_lor: [actual_num_tokens, q_lora_rank]
-        # compressed_kv: [actual_num_tokens, kv_lora_rank]
-        q_lor, compressed_kv = maybe_execute_in_parallel(
-            lambda: self.q_a_layernorm(q_lor),
-            lambda: self.kv_a_layernorm(compressed_kv),
-            self.ln_events[0],
-            self.ln_events[1],
-            self.aux_stream,
-        )
+        if fused_mla_mode == FUSED_MLA_MODE_WIP:
+            # The WIP fused MLA op normalizes compressed_kv in-place inside
+            # dsv3_fused_mla_generation_cuda, after latent_cache is built.
+            q_lor = self.q_a_layernorm(q_lor)
+        else:
+            # q_lor: [actual_num_tokens, q_lora_rank]
+            # compressed_kv: [actual_num_tokens, kv_lora_rank]
+            q_lor, compressed_kv = maybe_execute_in_parallel(
+                lambda: self.q_a_layernorm(q_lor),
+                lambda: self.kv_a_layernorm(compressed_kv),
+                self.ln_events[0],
+                self.ln_events[1],
+                self.aux_stream,
+            )
         # [actual_num_tokens, kv_lora_rank + qk_rope_head_dim]
         latent_cache = torch.concat([compressed_kv, k_pe], dim=-1)
 
@@ -1080,6 +1085,8 @@ class FusedMLA(nn.Module):
                         q_b_proj_weight_scale=q_b_proj_weight_scale_for_kernel,
                         q_b_proj_output=q_b_proj_output_chunk,
                         q_b_proj_impl=q_b_proj_impl,
+                        kv_a_layernorm_weight=self.kv_a_layernorm.weight,
+                        kv_a_layernorm_eps=float(self.kv_a_layernorm.variance_epsilon),
                     )
 
             if num_generation_tokens > 0:  # WIP
@@ -1205,6 +1212,8 @@ class FusedMLA(nn.Module):
                                 q_b_proj_weight_scale=q_b_proj_weight_scale_for_kernel,
                                 q_b_proj_output=q_b_proj_output_chunk,
                                 q_b_proj_impl=q_b_proj_impl,
+                                kv_a_layernorm_weight=self.kv_a_layernorm.weight,
+                                kv_a_layernorm_eps=float(self.kv_a_layernorm.variance_epsilon),
                             )
                         )
         else:  # pytorch path
