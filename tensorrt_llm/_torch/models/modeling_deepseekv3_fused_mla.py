@@ -16,10 +16,7 @@
 
 import math
 import os
-import random
-import time
 import weakref
-from pathlib import Path
 from typing import Optional
 
 import torch
@@ -47,16 +44,7 @@ from ..peft.lora.layer import LoraLayer
 from .modeling_deepseekv3_mla_pytorch import dsv3_mla_context_pytorch, dsv3_mla_decode_pytorch
 
 _FUSED_MLA_MODE_ENV = "TRTLLM_DEEPSEEKV3_FUSED_MLA_MODE"
-_FUSED_MLA_DEBUG_OUTPUT_DIR_ENV = "TRTLLM_DEEPSEEKV3_FUSED_MLA_DEBUG_OUTPUT_DIR"
-_FUSED_MLA_DUMP_Q_B_ENV = "TRTLLM_DEEPSEEKV3_FUSED_MLA_DUMP_Q_B"
-_FUSED_MLA_DUMP_Q_B_DECODE_ITER_ENV = "TRTLLM_DEEPSEEKV3_FUSED_MLA_DUMP_Q_B_DECODE_ITER"
-_FUSED_MLA_DUMP_Q_B_LAYERS_ENV = "TRTLLM_DEEPSEEKV3_FUSED_MLA_DUMP_Q_B_LAYERS"
-_FUSED_MLA_DUMP_Q_B_NUM_LAYERS_ENV = "TRTLLM_DEEPSEEKV3_FUSED_MLA_DUMP_Q_B_NUM_LAYERS"
-_FUSED_MLA_DUMP_Q_B_LAYER_SEED_ENV = "TRTLLM_DEEPSEEKV3_FUSED_MLA_DUMP_Q_B_LAYER_SEED"
-_FUSED_MLA_DUMP_Q_B_RANKS_ENV = "TRTLLM_DEEPSEEKV3_FUSED_MLA_DUMP_Q_B_RANKS"
 _FUSED_MLA_Q_B_PROJ_IMPL_ENV = "TRTLLM_DEEPSEEKV3_FUSED_MLA_Q_B_PROJ_IMPL"
-_FUSED_MLA_Q_B_PROJ_COMPARE_ENV = "TRTLLM_DEEPSEEKV3_FUSED_MLA_Q_B_PROJ_COMPARE"
-_FUSED_MLA_Q_B_PROJ_COMPARE_DIR_ENV = "TRTLLM_DEEPSEEKV3_FUSED_MLA_Q_B_PROJ_COMPARE_DIR"
 FUSED_MLA_MODE_BASELINE = "baseline"
 FUSED_MLA_MODE_PYTORCH = "pytorch"
 FUSED_MLA_MODE_WIP = "wip"
@@ -68,7 +56,6 @@ _FUSED_MLA_Q_B_PROJ_IMPL_KERNEL_MODES = {
     FUSED_MLA_Q_B_PROJ_IMPL_MMA: 1,
     FUSED_MLA_Q_B_PROJ_IMPL_UMMA: 2,
 }
-_FUSED_MLA_Q_B_PROJ_COMPARE_OUTPUT_DIR: Optional[Path] = None
 
 
 def get_fused_mla_mode() -> str:
@@ -140,67 +127,6 @@ def _get_fused_mla_q_b_proj_impl() -> str:
 
 def _get_fused_mla_q_b_proj_impl_kernel_mode() -> int:
     return _FUSED_MLA_Q_B_PROJ_IMPL_KERNEL_MODES[_get_fused_mla_q_b_proj_impl()]
-
-
-def _is_env_enabled(env_name: str, default: bool = True) -> bool:
-    value = os.environ.get(env_name)
-    if value is None:
-        return default
-    return value.strip().lower() not in {"0", "false", "off", "no"}
-
-
-def _env_int(env_name: str, default: int) -> int:
-    value = os.environ.get(env_name)
-    if value is None:
-        return default
-    return int(value.strip())
-
-
-def _parse_int_set(value: str) -> set[int]:
-    result: set[int] = set()
-    for item in value.split(","):
-        item = item.strip()
-        if not item:
-            continue
-        result.add(int(item))
-    return result
-
-
-def _selected_q_b_dump_layers(num_hidden_layers: int) -> set[int]:
-    explicit_layers = os.environ.get(_FUSED_MLA_DUMP_Q_B_LAYERS_ENV)
-    if explicit_layers:
-        return _parse_int_set(explicit_layers)
-    if num_hidden_layers <= 0:
-        return set()
-
-    num_layers = min(
-        num_hidden_layers,
-        max(0, _env_int(_FUSED_MLA_DUMP_Q_B_NUM_LAYERS_ENV, 10)),
-    )
-    seed = _env_int(_FUSED_MLA_DUMP_Q_B_LAYER_SEED_ENV, 6108841)
-    return set(random.Random(seed).sample(range(num_hidden_layers), num_layers))
-
-
-def _rank_is_selected_for_q_b_dump(rank: int) -> bool:
-    explicit_ranks = os.environ.get(_FUSED_MLA_DUMP_Q_B_RANKS_ENV)
-    return explicit_ranks is None or rank in _parse_int_set(explicit_ranks)
-
-
-def _q_b_proj_compare_output_dir() -> Path:
-    global _FUSED_MLA_Q_B_PROJ_COMPARE_OUTPUT_DIR
-    if _FUSED_MLA_Q_B_PROJ_COMPARE_OUTPUT_DIR is None:
-        explicit_dir = os.environ.get(_FUSED_MLA_Q_B_PROJ_COMPARE_DIR_ENV)
-        if explicit_dir:
-            output_dir = Path(explicit_dir).expanduser()
-        else:
-            timestamp = time.strftime("%Y%m%d_%H%M%S")
-            output_dir = (
-                Path("~/dev/mla-debug-output").expanduser()
-                / f"q_b_proj_compare_{timestamp}_pid{os.getpid()}"
-            )
-        output_dir.mkdir(parents=True, exist_ok=True)
-        _FUSED_MLA_Q_B_PROJ_COMPARE_OUTPUT_DIR = output_dir
-    return _FUSED_MLA_Q_B_PROJ_COMPARE_OUTPUT_DIR
 
 
 class DeepseekV3Linear(Linear):
@@ -453,11 +379,6 @@ class FusedMLA(nn.Module):
         self.pos_embd_params = pos_embd_params
         self.dense_bias = dense_bias
         self.num_groups = num_groups
-        self.num_hidden_layers = getattr(config.pretrained_config, "num_hidden_layers", 0)
-        self._q_b_proj_generation_call_count = 0
-        self._q_b_proj_debug_dumped = False
-        self._q_b_proj_compare_call_count = 0
-        self._q_b_proj_compare_capture_warned = False
         self.o_lora_rank = o_lora_rank
         if dense_bias is None:
             self.dense_bias = bias
@@ -881,192 +802,6 @@ class FusedMLA(nn.Module):
         else:
             torch.ops.trtllm.bmm_out(a, b_transposed, output)
 
-    def _save_q_b_debug_dump_tensor(
-        self,
-        output_dir: Path,
-        rank: int,
-        layer_idx: int,
-        tensor_name: str,
-        tensor: torch.Tensor,
-    ) -> None:
-        path = output_dir / f"r{rank}_l{layer_idx}_{tensor_name}.pt"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(tensor.detach().cpu(), path)
-
-    def _save_q_b_debug_dump_value(
-        self,
-        output_dir: Path,
-        rank: int,
-        layer_idx: int,
-        tensor_name: str,
-        value: int | float,
-    ) -> None:
-        path = output_dir / f"r{rank}_l{layer_idx}_{tensor_name}.pt"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(value, path)
-
-    def _maybe_dump_q_b_projection(
-        self,
-        q_b_proj_input: torch.Tensor,
-        generation_call_count: int,
-    ) -> None:
-        """Dump one live decode q_b projection case for WIP-kernel debugging."""
-        if not _is_env_enabled(_FUSED_MLA_DUMP_Q_B_ENV, default=False):
-            return
-        if self._q_b_proj_debug_dumped:
-            return
-        debug_output_dir = os.environ.get(_FUSED_MLA_DEBUG_OUTPUT_DIR_ENV)
-        if not debug_output_dir:
-            return
-        if torch.cuda.is_current_stream_capturing():
-            return
-
-        target_generation_call = _env_int(_FUSED_MLA_DUMP_Q_B_DECODE_ITER_ENV, 10)
-        if generation_call_count != target_generation_call:
-            return
-
-        layer_idx = self.layer_idx
-        if layer_idx is None or layer_idx not in _selected_q_b_dump_layers(self.num_hidden_layers):
-            return
-        rank = self.mapping.tp_rank
-        if not _rank_is_selected_for_q_b_dump(rank):
-            return
-
-        # [num_tokens, num_heads_tp * qk_head_dim]
-        q_b_proj_output = self.q_b_proj(q_b_proj_input)
-        output_dir = Path(debug_output_dir).expanduser()
-        self._save_q_b_debug_dump_tensor(
-            output_dir, rank, layer_idx, "q_b_proj_input", q_b_proj_input
-        )
-        self._save_q_b_debug_dump_tensor(
-            output_dir, rank, layer_idx, "q_b_proj_output", q_b_proj_output
-        )
-        self._save_q_b_debug_dump_tensor(
-            output_dir, rank, layer_idx, "q_b_proj_weight", self.q_b_proj.weight
-        )
-        self._save_q_b_debug_dump_tensor(
-            output_dir,
-            rank,
-            layer_idx,
-            "q_b_proj_weight_scale",
-            self.q_b_proj.weight_scale,
-        )
-        self._save_q_b_debug_dump_tensor(
-            output_dir, rank, layer_idx, "k_b_proj_trans", self.k_b_proj_trans
-        )
-        self._save_q_b_debug_dump_value(
-            output_dir, rank, layer_idx, "num_heads_tp", self.num_heads_tp
-        )
-        self._save_q_b_debug_dump_value(
-            output_dir, rank, layer_idx, "q_lora_rank", self.q_lora_rank
-        )
-        self._save_q_b_debug_dump_value(
-            output_dir, rank, layer_idx, "qk_head_dim", self.qk_head_dim
-        )
-        self._save_q_b_debug_dump_value(
-            output_dir, rank, layer_idx, "qk_nope_head_dim", self.qk_nope_head_dim
-        )
-        self._save_q_b_debug_dump_value(
-            output_dir, rank, layer_idx, "qk_rope_head_dim", self.qk_rope_head_dim
-        )
-        self._save_q_b_debug_dump_value(
-            output_dir, rank, layer_idx, "kv_lora_rank", self.kv_lora_rank
-        )
-        self._q_b_proj_debug_dumped = True
-
-    def _maybe_compare_q_b_proj_impls(
-        self,
-        q_b_proj_input: torch.Tensor,
-        q_b_proj_weight: torch.Tensor,
-        q_b_proj_weight_scale: torch.Tensor,
-        location: str,
-    ) -> None:
-        if not _is_env_enabled(_FUSED_MLA_Q_B_PROJ_COMPARE_ENV, default=False):
-            return
-        if torch.cuda.is_current_stream_capturing():
-            if not self._q_b_proj_compare_capture_warned:
-                print(
-                    "[q_b_proj_compare] skipping comparison during CUDA graph capture "
-                    f"rank={self.mapping.tp_rank} layer={self.layer_idx}",
-                    flush=True,
-                )
-                self._q_b_proj_compare_capture_warned = True
-            return
-
-        self._q_b_proj_compare_call_count += 1
-        compare_call_count = self._q_b_proj_compare_call_count
-        q_b_proj_impl = _get_fused_mla_q_b_proj_impl()
-        q_b_proj_impl_mode = _FUSED_MLA_Q_B_PROJ_IMPL_KERNEL_MODES[q_b_proj_impl]
-        if q_b_proj_impl == FUSED_MLA_Q_B_PROJ_IMPL_SCALAR:
-            return
-
-        with torch.inference_mode():
-            q_b_proj_scalar = torch.ops.trtllm.dsv3_fused_mla_q_b_proj_impl(
-                q_b_proj_input,
-                q_b_proj_weight,
-                q_b_proj_weight_scale,
-                _FUSED_MLA_Q_B_PROJ_IMPL_KERNEL_MODES[FUSED_MLA_Q_B_PROJ_IMPL_SCALAR],
-            )
-            q_b_proj_test = torch.ops.trtllm.dsv3_fused_mla_q_b_proj_impl(
-                q_b_proj_input,
-                q_b_proj_weight,
-                q_b_proj_weight_scale,
-                q_b_proj_impl_mode,
-            )
-
-        if torch.equal(q_b_proj_test, q_b_proj_scalar):
-            return
-
-        mismatch = q_b_proj_test != q_b_proj_scalar
-        mismatch_indices = mismatch.nonzero()
-        first_index = tuple(mismatch_indices[0].tolist())
-        abs_diff = (q_b_proj_test.float() - q_b_proj_scalar.float()).abs()
-        max_abs_diff = float(abs_diff.amax().item())
-        num_mismatches = int(mismatch_indices.shape[0])
-        rank = self.mapping.tp_rank
-        layer_idx = -1 if self.layer_idx is None else self.layer_idx
-        output_dir = _q_b_proj_compare_output_dir()
-        prefix = f"r{rank}_l{layer_idx}_c{compare_call_count}_{location}"
-
-        def save_tensor(name: str, tensor: torch.Tensor) -> None:
-            torch.save(tensor.detach().cpu(), output_dir / f"{prefix}_{name}.pt")
-
-        save_tensor("q_b_proj_input", q_b_proj_input)
-        save_tensor("q_b_proj_output_scalar", q_b_proj_scalar)
-        save_tensor(f"q_b_proj_output_{q_b_proj_impl}", q_b_proj_test)
-        save_tensor("q_b_proj_weight", q_b_proj_weight)
-        save_tensor("q_b_proj_weight_scale", q_b_proj_weight_scale)
-        torch.save(
-            {
-                "rank": rank,
-                "layer_idx": layer_idx,
-                "location": location,
-                "q_b_proj_impl": q_b_proj_impl,
-                "q_b_proj_impl_mode": q_b_proj_impl_mode,
-                "compare_call_count": compare_call_count,
-                "tokens": q_b_proj_input.shape[0],
-                "num_mismatches": num_mismatches,
-                "max_abs_diff": max_abs_diff,
-                "first_mismatch_index": first_index,
-                "scalar_value": q_b_proj_scalar[first_index].item(),
-                "test_value": q_b_proj_test[first_index].item(),
-            },
-            output_dir / f"{prefix}_stats.pt",
-        )
-        print(
-            "[q_b_proj_compare] mismatch "
-            f"rank={rank} layer={layer_idx} impl={q_b_proj_impl} location={location} call={compare_call_count} "
-            f"tokens={q_b_proj_input.shape[0]} num_mismatches={num_mismatches} "
-            f"max_abs_diff={max_abs_diff:.6g} first_index={first_index} "
-            f"scalar={q_b_proj_scalar[first_index].item()} test={q_b_proj_test[first_index].item()} "
-            f"debug_dir={output_dir}",
-            flush=True,
-        )
-        raise RuntimeError(
-            f"dsv3 fused MLA q_b projection {q_b_proj_impl} output differs from scalar output; "
-            f"debug tensors saved under {output_dir}"
-        )
-
     def forward(
         self,
         position_ids: Optional[torch.Tensor],
@@ -1084,8 +819,7 @@ class FusedMLA(nn.Module):
         padding is active, otherwise it equals `attn_metadata.num_tokens`.
         Runtime-sized attention tensors are sliced using `attn_metadata.num_tokens`.
         The baseline context path may consume and clear stashed fused FP8-Q
-        buffers, and the WIP generation path may emit q_b projection debug dumps
-        when the debug environment is enabled.
+        buffers.
 
         KV-cache interface used by the DSA/TRTLLM kernels:
 
@@ -1310,12 +1044,6 @@ class FusedMLA(nn.Module):
                         device=q_lor.device,
                     )
                     q_b_proj_input_chunk = q_lor[chunk_slice]
-                    self._maybe_compare_q_b_proj_impls(
-                        q_b_proj_input_chunk,
-                        q_b_proj_weight_for_kernel,
-                        q_b_proj_weight_scale_for_kernel,
-                        "context",
-                    )
                     # [chunk_len, num_heads_tp * kv_lora_rank]
                     attn_out_latent[chunk_slice] = torch.ops.trtllm.dsv3_fused_mla_generation(
                         fused_q=fused_q_chunk,
@@ -1355,12 +1083,6 @@ class FusedMLA(nn.Module):
                     )
 
             if num_generation_tokens > 0:  # WIP
-                self._q_b_proj_generation_call_count += 1
-                self._maybe_dump_q_b_projection(
-                    q_lor[generation_slice],
-                    self._q_b_proj_generation_call_count,
-                )
-
                 # topk_indices_pool: [num_generation_tokens, top_k], int32
                 # kv_cache_pool: pooled KV cache view used by sparse attention.
                 topk_indices_pool, kv_cache_pool = transform_local_topk_and_prepare_pool_view(
@@ -1446,12 +1168,6 @@ class FusedMLA(nn.Module):
                             device=q_lor.device,
                         )
                         q_b_proj_input_chunk = q_lor[generation_chunk_slice]
-                        self._maybe_compare_q_b_proj_impls(
-                            q_b_proj_input_chunk,
-                            q_b_proj_weight_for_kernel,
-                            q_b_proj_weight_scale_for_kernel,
-                            "generation",
-                        )
                         # [chunk_len, num_heads_tp * kv_lora_rank]
                         attn_out_latent[generation_chunk_slice] = (
                             torch.ops.trtllm.dsv3_fused_mla_generation(
