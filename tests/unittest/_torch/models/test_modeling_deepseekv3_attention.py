@@ -384,6 +384,7 @@ def _custom_context_attention_with_combined_kernel_chunks(
     q_b_proj_weight: torch.Tensor | None = None,
     q_b_proj_weight_scale: torch.Tensor | None = None,
     q_b_proj_use_mma: bool = True,
+    q_b_proj_impl: int | None = None,
 ) -> torch.Tensor:
     attention._ensure_rope_table_size(metadata.max_seq_len)
     topk_indices_pool, kv_cache_pool = transform_local_topk_and_prepare_pool_view(
@@ -458,7 +459,9 @@ def _custom_context_attention_with_combined_kernel_chunks(
             q_b_proj_weight=q_b_proj_weight,
             q_b_proj_weight_scale=q_b_proj_weight_scale,
             q_b_proj_output=q_b_proj_output_chunk,
-            q_b_proj_use_mma=q_b_proj_use_mma,
+            q_b_proj_impl=(1 if q_b_proj_use_mma else 0)
+            if q_b_proj_impl is None
+            else q_b_proj_impl,
         )
 
     return output
@@ -757,6 +760,7 @@ def _custom_decode_attention(
     q_b_proj_weight_scale: torch.Tensor | None = None,
     q_b_proj_output: torch.Tensor | None = None,
     q_b_proj_use_mma: bool = True,
+    q_b_proj_impl: int | None = None,
 ) -> torch.Tensor:
     _ = cu_q_seqlens, cu_kv_seqlens, fmha_scheduler_counter
     attention._ensure_rope_table_size(metadata.max_seq_len)
@@ -797,7 +801,7 @@ def _custom_decode_attention(
         q_b_proj_weight=q_b_proj_weight,
         q_b_proj_weight_scale=q_b_proj_weight_scale,
         q_b_proj_output=q_b_proj_output,
-        q_b_proj_use_mma=q_b_proj_use_mma,
+        q_b_proj_impl=(1 if q_b_proj_use_mma else 0) if q_b_proj_impl is None else q_b_proj_impl,
     )
 
 

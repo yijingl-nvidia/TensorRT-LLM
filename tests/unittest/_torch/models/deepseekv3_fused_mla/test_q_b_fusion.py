@@ -13,7 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from dataclasses import replace
+from pathlib import Path
 
 import pytest
 import torch
@@ -32,6 +34,17 @@ from tests.unittest._torch.models.test_modeling_deepseekv3_attention import (
     _Q_LORA_RANK,
     _QK_HEAD_DIM,
 )
+
+_LIVE_MISMATCH_DUMP_DIR_ENV = "TRTLLM_DEEPSEEKV3_FUSED_MLA_Q_B_PROJ_MISMATCH_DUMP_DIR"
+_DEFAULT_LIVE_MISMATCH_DUMP_DIR = Path("~/dev/mla-debug-output/q_b_proj_compare_20260617_123618")
+_Q_B_PROJ_IMPL_SCALAR = 0
+_Q_B_PROJ_IMPL_MMA = 1
+_Q_B_PROJ_IMPL_UMMA = 2
+_Q_B_PROJ_IMPL_NAMES = {
+    _Q_B_PROJ_IMPL_SCALAR: "scalar",
+    _Q_B_PROJ_IMPL_MMA: "mma",
+    _Q_B_PROJ_IMPL_UMMA: "umma",
+}
 
 
 def _slice_case_tokens(case, token_count: int):
@@ -163,12 +176,40 @@ def _assert_tensors_identical(
     )
 
 
+def _load_live_q_b_proj_mismatch_dump() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    dump_dir = Path(
+        os.environ.get(_LIVE_MISMATCH_DUMP_DIR_ENV, str(_DEFAULT_LIVE_MISMATCH_DUMP_DIR))
+    ).expanduser()
+    if not dump_dir.exists():
+        pytest.skip(f"live q_b projection mismatch dump not found: {dump_dir}")
+
+    input_paths = sorted(dump_dir.glob("r*_l*_c*_context_q_b_proj_input.pt"))
+    if not input_paths:
+        pytest.skip(f"live q_b projection mismatch input not found under: {dump_dir}")
+
+    input_path = input_paths[0]
+    prefix = input_path.name.removesuffix("_q_b_proj_input.pt")
+    weight_path = dump_dir / f"{prefix}_q_b_proj_weight.pt"
+    weight_scale_path = dump_dir / f"{prefix}_q_b_proj_weight_scale.pt"
+    for path in (weight_path, weight_scale_path):
+        if not path.exists():
+            pytest.skip(f"live q_b projection mismatch tensor not found: {path}")
+
+    return (
+        torch.load(input_path, map_location="cpu", weights_only=True).cuda(),
+        torch.load(weight_path, map_location="cpu", weights_only=True).cuda(),
+        torch.load(weight_scale_path, map_location="cpu", weights_only=True).cuda(),
+    )
+
+
 @pytest.mark.parametrize("token_count", [1, 2, 3, 4])
-@pytest.mark.parametrize("q_b_proj_use_mma", [True, False])
+@pytest.mark.parametrize(
+    "q_b_proj_impl", [_Q_B_PROJ_IMPL_SCALAR, _Q_B_PROJ_IMPL_MMA, _Q_B_PROJ_IMPL_UMMA]
+)
 @pytest.mark.parametrize("rank", range(_NUM_RANKS))
 def test_deepseekv3_fused_mla_q_b_proj(
     rank: int,
-    q_b_proj_use_mma: bool,
+    q_b_proj_impl: int,
     token_count: int,
 ) -> None:
     """
@@ -185,7 +226,7 @@ def test_deepseekv3_fused_mla_q_b_proj(
         _run_dump_decode_fused_q_b(
             case,
             q_b_proj_output=q_b_proj_actual,
-            q_b_proj_use_mma=q_b_proj_use_mma,
+            q_b_proj_impl=q_b_proj_impl,
         )
 
     assert not torch.isnan(q_b_proj_actual).any().item()
@@ -193,7 +234,7 @@ def test_deepseekv3_fused_mla_q_b_proj(
     wip_min, wip_max = _matrix_min_max(q_b_proj_actual)
     print(
         f"rank={rank} token_count={token_count} "
-        f"q_b_proj_use_mma={q_b_proj_use_mma} "
+        f"q_b_proj_impl={_Q_B_PROJ_IMPL_NAMES[q_b_proj_impl]} "
         f"q_b_proj_ref_min={ref_min:.6g} "
         f"q_b_proj_ref_max={ref_max:.6g} "
         f"q_b_proj_wip_min={wip_min:.6g} "
@@ -208,13 +249,16 @@ def test_deepseekv3_fused_mla_q_b_proj(
 
 
 @pytest.mark.parametrize("token_count", [1, 2, 3, 4])
+@pytest.mark.parametrize("q_b_proj_impl", [_Q_B_PROJ_IMPL_MMA, _Q_B_PROJ_IMPL_UMMA])
 @pytest.mark.parametrize("rank", range(_NUM_RANKS))
-def test_deepseekv3_fused_mla_q_b_proj_mma_matches_scalar(
+def test_deepseekv3_fused_mla_q_b_proj_impl_matches_scalar(
     rank: int,
+    q_b_proj_impl: int,
     token_count: int,
 ) -> None:
     """
-    Compare MMA and scalar q_b projection on the same q_b input tensors.
+    Compare the optimized q_b projection implementations against scalar on the
+    same q_b input tensors.
 
     This test intentionally compares the two fused-kernel q_b implementations
     directly instead of comparing either one against Linear. The input tensors
@@ -224,25 +268,61 @@ def test_deepseekv3_fused_mla_q_b_proj_mma_matches_scalar(
     case = _slice_case_tokens(_build_dump_decode_q_b_case(rank), token_count)
 
     with torch.inference_mode():
-        q_b_proj_scalar = torch.empty_like(case.q_b_proj_output)
-        q_b_proj_mma = torch.empty_like(case.q_b_proj_output)
-        q_b_proj_scalar.fill_(float("nan"))
-        q_b_proj_mma.fill_(float("nan"))
-        _run_dump_decode_fused_q_b(
-            case,
-            q_b_proj_output=q_b_proj_scalar,
-            q_b_proj_use_mma=False,
+        q_b_proj_scalar = torch.ops.trtllm.dsv3_fused_mla_q_b_proj_impl(
+            case.q_b_proj_input,
+            case.q_b_proj_weight,
+            case.q_b_proj_weight_scale,
+            _Q_B_PROJ_IMPL_SCALAR,
         )
-        _run_dump_decode_fused_q_b(
-            case,
-            q_b_proj_output=q_b_proj_mma,
-            q_b_proj_use_mma=True,
+        q_b_proj_test = torch.ops.trtllm.dsv3_fused_mla_q_b_proj_impl(
+            case.q_b_proj_input,
+            case.q_b_proj_weight,
+            case.q_b_proj_weight_scale,
+            q_b_proj_impl,
         )
 
-    assert not torch.isnan(q_b_proj_scalar).any().item()
-    assert not torch.isnan(q_b_proj_mma).any().item()
     _assert_tensors_identical(
-        q_b_proj_mma,
+        q_b_proj_test,
         q_b_proj_scalar,
-        f"rank={rank} layer={case.group.layer_idx} token_count={token_count}",
+        f"rank={rank} layer={case.group.layer_idx} "
+        f"impl={_Q_B_PROJ_IMPL_NAMES[q_b_proj_impl]} token_count={token_count}",
     )
+
+
+def test_deepseekv3_fused_mla_q_b_proj_live_mismatch_dump_impl_matches_scalar() -> None:
+    """
+    Reproduce the live bench q_b projection mismatch from the saved tensors.
+
+    The dump is produced by setting
+    TRTLLM_DEEPSEEKV3_FUSED_MLA_Q_B_PROJ_COMPARE=1 during benching. The first
+    observed mismatch came from rank 5, layer 11, context warmup with one token.
+    """
+    q_b_proj_input, q_b_proj_weight, q_b_proj_weight_scale = _load_live_q_b_proj_mismatch_dump()
+
+    for q_b_proj_input_case, case_name in (
+        (q_b_proj_input, "live q_b projection mismatch dump"),
+        (
+            q_b_proj_input.repeat(4, 1).contiguous(),
+            "live q_b projection mismatch dump repeated to MTP4",
+        ),
+    ):
+        for q_b_proj_impl in (_Q_B_PROJ_IMPL_MMA, _Q_B_PROJ_IMPL_UMMA):
+            with torch.inference_mode():
+                q_b_proj_scalar = torch.ops.trtllm.dsv3_fused_mla_q_b_proj_impl(
+                    q_b_proj_input_case,
+                    q_b_proj_weight,
+                    q_b_proj_weight_scale,
+                    _Q_B_PROJ_IMPL_SCALAR,
+                )
+                q_b_proj_test = torch.ops.trtllm.dsv3_fused_mla_q_b_proj_impl(
+                    q_b_proj_input_case,
+                    q_b_proj_weight,
+                    q_b_proj_weight_scale,
+                    q_b_proj_impl,
+                )
+
+            _assert_tensors_identical(
+                q_b_proj_test,
+                q_b_proj_scalar,
+                f"{case_name} impl={_Q_B_PROJ_IMPL_NAMES[q_b_proj_impl]}",
+            )

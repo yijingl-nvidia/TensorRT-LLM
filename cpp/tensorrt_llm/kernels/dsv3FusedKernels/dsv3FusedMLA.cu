@@ -24,6 +24,13 @@
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime_api.h>
+#include <cute/arch/tmem_allocator_sm100.hpp>
+#include <cutlass/arch/barrier.h>
+#include <cutlass/float8.h>
+#include <deep_gemm/common/math.cuh>
+#include <deep_gemm/mma/sm100.cuh>
+#include <deep_gemm/ptx/ld_st.cuh>
+#include <deep_gemm/ptx/tcgen05.cuh>
 #include <torch/extension.h>
 
 // #include <cmath>
@@ -55,12 +62,43 @@ constexpr int kQbProjMmaCols = 8;
 constexpr int kQbProjMmaK = 32;
 constexpr int kQbProjMmaKSubsPerScaleBlock = kQbProjKPerScaleBlock / kQbProjMmaK;
 constexpr int kQbProjMmaOutputTiles = (kLocalHeads * kQkHeadDim) / kQbProjMmaRows;
+constexpr int kQbProjUmmaRows = 128;
+constexpr int kQbProjUmmaOutputTiles = (kLocalHeads * kQkHeadDim) / kQbProjUmmaRows;
+constexpr int kQbProjUmmaThreads = 128;
+constexpr int kQbProjUmmaAlignedTokens = 16;
+constexpr int kQbProjUmmaK = 32;
+constexpr int kQbProjUmmaScalePacks = kQbProjScaleBlocks / 4;
+[[maybe_unused]] constexpr int kQbProjUmmaSwizzleBytes = 128;
+constexpr int kQbProjUmmaSmemCdBytes = kQbProjUmmaAlignedTokens * kQbProjUmmaRows * sizeof(__nv_bfloat16);
+constexpr int kQbProjUmmaSmemWeightBytes = kQbProjUmmaRows * kQbProjKPerScaleBlock * sizeof(__nv_fp8_e4m3);
+constexpr int kQbProjUmmaSmemActBytes = kQbProjUmmaAlignedTokens * kQbProjKPerScaleBlock * sizeof(__nv_fp8_e4m3);
+constexpr int kQbProjUmmaSmemSfBytes = kQbProjUmmaRows * sizeof(uint32_t);
+constexpr int kQbProjUmmaSmemActScaleRawBytes = kQbProjUmmaAlignedTokens * sizeof(uint32_t);
+constexpr int kQbProjUmmaTmemAccumCols = kQbProjUmmaAlignedTokens;
+constexpr int kQbProjUmmaTmemSfaCols = kQbProjUmmaRows / 32;
+constexpr int kQbProjUmmaTmemSfbCols = kQbProjUmmaRows / 32;
+constexpr int kQbProjUmmaTmemSfaStart = kQbProjUmmaTmemAccumCols;
+constexpr int kQbProjUmmaTmemSfbStart = kQbProjUmmaTmemSfaStart + kQbProjUmmaTmemSfaCols;
+constexpr int kQbProjUmmaTmemCols = 32;
+constexpr int kQbProjUmmaSharedBytes = kQbProjUmmaSmemCdBytes + kQbProjUmmaSmemWeightBytes + kQbProjUmmaSmemActBytes
+    + 2 * kQbProjUmmaSmemSfBytes + kQbProjUmmaSmemActScaleRawBytes + 16
+    + sizeof(cutlass::arch::ClusterTransactionBarrier) + sizeof(uint32_t);
+constexpr int kQbProjImplScalar = 0;
+constexpr int kQbProjImplMma = 1;
+constexpr int kQbProjImplUmma = 2;
 constexpr int kTileRtMaxResidentSplitCtas = 128;
 constexpr int kMaxTopK = 4096;
 
 static_assert(kQbProjMmaCols == 8);
 static_assert(kQbProjMmaKSubsPerScaleBlock * kQbProjMmaK == kQbProjKPerScaleBlock);
 static_assert(kQbProjMmaOutputTiles == kTileRtMaxResidentSplitCtas);
+static_assert(kQbProjUmmaScalePacks * 4 == kQbProjScaleBlocks);
+static_assert(kQbProjUmmaOutputTiles * kQbProjUmmaRows == kLocalHeads * kQkHeadDim);
+static_assert(kQbProjUmmaK * 4 == kQbProjKPerScaleBlock);
+static_assert(kQbProjUmmaSmemCdBytes % 1024 == 0);
+static_assert(kQbProjUmmaSmemWeightBytes % 1024 == 0);
+static_assert(kQbProjUmmaSmemActBytes % 1024 == 0);
+static_assert(kQbProjUmmaTmemSfbStart + kQbProjUmmaTmemSfbCols <= kQbProjUmmaTmemCols);
 
 // This file is intentionally specialized to the GLM-5/DeepSeek-V3 fused MLA shape used by the WIP Python path.
 // The constants above are part of that specialization:
@@ -623,6 +661,236 @@ __device__ __forceinline__ bool useQbProjMmaMtp4(int32_t const* qBProjWeightScal
 #endif
 }
 
+// Resolve the requested q_b implementation to one the current launch can run.
+//
+// Inputs:
+// - requestedImpl: kQbProjImplScalar, kQbProjImplMma, or kQbProjImplUmma.
+// - deviceProperties: active CUDA device properties.
+// - qBProjWeightScalePacked/qBProjWeightScaleFp32: active q_b weight scale layout.
+// - numTokens: token rows in the standalone q_b launch.
+//
+// Output:
+// - Implementation id to pass to qBProjProjectionKernel. Unsupported optimized modes fall back to scalar.
+//
+// Side effects: none.
+int selectQbProjImpl(int requestedImpl, cudaDeviceProp const& deviceProperties, int32_t const* qBProjWeightScalePacked,
+    float const* qBProjWeightScaleFp32, int numTokens)
+{
+    bool const packedScale = qBProjWeightScalePacked != nullptr && qBProjWeightScaleFp32 == nullptr;
+    bool const validMtpTokens = numTokens > 0 && numTokens <= kQbProjMmaTokens;
+    bool const deviceSupportsFp8Mma
+        = deviceProperties.major > 8 || (deviceProperties.major == 8 && deviceProperties.minor >= 9);
+    bool const deviceSupportsUmma = deviceProperties.major >= 10;
+
+    if (requestedImpl == kQbProjImplMma && deviceSupportsFp8Mma && packedScale && validMtpTokens)
+    {
+        return kQbProjImplMma;
+    }
+    if (requestedImpl == kQbProjImplUmma && deviceSupportsUmma && packedScale && validMtpTokens)
+    {
+        return kQbProjImplUmma;
+    }
+    return kQbProjImplScalar;
+}
+
+// Return the q_b projection grid width for the selected implementation.
+//
+// Inputs:
+// - selectedImpl: already resolved q_b implementation id.
+// - numTokens: token rows in the standalone q_b launch.
+// - numSplits: scalar q_b split count.
+//
+// Output:
+// - Number of CTAs to launch.
+//
+// Side effects: none.
+int qBProjProjectionGridSize(int selectedImpl, int numTokens, int numSplits)
+{
+    if (selectedImpl == kQbProjImplMma)
+    {
+        return kQbProjMmaOutputTiles;
+    }
+    if (selectedImpl == kQbProjImplUmma)
+    {
+        return kQbProjUmmaOutputTiles;
+    }
+    return numTokens * numSplits;
+}
+
+// Return the q_b projection CTA width for the selected implementation.
+int qBProjProjectionBlockSize(int selectedImpl)
+{
+    if (selectedImpl == kQbProjImplUmma)
+    {
+        return kQbProjUmmaThreads;
+    }
+    return kTileRtThreads;
+}
+
+// Return dynamic shared memory bytes for the selected q_b implementation.
+size_t qBProjProjectionSharedBytes(int selectedImpl)
+{
+    if (selectedImpl == kQbProjImplScalar)
+    {
+        return std::max(
+            static_cast<size_t>(kQbProjScalarSharedBytes), static_cast<size_t>(2 * kQbProjScaleBlocks * sizeof(float)));
+    }
+    if (selectedImpl == kQbProjImplUmma)
+    {
+        return static_cast<size_t>(kQbProjUmmaSharedBytes);
+    }
+    return 0;
+}
+
+// Compute one packed-scale q_b projection element with the scalar accumulation order used by the accuracy reference.
+//
+// Inputs mirror the q_b projection tensor arguments. The helper is used only as a rare repair path when an MMA result
+// lands close enough to a BF16 rounding boundary that tensor-core accumulation order can flip the final BF16 value.
+//
+// Output:
+// - FP32 projected q_b value before BF16 rounding.
+__device__ __forceinline__ float projectQbProjPackedScalarElement(__nv_bfloat16 const* qBProjInput,
+    __nv_fp8_e4m3 const* qBProjWeight, int32_t const* qBProjWeightScalePacked, int64_t qBProjStrideToken,
+    int64_t qBProjStrideDim, int64_t qBProjWeightStrideRow, int64_t qBProjWeightStrideDim, int64_t qBProjScaleStrideRow,
+    int64_t qBProjScaleStridePack, int tokenIdx, int outputDim)
+{
+    float projected = 0.0F;
+    for (int kBlock = 0; kBlock < kQbProjScaleBlocks; ++kBlock)
+    {
+        uint32_t const actScaleByte
+            = computeQbProjActivationScaleByte(qBProjInput, qBProjStrideToken, qBProjStrideDim, tokenIdx, kBlock);
+        float const actScale = decodeUe8m0Scale(actScaleByte);
+        float const quantScale = decodeUe8m0InverseScale(actScaleByte);
+        float const weightScale = loadPackedUe8m0Scale(
+            qBProjWeightScalePacked, qBProjScaleStrideRow, qBProjScaleStridePack, outputDim, kBlock);
+        float rawBlockAccum = 0.0F;
+        int const inputStart = kBlock * kQbProjKPerScaleBlock;
+
+        for (int k = 0; k < kQbProjKPerScaleBlock; ++k)
+        {
+            int const inputDim = inputStart + k;
+            float const inputValue = toFloat(qBProjInput[static_cast<int64_t>(tokenIdx) * qBProjStrideToken
+                + static_cast<int64_t>(inputDim) * qBProjStrideDim]);
+            __nv_fp8_e4m3 const inputFp8 = __nv_fp8_e4m3(inputValue * quantScale);
+            __nv_fp8_e4m3 const weightFp8 = qBProjWeight[static_cast<int64_t>(outputDim) * qBProjWeightStrideRow
+                + static_cast<int64_t>(inputDim) * qBProjWeightStrideDim];
+            rawBlockAccum = fmaf(toFloat(inputFp8), toFloat(weightFp8), rawBlockAccum);
+        }
+
+        projected = fmaf(rawBlockAccum, actScale * weightScale, projected);
+    }
+    return projected;
+}
+
+// Return the spacing between adjacent normal BF16 values around a rounded BF16 value.
+//
+// Inputs:
+// - value: BF16 rounded value.
+//
+// Output:
+// - FP32 BF16 ulp. Subnormal/zero values are conservatively assigned the smallest normal-adjacent spacing used here.
+__device__ __forceinline__ float bfloat16Ulp(__nv_bfloat16 value)
+{
+    uint16_t const bits = __bfloat16_as_ushort(value);
+    int const exponent = static_cast<int>((bits & 0x7F80U) >> 7);
+    if (exponent == 0)
+    {
+        return exp2f(-133.0F);
+    }
+    return exp2f(static_cast<float>(exponent) - 134.0F);
+}
+
+// Decide whether an MMA FP32 result is too close to a BF16 rounding midpoint to trust for exact parity.
+//
+// Tensor-core FP8 accumulation can differ from the scalar/Linear accumulation by a few FP32 ulps. That normally does
+// not matter after BF16 rounding, but values near the halfway point between two BF16 numbers can flip by one BF16 ulp.
+__device__ __forceinline__ bool needsQbProjScalarRepair(float projected)
+{
+    __nv_bfloat16 const rounded = toBfloat16(projected);
+    float const roundedFloat = toFloat(rounded);
+    float const ulp = bfloat16Ulp(rounded);
+    return fabsf(projected - roundedFloat) > 0.375F * ulp;
+}
+
+// Use the scalar q_b element only when the MMA result is near a BF16 rounding boundary.
+__device__ __forceinline__ __nv_bfloat16 qBProjMmaToBfloat16Exact(float projected, __nv_bfloat16 const* qBProjInput,
+    __nv_fp8_e4m3 const* qBProjWeight, int32_t const* qBProjWeightScalePacked, int64_t qBProjStrideToken,
+    int64_t qBProjStrideDim, int64_t qBProjWeightStrideRow, int64_t qBProjWeightStrideDim, int64_t qBProjScaleStrideRow,
+    int64_t qBProjScaleStridePack, int tokenIdx, int outputDim)
+{
+    if (needsQbProjScalarRepair(projected))
+    {
+        projected = projectQbProjPackedScalarElement(qBProjInput, qBProjWeight, qBProjWeightScalePacked,
+            qBProjStrideToken, qBProjStrideDim, qBProjWeightStrideRow, qBProjWeightStrideDim, qBProjScaleStrideRow,
+            qBProjScaleStridePack, tokenIdx, outputDim);
+    }
+    return toBfloat16(projected);
+}
+
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+// Return the byte offset inside a K-major, 128B-swizzled UMMA SMEM tile.
+//
+// Inputs:
+// - row: logical MN row inside the operand tile.
+// - k: logical K byte inside the 128-wide K block.
+//
+// Output:
+// - Byte offset into the swizzled shared-memory operand buffer.
+__device__ __forceinline__ uint32_t qBProjUmmaKMajorOffset(int row, int k)
+{
+    int const rowGroup = row >> 3;
+    int const rowInGroup = row & 7;
+    int const kGroup = k >> 4;
+    int const kByte = k & 15;
+    return static_cast<uint32_t>(rowGroup * 8 * kQbProjUmmaSwizzleBytes + rowInGroup * kQbProjUmmaSwizzleBytes
+        + ((kGroup ^ rowInGroup) << 4) + kByte);
+}
+
+// Return the byte offset inside the BF16 swap-AB epilogue SMEM tile.
+//
+// The tile is logical [16 token rows, 128 output rows], with the same 128B-swizzled layout used by DeepGEMM's
+// sm100_store_cd_swap_ab epilogue before its TMA store.
+__device__ __forceinline__ uint32_t qBProjUmmaCdOffset(int tokenIdx, int rowOffset)
+{
+    int const outerColumnAtom = rowOffset >> 6;
+    int const columnInAtom = rowOffset & 63;
+    int const columnGroup = columnInAtom >> 3;
+    int const columnInGroup = columnInAtom & 7;
+    int const tokenGroup = tokenIdx >> 3;
+    int const tokenInGroup = tokenIdx & 7;
+    return static_cast<uint32_t>(outerColumnAtom * kQbProjUmmaAlignedTokens * kQbProjUmmaSwizzleBytes
+        + tokenGroup * 8 * kQbProjUmmaSwizzleBytes + tokenInGroup * kQbProjUmmaSwizzleBytes
+        + ((columnGroup ^ tokenInGroup) << 4) + columnInGroup * static_cast<int>(sizeof(__nv_bfloat16)));
+}
+
+// Store one logical scale row into the UTCCP-transposed shared-memory scale layout.
+//
+// DeepGEMM's block-scaled UMMA path first TMA-loads a contiguous [128] uint32 scale vector, then applies a
+// warp-local transpose before issuing UTCCP. This helper writes that final transposed layout directly.
+__device__ __forceinline__ void storeQbProjUmmaScale(uint32_t* scaleSmem, int logicalRow, uint32_t packedScale)
+{
+    int const group = logicalRow >> 5;
+    int const lane = logicalRow & 31;
+    int const transposedIdx = lane * 4 + (group ^ (lane >> 3));
+    scaleSmem[transposedIdx] = packedScale;
+}
+
+// Pack the four UE8M0 activation scale bytes that correspond to four adjacent 128-wide K blocks.
+__device__ __forceinline__ uint32_t computeQbProjActivationScalePack(
+    __nv_bfloat16 const* qBProjInput, int64_t qBProjStrideToken, int64_t qBProjStrideDim, int tokenIdx, int packIdx)
+{
+    uint32_t packed = 0U;
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+    {
+        uint32_t const scaleByte = computeQbProjActivationScaleByte(
+            qBProjInput, qBProjStrideToken, qBProjStrideDim, tokenIdx, packIdx * 4 + i);
+        packed |= (scaleByte & 0xFFU) << (8 * i);
+    }
+    return packed;
+}
+#endif
+
 // Compute one 16-row q_b_proj tile for up to four tokens with FP8 MMA.
 //
 // Inputs:
@@ -752,8 +1020,12 @@ __device__ __forceinline__ void projectQbProjMmaTile(__nv_bfloat16* qBProjScratc
                 continue;
             }
 
-            __nv_bfloat16 const projected0 = toBfloat16(projectedRow0[token]);
-            __nv_bfloat16 const projected1 = toBfloat16(projectedRow1[token]);
+            __nv_bfloat16 const projected0 = qBProjMmaToBfloat16Exact(projectedRow0[token], qBProjInput, qBProjWeight,
+                qBProjWeightScalePacked, qBProjStrideToken, qBProjStrideDim, qBProjWeightStrideRow,
+                qBProjWeightStrideDim, qBProjScaleStrideRow, qBProjScaleStridePack, token, row0);
+            __nv_bfloat16 const projected1 = qBProjMmaToBfloat16Exact(projectedRow1[token], qBProjInput, qBProjWeight,
+                qBProjWeightScalePacked, qBProjStrideToken, qBProjStrideDim, qBProjWeightStrideRow,
+                qBProjWeightStrideDim, qBProjScaleStrideRow, qBProjScaleStridePack, token, row1);
             qBProjScratch[static_cast<int64_t>(token) * qBProjScratchStrideToken
                 + static_cast<int64_t>(row0) * qBProjScratchStrideDim]
                 = projected0;
@@ -762,6 +1034,213 @@ __device__ __forceinline__ void projectQbProjMmaTile(__nv_bfloat16* qBProjScratc
                 = projected1;
         }
     }
+}
+
+// Compute one 128-row q_b_proj tile for the UMMA implementation slot.
+//
+// Inputs mirror projectQbProjMmaTile, but outputTileIdx selects a 128-row tile. This deliberately keeps the UMMA
+// path on the DeepGEMM-shaped output-row partition while the tcgen05 body is isolated from the older warp-MMA path.
+//
+// Outputs: none.
+//
+// Side effects:
+// - Writes qBProjScratch[token, outputDim] for a 128-row output tile and each active token.
+__device__ __forceinline__ void projectQbProjUmmaTile(__nv_bfloat16* qBProjScratch, __nv_bfloat16 const* qBProjInput,
+    __nv_fp8_e4m3 const* qBProjWeight, int32_t const* qBProjWeightScalePacked, int64_t qBProjStrideToken,
+    int64_t qBProjStrideDim, int64_t qBProjWeightStrideRow, int64_t qBProjWeightStrideDim, int64_t qBProjScaleStrideRow,
+    int64_t qBProjScaleStridePack, int64_t qBProjScratchStrideToken, int64_t qBProjScratchStrideDim, int numTokens,
+    int outputTileIdx, uint8_t* dynamicShared)
+{
+    int const validTokens = numTokens < kQbProjMmaTokens ? numTokens : kQbProjMmaTokens;
+    if (outputTileIdx >= kQbProjUmmaOutputTiles || validTokens <= 0)
+    {
+        return;
+    }
+
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+    using Barrier = cutlass::arch::ClusterTransactionBarrier;
+
+    uint8_t* smemCdBytes = dynamicShared;
+    uint8_t* smemWeightBytes = smemCdBytes + kQbProjUmmaSmemCdBytes;
+    uint8_t* smemActBytes = smemWeightBytes + kQbProjUmmaSmemWeightBytes;
+    auto* smemWeightScales = reinterpret_cast<uint32_t*>(smemActBytes + kQbProjUmmaSmemActBytes);
+    auto* smemActScales
+        = reinterpret_cast<uint32_t*>(reinterpret_cast<uint8_t*>(smemWeightScales) + kQbProjUmmaSmemSfBytes);
+    auto* smemActScaleRaw
+        = reinterpret_cast<uint32_t*>(reinterpret_cast<uint8_t*>(smemActScales) + kQbProjUmmaSmemSfBytes);
+    uint8_t* cursor = reinterpret_cast<uint8_t*>(smemActScaleRaw) + kQbProjUmmaSmemActScaleRawBytes;
+    cursor = reinterpret_cast<uint8_t*>((reinterpret_cast<uintptr_t>(cursor) + 15U) & ~uintptr_t(15U));
+    auto* ummaDoneBarrier = reinterpret_cast<Barrier*>(cursor);
+    auto* tmemPtrInSmem = reinterpret_cast<uint32_t*>(ummaDoneBarrier + 1);
+
+    int const warpIdx = static_cast<int>(threadIdx.x) >> 5;
+    int const laneIdx = static_cast<int>(threadIdx.x) & 31;
+    int const outputStart = outputTileIdx * kQbProjUmmaRows;
+
+    if (threadIdx.x == 0)
+    {
+        ummaDoneBarrier->init(1);
+        cutlass::arch::fence_barrier_init();
+    }
+    if (warpIdx == 1)
+    {
+        cute::TMEM::Allocator1Sm().allocate(kQbProjUmmaTmemCols, tmemPtrInSmem);
+    }
+    __syncthreads();
+
+    auto instrDesc = cute::UMMA::make_instr_desc_block_scaled<cutlass::float_e4m3_t, cutlass::float_e4m3_t, float,
+        cutlass::float_ue8m0_t, kQbProjUmmaRows, kQbProjUmmaAlignedTokens, cute::UMMA::Major::K,
+        cute::UMMA::Major::K>();
+    auto sfDesc = deep_gemm::mma::sm100::make_sf_desc(nullptr);
+    auto weightDesc = deep_gemm::mma::sm100::make_umma_desc<cute::UMMA::Major::K, kQbProjUmmaRows,
+        kQbProjKPerScaleBlock, kQbProjUmmaSwizzleBytes>(reinterpret_cast<__nv_fp8_e4m3*>(smemWeightBytes), 0, 0);
+    auto actDesc = deep_gemm::mma::sm100::make_umma_desc<cute::UMMA::Major::K, kQbProjUmmaAlignedTokens,
+        kQbProjKPerScaleBlock, kQbProjUmmaSwizzleBytes>(reinterpret_cast<__nv_fp8_e4m3*>(smemActBytes), 0, 0);
+    uint32_t const weightDescBaseLo = weightDesc.lo;
+    uint32_t const actDescBaseLo = actDesc.lo;
+
+    for (int kBlock = 0; kBlock < kQbProjScaleBlocks; ++kBlock)
+    {
+        int const packIdx = kBlock >> 2;
+        int const scaleByteIdx = kBlock & 3;
+        int const kStart = kBlock * kQbProjKPerScaleBlock;
+
+        if (threadIdx.x < kQbProjUmmaAlignedTokens)
+        {
+            int const tokenIdx = static_cast<int>(threadIdx.x);
+            smemActScaleRaw[tokenIdx] = tokenIdx < validTokens
+                ? computeQbProjActivationScalePack(qBProjInput, qBProjStrideToken, qBProjStrideDim, tokenIdx, packIdx)
+                : 0U;
+        }
+        __syncthreads();
+
+        for (int row = static_cast<int>(threadIdx.x); row < kQbProjUmmaRows; row += blockDim.x)
+        {
+            uint32_t const weightScalePacked = static_cast<uint32_t>(
+                qBProjWeightScalePacked[static_cast<int64_t>(outputStart + row) * qBProjScaleStrideRow
+                    + static_cast<int64_t>(packIdx) * qBProjScaleStridePack]);
+            storeQbProjUmmaScale(smemWeightScales, row, weightScalePacked);
+            uint32_t const actScalePacked = row < kQbProjUmmaAlignedTokens ? smemActScaleRaw[row] : 0U;
+            storeQbProjUmmaScale(smemActScales, row, actScalePacked);
+        }
+
+        for (int idx = static_cast<int>(threadIdx.x); idx < kQbProjUmmaRows * kQbProjKPerScaleBlock; idx += blockDim.x)
+        {
+            int const row = idx / kQbProjKPerScaleBlock;
+            int const k = idx - row * kQbProjKPerScaleBlock;
+            __nv_fp8_e4m3 const weight = qBProjWeight[static_cast<int64_t>(outputStart + row) * qBProjWeightStrideRow
+                + static_cast<int64_t>(kStart + k) * qBProjWeightStrideDim];
+            smemWeightBytes[qBProjUmmaKMajorOffset(row, k)] = static_cast<uint8_t>(weight.__x);
+        }
+
+        for (int idx = static_cast<int>(threadIdx.x); idx < kQbProjUmmaAlignedTokens * kQbProjKPerScaleBlock;
+             idx += blockDim.x)
+        {
+            int const tokenIdx = idx / kQbProjKPerScaleBlock;
+            int const k = idx - tokenIdx * kQbProjKPerScaleBlock;
+            uint8_t fp8Byte = 0U;
+            if (tokenIdx < validTokens)
+            {
+                uint32_t const scaleByte = (smemActScaleRaw[tokenIdx] >> (8 * scaleByteIdx)) & 0xFFU;
+                float const quantScale = decodeUe8m0InverseScale(scaleByte);
+                float const inputValue = toFloat(qBProjInput[static_cast<int64_t>(tokenIdx) * qBProjStrideToken
+                    + static_cast<int64_t>(kStart + k) * qBProjStrideDim]);
+                __nv_fp8_e4m3 const inputFp8 = __nv_fp8_e4m3(inputValue * quantScale);
+                fp8Byte = static_cast<uint8_t>(inputFp8.__x);
+            }
+            smemActBytes[qBProjUmmaKMajorOffset(tokenIdx, k)] = fp8Byte;
+        }
+
+        cutlass::arch::fence_view_async_shared();
+        __syncthreads();
+
+        if (warpIdx == 0)
+        {
+            deep_gemm::ptx::tcgen05_after_thread_sync();
+            if (cute::elect_one_sync())
+            {
+                deep_gemm::mma::sm100::replace_smem_desc_addr(sfDesc, smemWeightScales);
+                cute::SM100_UTCCP_4x32dp128bit_1cta::copy(sfDesc, kQbProjUmmaTmemSfaStart);
+                deep_gemm::mma::sm100::replace_smem_desc_addr(sfDesc, smemActScales);
+                cute::SM100_UTCCP_4x32dp128bit_1cta::copy(sfDesc, kQbProjUmmaTmemSfbStart);
+
+#pragma unroll
+                for (int kSub = 0; kSub < kQbProjKPerScaleBlock / kQbProjUmmaK; ++kSub)
+                {
+                    uint64_t const runtimeInstrDesc = deep_gemm::mma::sm100::make_runtime_instr_desc_with_sf_id(
+                        instrDesc, scaleByteIdx, scaleByteIdx);
+                    weightDesc.lo = deep_gemm::mma::sm100::advance_umma_desc_lo<cute::UMMA::Major::K, kQbProjUmmaRows,
+                        kQbProjUmmaSwizzleBytes, __nv_fp8_e4m3>(weightDescBaseLo, 0, kSub * kQbProjUmmaK);
+                    actDesc.lo
+                        = deep_gemm::mma::sm100::advance_umma_desc_lo<cute::UMMA::Major::K, kQbProjUmmaAlignedTokens,
+                            kQbProjUmmaSwizzleBytes, __nv_fp8_e4m3>(actDescBaseLo, 0, kSub * kQbProjUmmaK);
+                    deep_gemm::ptx::SM100_MMA_MXF8F6F4_SS::fma(weightDesc, actDesc, 0, kBlock > 0 || kSub > 0,
+                        runtimeInstrDesc, kQbProjUmmaTmemSfaStart, kQbProjUmmaTmemSfbStart);
+                }
+            }
+            cutlass::arch::umma_arrive(reinterpret_cast<uint64_t*>(ummaDoneBarrier));
+        }
+
+        ummaDoneBarrier->wait(kBlock & 1);
+        deep_gemm::ptx::tcgen05_after_thread_sync();
+        __syncthreads();
+    }
+
+    for (int i = 0; i < kQbProjUmmaAlignedTokens / 8; ++i)
+    {
+        uint32_t const tmemAddr = static_cast<uint32_t>(i * 8);
+        uint32_t values[8];
+        cute::SM100_TMEM_LOAD_16dp256b1x::copy(tmemAddr, values[0], values[1], values[2], values[3]);
+        cute::SM100_TMEM_LOAD_16dp256b1x::copy(tmemAddr | 0x00100000U, values[4], values[5], values[6], values[7]);
+        cutlass::arch::fence_view_async_tmem_load();
+
+        uint32_t const row = static_cast<uint32_t>(laneIdx & 7);
+        uint32_t const columnGroup = static_cast<uint32_t>((warpIdx & 1) * 4 + (laneIdx >> 3));
+        uint32_t const outerColumnAtom = static_cast<uint32_t>(warpIdx >> 1);
+        uint8_t* smemPtr = smemCdBytes + outerColumnAtom * kQbProjUmmaAlignedTokens * kQbProjUmmaSwizzleBytes
+            + static_cast<uint32_t>(i) * 8U * kQbProjUmmaSwizzleBytes + row * kQbProjUmmaSwizzleBytes
+            + ((columnGroup ^ row) << 4);
+
+        deep_gemm::ptx::SM90_U32x4_STSM_T<int>::copy(deep_gemm::math::cast_into_bf16_and_pack(values[0], values[1]),
+            deep_gemm::math::cast_into_bf16_and_pack(values[2], values[3]),
+            deep_gemm::math::cast_into_bf16_and_pack(values[4], values[5]),
+            deep_gemm::math::cast_into_bf16_and_pack(values[6], values[7]), smemPtr);
+    }
+    __syncthreads();
+
+    for (int idx = static_cast<int>(threadIdx.x); idx < validTokens * kQbProjUmmaRows; idx += blockDim.x)
+    {
+        int const tokenIdx = idx / kQbProjUmmaRows;
+        int const rowOffset = idx - tokenIdx * kQbProjUmmaRows;
+        auto const* valuePtr
+            = reinterpret_cast<__nv_bfloat16 const*>(smemCdBytes + qBProjUmmaCdOffset(tokenIdx, rowOffset));
+        qBProjScratch[static_cast<int64_t>(tokenIdx) * qBProjScratchStrideToken
+            + static_cast<int64_t>(outputStart + rowOffset) * qBProjScratchStrideDim]
+            = *valuePtr;
+    }
+
+    deep_gemm::ptx::tcgen05_before_thread_sync();
+    __syncthreads();
+    if (warpIdx == 0)
+    {
+        cute::TMEM::Allocator1Sm().free(0, kQbProjUmmaTmemCols);
+    }
+#else
+    int const outputStart = outputTileIdx * kQbProjUmmaRows;
+    for (int token = 0; token < validTokens; ++token)
+    {
+        for (int rowOffset = static_cast<int>(threadIdx.x); rowOffset < kQbProjUmmaRows; rowOffset += blockDim.x)
+        {
+            int const outputDim = outputStart + rowOffset;
+            float const projected = projectQbProjPackedScalarElement(qBProjInput, qBProjWeight, qBProjWeightScalePacked,
+                qBProjStrideToken, qBProjStrideDim, qBProjWeightStrideRow, qBProjWeightStrideDim, qBProjScaleStrideRow,
+                qBProjScaleStridePack, token, outputDim);
+            qBProjScratch[static_cast<int64_t>(token) * qBProjScratchStrideToken
+                + static_cast<int64_t>(outputDim) * qBProjScratchStrideDim]
+                = toBfloat16(projected);
+        }
+    }
+#endif
 }
 
 // Compute one 64-column q_b_proj tile for a single token.
@@ -880,6 +1359,7 @@ __device__ __forceinline__ void projectQbProjTile(__nv_bfloat16* qBProjScratch, 
 //
 // Grid:
 // - MMA mode: blockIdx.x is the 16-row output tile coordinate in [0, 128).
+// - UMMA mode: blockIdx.x is the 128-row output tile coordinate in [0, 16).
 // - Scalar mode: blockIdx.x is the same linearized [token, split] coordinate as the combined generation kernel.
 //
 // Side effects:
@@ -888,12 +1368,12 @@ __global__ void qBProjProjectionKernel(__nv_bfloat16* qBProjScratch, __nv_bfloat
     __nv_fp8_e4m3 const* qBProjWeight, int32_t const* qBProjWeightScalePacked, float const* qBProjWeightScaleFp32,
     int64_t qBProjStrideToken, int64_t qBProjStrideDim, int64_t qBProjWeightStrideRow, int64_t qBProjWeightStrideDim,
     int64_t qBProjScaleStrideRow, int64_t qBProjScaleStridePack, int64_t qBProjScratchStrideToken,
-    int64_t qBProjScratchStrideDim, int numTokens, int numSplits, bool qBProjUseMma)
+    int64_t qBProjScratchStrideDim, int numTokens, int numSplits, int qBProjImpl)
 {
-    extern __shared__ __align__(16) uint8_t dynamicShared[];
+    extern __shared__ __align__(1024) uint8_t dynamicShared[];
     float* sharedTile = reinterpret_cast<float*>(dynamicShared);
 
-    if (qBProjUseMma)
+    if (qBProjImpl == kQbProjImplMma)
     {
         int const outputTileIdx = static_cast<int>(blockIdx.x);
         if (outputTileIdx < kQbProjMmaOutputTiles)
@@ -901,6 +1381,18 @@ __global__ void qBProjProjectionKernel(__nv_bfloat16* qBProjScratch, __nv_bfloat
             projectQbProjMmaTile(qBProjScratch, qBProjInput, qBProjWeight, qBProjWeightScalePacked, qBProjStrideToken,
                 qBProjStrideDim, qBProjWeightStrideRow, qBProjWeightStrideDim, qBProjScaleStrideRow,
                 qBProjScaleStridePack, qBProjScratchStrideToken, qBProjScratchStrideDim, numTokens, outputTileIdx);
+        }
+        return;
+    }
+    if (qBProjImpl == kQbProjImplUmma)
+    {
+        int const outputTileIdx = static_cast<int>(blockIdx.x);
+        if (outputTileIdx < kQbProjUmmaOutputTiles)
+        {
+            projectQbProjUmmaTile(qBProjScratch, qBProjInput, qBProjWeight, qBProjWeightScalePacked, qBProjStrideToken,
+                qBProjStrideDim, qBProjWeightStrideRow, qBProjWeightStrideDim, qBProjScaleStrideRow,
+                qBProjScaleStridePack, qBProjScratchStrideToken, qBProjScratchStrideDim, numTokens, outputTileIdx,
+                dynamicShared);
         }
         return;
     }
@@ -2036,6 +2528,59 @@ torch::Tensor dsv3_fused_mla_context_cuda(torch::Tensor fused_q, torch::Tensor q
     return output;
 }
 
+// Standalone q_b projection entry point used for live scalar-vs-MMA debugging from Python.
+//
+// Inputs:
+// - q_b_proj_input: BF16 [numTokens, 2048], normalized q_a output.
+// - q_b_proj_weight: FP8 E4M3 [2048, 2048], local q_b projection weight.
+// - q_b_proj_weight_scale: INT32 [2048, 4] packed UE8M0 scale tensor, or FP32 [16, 16] original block scales.
+// - q_b_proj_impl: 0=scalar, 1=old warp-MMA, 2=UMMA slot.
+//
+// Output:
+// - Returns BF16 [numTokens, 2048].
+torch::Tensor dsv3_fused_mla_q_b_proj_cuda(torch::Tensor q_b_proj_input, torch::Tensor q_b_proj_weight,
+    torch::Tensor q_b_proj_weight_scale, int64_t q_b_proj_impl)
+{
+    c10::cuda::CUDAGuard const deviceGuard{q_b_proj_input.device()};
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream(q_b_proj_input.get_device());
+
+    int const numTokens = static_cast<int>(q_b_proj_input.size(0));
+    auto output = torch::empty({numTokens, kLocalHeads * kQkHeadDim}, q_b_proj_input.options());
+
+    auto* qBProjInputPtr = static_cast<__nv_bfloat16 const*>(q_b_proj_input.data_ptr());
+    auto* qBProjWeightPtr = reinterpret_cast<__nv_fp8_e4m3 const*>(q_b_proj_weight.data_ptr());
+    bool const qBProjUsesFp32Scale = q_b_proj_weight_scale.scalar_type() == torch::kFloat32;
+    auto* qBProjWeightScalePackedPtr = qBProjUsesFp32Scale ? nullptr : q_b_proj_weight_scale.data_ptr<int32_t>();
+    auto* qBProjWeightScaleFp32Ptr = qBProjUsesFp32Scale ? q_b_proj_weight_scale.data_ptr<float>() : nullptr;
+    auto* qBProjOutputPtr = static_cast<__nv_bfloat16*>(output.data_ptr());
+
+    int64_t const qBProjStrideToken = q_b_proj_input.stride(0);
+    int64_t const qBProjStrideDim = q_b_proj_input.stride(1);
+    int64_t const qBProjWeightStrideRow = q_b_proj_weight.stride(0);
+    int64_t const qBProjWeightStrideDim = q_b_proj_weight.stride(1);
+    int64_t const qBProjScaleStrideRow = q_b_proj_weight_scale.stride(0);
+    int64_t const qBProjScaleStridePack = q_b_proj_weight_scale.stride(1);
+    int64_t const qBProjOutputStrideToken = output.stride(0);
+    int64_t const qBProjOutputStrideDim = output.stride(1);
+
+    cudaDeviceProp deviceProperties;
+    TLLM_CUDA_CHECK(cudaGetDeviceProperties(&deviceProperties, q_b_proj_input.get_device()));
+    int const qBProjImpl = selectQbProjImpl(static_cast<int>(q_b_proj_impl), deviceProperties,
+        qBProjWeightScalePackedPtr, qBProjWeightScaleFp32Ptr, numTokens);
+
+    int const numSplits = (kLocalHeads * kQkHeadDim + kQbProjTileDim - 1) / kQbProjTileDim;
+    dim3 const qBProjGrid(qBProjProjectionGridSize(qBProjImpl, numTokens, numSplits));
+    int const qBProjBlockSize = qBProjProjectionBlockSize(qBProjImpl);
+    size_t const qBProjSharedBytes = qBProjProjectionSharedBytes(qBProjImpl);
+    qBProjProjectionKernel<<<qBProjGrid, qBProjBlockSize, qBProjSharedBytes, stream>>>(qBProjOutputPtr, qBProjInputPtr,
+        qBProjWeightPtr, qBProjWeightScalePackedPtr, qBProjWeightScaleFp32Ptr, qBProjStrideToken, qBProjStrideDim,
+        qBProjWeightStrideRow, qBProjWeightStrideDim, qBProjScaleStrideRow, qBProjScaleStridePack,
+        qBProjOutputStrideToken, qBProjOutputStrideDim, numTokens, numSplits, qBProjImpl);
+
+    sync_check_cuda_error(stream);
+    return output;
+}
+
 // Fused GLM-5/DeepSeek-V3 sparse MLA generation/decode path.
 //
 // Inputs:
@@ -2067,7 +2612,7 @@ torch::Tensor dsv3_fused_mla_context_cuda(torch::Tensor fused_q, torch::Tensor q
 // - q_b_proj_weight_scale: optional INT32 [2048, 4] packed UE8M0 scale tensor from FP8BlockScalesLinearMethod,
 //   or FP32 [16, 16] saved original 128x128 block-scale tensor.
 // - q_b_proj_output: optional BF16 [numTokens, 2048]. Required with q_b_proj_input; used as q_b scratch/output.
-// - q_b_proj_use_mma: bool, true to use the packed-scale FP8 MMA q_b projection path when shape/device allow it.
+// - q_b_proj_impl: 0=scalar, 1=old warp-MMA, 2=UMMA slot.
 //
 // Output:
 // - Returns BF16 [numTokens, 8 * 512], logically [numTokens, 8, 512].
@@ -2085,7 +2630,7 @@ torch::Tensor dsv3_fused_mla_generation_cuda(torch::Tensor fused_q, torch::Tenso
     std::optional<torch::Tensor> kv_scale_quant_orig, std::optional<torch::Tensor> spec_decoding_packed_mask,
     double q_scaling, bool is_context, int64_t context_chunk_start, std::optional<torch::Tensor> q_b_proj_input,
     std::optional<torch::Tensor> q_b_proj_weight, std::optional<torch::Tensor> q_b_proj_weight_scale,
-    std::optional<torch::Tensor> q_b_proj_output, bool q_b_proj_use_mma)
+    std::optional<torch::Tensor> q_b_proj_output, int64_t q_b_proj_impl)
 {
     // Set the active CUDA device to match fused_q so the launch uses the correct GPU.
     c10::cuda::CUDAGuard const deviceGuard{fused_q.device()};
@@ -2213,18 +2758,15 @@ torch::Tensor dsv3_fused_mla_generation_cuda(torch::Tensor fused_q, torch::Tenso
     {
         // Run q_b projection in its own stream-ordered kernel launch. The combined attention kernel consumes this
         // buffer after the kernel boundary and therefore no longer uses the in-kernel q_b grid barrier path.
-        bool const deviceSupportsFp8Mma
-            = deviceProperties.major > 8 || (deviceProperties.major == 8 && deviceProperties.minor >= 9);
-        bool const qBProjUseMma = q_b_proj_use_mma && deviceSupportsFp8Mma && qBProjWeightScalePackedPtr != nullptr
-            && qBProjWeightScaleFp32Ptr == nullptr && numTokens > 0 && numTokens <= kQbProjMmaTokens;
-        dim3 const qBProjGrid(qBProjUseMma ? kQbProjMmaOutputTiles : numTokens * numSplits);
-        size_t const qBProjSharedBytes = qBProjUseMma ? 0
-                                                      : std::max(static_cast<size_t>(kQbProjScalarSharedBytes),
-                                                          static_cast<size_t>(2 * kQbProjScaleBlocks * sizeof(float)));
-        qBProjProjectionKernel<<<qBProjGrid, kTileRtThreads, qBProjSharedBytes, stream>>>(qBProjScratchPtr,
+        int const qBProjImpl = selectQbProjImpl(static_cast<int>(q_b_proj_impl), deviceProperties,
+            qBProjWeightScalePackedPtr, qBProjWeightScaleFp32Ptr, numTokens);
+        dim3 const qBProjGrid(qBProjProjectionGridSize(qBProjImpl, numTokens, numSplits));
+        int const qBProjBlockSize = qBProjProjectionBlockSize(qBProjImpl);
+        size_t const qBProjSharedBytes = qBProjProjectionSharedBytes(qBProjImpl);
+        qBProjProjectionKernel<<<qBProjGrid, qBProjBlockSize, qBProjSharedBytes, stream>>>(qBProjScratchPtr,
             qBProjInputPtr, qBProjWeightPtr, qBProjWeightScalePackedPtr, qBProjWeightScaleFp32Ptr, qBProjStrideToken,
             qBProjStrideDim, qBProjWeightStrideRow, qBProjWeightStrideDim, qBProjScaleStrideRow, qBProjScaleStridePack,
-            qBProjScratchStrideToken, qBProjScratchStrideDim, numTokens, numSplits, qBProjUseMma);
+            qBProjScratchStrideToken, qBProjScratchStrideDim, numTokens, numSplits, qBProjImpl);
 
         qNopeForCombinedPtr = qBProjScratchPtr;
         qPeForCombinedPtr = qBProjScratchPtr + static_cast<int64_t>(kQkNopeHeadDim) * qBProjScratchStrideDim;

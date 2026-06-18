@@ -1201,7 +1201,7 @@ def _register_fake():
         q_b_proj_weight: Optional[torch.Tensor],
         q_b_proj_weight_scale: Optional[torch.Tensor],
         q_b_proj_output: Optional[torch.Tensor],
-        q_b_proj_use_mma: bool,
+        q_b_proj_impl: int,
     ) -> torch.Tensor:
         del (
             q_nope,
@@ -1232,9 +1232,31 @@ def _register_fake():
             q_b_proj_weight,
             q_b_proj_weight_scale,
             q_b_proj_output,
-            q_b_proj_use_mma,
+            q_b_proj_impl,
         )
         return fused_q.new_empty((fused_q.shape[0], fused_q.shape[1] * 512))
+
+    @torch.library.register_fake("trtllm::dsv3_fused_mla_q_b_proj")
+    def _(
+        q_b_proj_input: torch.Tensor,
+        q_b_proj_weight: torch.Tensor,
+        q_b_proj_weight_scale: torch.Tensor,
+        q_b_proj_use_mma: bool,
+    ) -> torch.Tensor:
+        del q_b_proj_weight_scale, q_b_proj_use_mma
+        return q_b_proj_input.new_empty(
+            (q_b_proj_input.shape[0], q_b_proj_weight.shape[0]))
+
+    @torch.library.register_fake("trtllm::dsv3_fused_mla_q_b_proj_impl")
+    def _(
+        q_b_proj_input: torch.Tensor,
+        q_b_proj_weight: torch.Tensor,
+        q_b_proj_weight_scale: torch.Tensor,
+        q_b_proj_impl: int,
+    ) -> torch.Tensor:
+        del q_b_proj_weight_scale, q_b_proj_impl
+        return q_b_proj_input.new_empty(
+            (q_b_proj_input.shape[0], q_b_proj_weight.shape[0]))
 
     @torch.library.register_fake("trtllm::fused_add_rms_norm_quant")
     def _(

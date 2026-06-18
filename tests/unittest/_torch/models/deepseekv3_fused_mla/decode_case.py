@@ -291,6 +291,7 @@ def _run_dump_decode_fused_q_b(
     case: FusedMlaDumpDecodeCase,
     q_b_proj_output: torch.Tensor | None = None,
     q_b_proj_use_mma: bool = True,
+    q_b_proj_impl: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Run the WIP decode op with q_b projection fused into the op.
@@ -355,6 +356,7 @@ def _run_dump_decode_fused_q_b(
         q_b_proj_weight_scale=case.q_b_proj_weight_scale,
         q_b_proj_output=q_b_proj_output,
         q_b_proj_use_mma=q_b_proj_use_mma,
+        q_b_proj_impl=q_b_proj_impl,
     )
     return output, fused_q, quant_q_buffer, mla_bmm1_scale, mla_bmm2_scale
 
