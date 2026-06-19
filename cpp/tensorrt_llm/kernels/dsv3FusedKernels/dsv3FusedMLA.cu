@@ -2258,6 +2258,22 @@ __global__ void generationAttentionCombinedKernel(__nv_bfloat16* fusedQ, __nv_bf
     // Wait until Q quantization, bmm scale publication, and paged KV appends are visible to every split CTA.
     generationGridBarrier(syncScratch + 2, expectedCtas);
 
+    // Stage the sparse KV row offsets once per [token, split] CTA. The selected rows and visibility do not depend
+    // on attention head or V dimension, so this removes redundant top-k loads and visibility checks from the QK/AV
+    // loops below.
+    __shared__ int64_t validKvBaseOffsets[kSparseSplitSize];
+    int const splitStart = splitIdx * kSparseSplitSize;
+    if (tid < kSparseSplitSize)
+    {
+        int const topkIdx = splitStart + tid;
+        bool const inRange = topkIdx < topK;
+        int const kvIdx = inRange ? topkIndicesPool[tokenIdx * topK + topkIdx] : -1;
+        int const localKvIdx = inRange ? topkIndicesLocal[tokenIdx * topK + topkIdx] : -1;
+        bool const validKv = kvIdx >= 0 && isGenerationKvVisible(tokenIdx, localKvIdx, currentGroupStart, numTokens);
+        validKvBaseOffsets[tid] = validKv ? static_cast<int64_t>(kvIdx) * kHeadDim : -1;
+    }
+    __syncthreads();
+
     // Threads 256..383 correspond to TileRT's producer/control group. This WIP version does not issue TMA gather
     // from them yet; they skip split math but stay alive so the CTA reaches the common grid barrier safely.
     if (tid < kTileRtConsumerThreads)
@@ -2266,10 +2282,6 @@ __global__ void generationAttentionCombinedKernel(__nv_bfloat16* fusedQ, __nv_bf
         int const headIdx = warpIdx;
         // Each head gets 64 score/probability slots inside dynamic shared memory.
         float* headScores = splitScores + headIdx * kSparseSplitSize;
-        // First top-k index owned by this sparse split.
-        int const splitStart = splitIdx * kSparseSplitSize;
-        // Current decode/MTP group's first local sequence position.
-        int const currentGroupStart = currentGroupStartShared;
         // bmm1Scale[1] is already in log2 space. exp2f below therefore matches the existing generation path.
         float const scoreScaleLog2 = bmm1Scale == nullptr ? 1.4426950408889634F : bmm1Scale[1];
         // Full FP8 query vector for this token/head.
@@ -2280,25 +2292,15 @@ __global__ void generationAttentionCombinedKernel(__nv_bfloat16* fusedQ, __nv_bf
         // QK pass: one consumer warp computes all candidate scores for its head over this 64-key split.
         for (int splitOffset = 0; splitOffset < kSparseSplitSize; ++splitOffset)
         {
-            // Convert split-local offset to global top-k index.
-            int const topkIdx = splitStart + splitOffset;
-            // Only indices inside topK are real. The tail of a non-multiple-of-64 split is invalid.
-            bool const inRange = topkIdx < topK;
-            // Load pool and local indices when in range; otherwise use invalid sentinels.
-            int const kvIdx = inRange ? topkIndicesPool[tokenIdx * topK + topkIdx] : -1;
-            // Local sequence position drives causal/speculative visibility checks.
-            int const localKvIdx = inRange ? topkIndicesLocal[tokenIdx * topK + topkIdx] : -1;
             // Candidate must have a real pool row and be visible to this query token.
-            bool const validKv
-                = kvIdx >= 0 && isGenerationKvVisible(tokenIdx, localKvIdx, currentGroupStart, numTokens);
+            int64_t const kvBaseOffset = validKvBaseOffsets[splitOffset];
+            bool const validKv = kvBaseOffset >= 0;
             // Each lane accumulates a strided slice of the 576-dim QK dot product.
             float partial = 0.0F;
             if (validKv)
             {
-                // Use 64-bit offset math because real pool row ids can be large in the benchmark.
-                int64_t const kvOffset = static_cast<int64_t>(kvIdx) * kHeadDim;
                 // Pointer to the selected FP8 latent KV row.
-                __nv_fp8_e4m3 const* kvPtr = kvCachePool + kvOffset;
+                __nv_fp8_e4m3 const* kvPtr = kvCachePool + kvBaseOffset;
                 // Stride the warp lanes over [0, 576).
                 for (int dim = laneIdx; dim < kHeadDim; dim += 32)
                 {
@@ -2370,21 +2372,12 @@ __global__ void generationAttentionCombinedKernel(__nv_bfloat16* fusedQ, __nv_bf
             // Sum split-local probability times selected latent V value.
             for (int splitOffset = 0; splitOffset < kSparseSplitSize; ++splitOffset)
             {
-                // Convert split-local offset to global top-k index.
-                int const topkIdx = splitStart + splitOffset;
-                // Skip tail entries outside topK.
-                bool const inRange = topkIdx < topK;
-                // Load the selected pool row or invalid sentinel.
-                int const kvIdx = inRange ? topkIndicesPool[tokenIdx * topK + topkIdx] : -1;
-                // Load the local sequence position or invalid sentinel.
-                int const localKvIdx = inRange ? topkIndicesLocal[tokenIdx * topK + topkIdx] : -1;
-                // Reuse the exact same visibility rule as the QK pass.
-                bool const validKv
-                    = kvIdx >= 0 && isGenerationKvVisible(tokenIdx, localKvIdx, currentGroupStart, numTokens);
-                if (validKv)
+                // Reuse the exact same visible KV row selected for the QK pass.
+                int64_t const kvBaseOffset = validKvBaseOffsets[splitOffset];
+                if (kvBaseOffset >= 0)
                 {
                     // Flattened [pool row, latent dim] address. Only dims [0, 512) are latent V.
-                    int64_t const kvOffset = static_cast<int64_t>(kvIdx) * kHeadDim + dim;
+                    int64_t const kvOffset = kvBaseOffset + dim;
                     // Accumulate split-softmax probability times raw FP8-cache V value.
                     acc += headScores[splitOffset] * toFloat(kvCachePool[kvOffset]);
                 }
