@@ -54,6 +54,7 @@ constexpr int kCompressedKvRmsNormThreadsPerRow = 32;
 constexpr int kCompressedKvRmsNormThreads = kCompressedKvRmsNormRowsPerCta * kCompressedKvRmsNormThreadsPerRow;
 constexpr int kTileRtThreads = 384;
 constexpr int kTileRtConsumerThreads = 256;
+constexpr int kGenerationAttentionThreads = kTileRtConsumerThreads;
 constexpr int kSparseSplitSize = 64;
 constexpr int kQbProjTileDim = 64;
 constexpr int kQbProjKPerScaleBlock = 128;
@@ -507,6 +508,60 @@ __global__ void compressedKvRmsNormKernel(__nv_bfloat16* latentCache, __nv_bfloa
     }
 }
 
+__device__ __forceinline__ void normalizeCompressedKvRowsInCurrentCta(__nv_bfloat16* latentCache,
+    __nv_bfloat16 const* normWeight, int64_t latentCacheStrideToken, int64_t latentCacheStrideDim, int numTokens,
+    float eps)
+{
+    int const rowInCta = threadIdx.x / kCompressedKvRmsNormThreadsPerRow;
+    if (rowInCta >= kCompressedKvRmsNormRowsPerCta)
+    {
+        return;
+    }
+
+    int const lane = threadIdx.x & (kCompressedKvRmsNormThreadsPerRow - 1);
+    int const tokenIdx = rowInCta;
+    if (tokenIdx >= numTokens)
+    {
+        return;
+    }
+
+    int64_t const tokenBase = static_cast<int64_t>(tokenIdx) * latentCacheStrideToken;
+    float localSumSquares = 0.0F;
+    constexpr int kVectorElements = 8;
+    constexpr int kElementsPerWarpBlock = kCompressedKvRmsNormThreadsPerRow * kVectorElements;
+    for (int block = 0; block < kKvLoraRank / kElementsPerWarpBlock; ++block)
+    {
+        int const dimBase = block * kElementsPerWarpBlock + lane * kVectorElements;
+        for (int elem = 0; elem < kVectorElements; ++elem)
+        {
+            int const dim = dimBase + elem;
+            float const value = toFloat(latentCache[tokenBase + static_cast<int64_t>(dim) * latentCacheStrideDim]);
+            localSumSquares += value * value;
+        }
+    }
+
+    unsigned const mask = 0xFFFFFFFFU;
+    float sumSquares = localSumSquares;
+    for (int offset = 1; offset < kCompressedKvRmsNormThreadsPerRow; offset <<= 1)
+    {
+        sumSquares += __shfl_xor_sync(mask, sumSquares, offset, kCompressedKvRmsNormThreadsPerRow);
+    }
+    float const invRms = rsqrtf(sumSquares / static_cast<float>(kKvLoraRank) + eps);
+
+    for (int block = 0; block < kKvLoraRank / kElementsPerWarpBlock; ++block)
+    {
+        int const dimBase = block * kElementsPerWarpBlock + lane * kVectorElements;
+        for (int elem = 0; elem < kVectorElements; ++elem)
+        {
+            int const dim = dimBase + elem;
+            int64_t const offset = tokenBase + static_cast<int64_t>(dim) * latentCacheStrideDim;
+            float const value = toFloat(latentCache[offset]);
+            float const weight = toFloat(normWeight[dim]);
+            latentCache[offset] = toBfloat16(value * invRms * weight);
+        }
+    }
+}
+
 // Sum one scalar contribution across the current warp.
 //
 // Inputs:
@@ -562,8 +617,8 @@ __device__ __forceinline__ bool isGenerationKvVisible(
         return false;
     }
 
-    // TRTLLM-Gen MLA generation applies multi-token visibility with causal effective sequence length and does not
-    // consume spec_decoding_packed_mask on this path.
+    // GLM-5 WIP MLA generation uses triangular current-group visibility and does not consume
+    // spec_decoding_packed_mask.
     return currentGroupOffset <= tokenIdx;
 }
 
@@ -579,12 +634,15 @@ __device__ __forceinline__ bool isGenerationKvVisible(
 // - Uses global atomics and a spin wait to form a one-shot grid-wide barrier.
 // - Requires every launched CTA to be resident concurrently. The host path enforces this for the narrow GLM-5 WIP
 //   configuration by capping the split grid to kTileRtMaxResidentSplitCtas.
-__device__ __forceinline__ void generationGridBarrier(int32_t* syncScratch, int expectedCtas)
+__device__ __forceinline__ void generationGridBarrier(int32_t* syncScratch, int expectedCtas, bool needsGlobalFence)
 {
     // Ensure every producer thread in this CTA finishes its phase stores before any thread fences them.
     __syncthreads();
-    // Publish each thread's global writes before this CTA announces arrival.
-    __threadfence();
+    if (needsGlobalFence)
+    {
+        // Publish each thread's global writes before this CTA announces arrival.
+        __threadfence();
+    }
     // Thread 0 must not increment the global arrival counter until every thread's fence has completed.
     __syncthreads();
 
@@ -614,8 +672,8 @@ __device__ __forceinline__ void generationGridBarrier(int32_t* syncScratch, int 
         // Wait until the last CTA publishes the release flag.
         while (atomicAdd(syncScratch + 1, 0) == 0)
         {
-            // Back off slightly while polling global memory.
-            __nanosleep(64U);
+            // Back off while polling global memory.
+            __nanosleep(2048U);
         }
     }
     // Keep all threads in the CTA aligned before entering the combine phase.
@@ -1432,21 +1490,54 @@ __device__ __forceinline__ void projectQbProjTile(__nv_bfloat16* qBProjScratch, 
 // - MMA mode: blockIdx.x is the 16-row output tile coordinate in [0, 128).
 // - UMMA mode: blockIdx.x is the 128-row output tile coordinate in [0, 16).
 // - Scalar mode: blockIdx.x is the same linearized [token, split] coordinate as the combined generation kernel.
+// - A trailing CTA may be reserved for compressed-KV RMSNorm when useDedicatedNormCta is true.
 //
 // Side effects:
 // - Writes qBProjScratch[token, outputDim] for every active token and local q_b output row.
+// - Optionally normalizes latentCache[token, 0:512] before the stream-ordered attention launch.
 __global__ void qBProjProjectionKernel(__nv_bfloat16* qBProjScratch, __nv_bfloat16 const* qBProjInput,
     __nv_fp8_e4m3 const* qBProjWeight, int32_t const* qBProjWeightScalePacked, float const* qBProjWeightScaleFp32,
     int64_t qBProjStrideToken, int64_t qBProjStrideDim, int64_t qBProjWeightStrideRow, int64_t qBProjWeightStrideDim,
     int64_t qBProjScaleStrideRow, int64_t qBProjScaleStridePack, int64_t qBProjScratchStrideToken,
-    int64_t qBProjScratchStrideDim, int numTokens, int numSplits, int qBProjImpl)
+    int64_t qBProjScratchStrideDim, int numTokens, int numSplits, int qBProjImpl, __nv_bfloat16* latentCache,
+    __nv_bfloat16 const* kvALayerNormWeight, int64_t latentCacheStrideToken, int64_t latentCacheStrideDim,
+    float kvALayerNormEps, bool useDedicatedNormCta)
 {
     extern __shared__ __align__(1024) uint8_t dynamicShared[];
     float* sharedTile = reinterpret_cast<float*>(dynamicShared);
 
+    int qBProjWorkCtas = numTokens * numSplits;
     if (qBProjImpl == kQbProjImplMma)
     {
-        int const outputTileIdx = static_cast<int>(blockIdx.x);
+        qBProjWorkCtas = kQbProjMmaOutputTiles;
+    }
+    else if (qBProjImpl == kQbProjImplUmma)
+    {
+        qBProjWorkCtas = kQbProjUmmaOutputTiles;
+    }
+    int const blockIdxX = static_cast<int>(blockIdx.x);
+    if (useDedicatedNormCta && blockIdxX == qBProjWorkCtas)
+    {
+        if (kvALayerNormWeight != nullptr)
+        {
+            normalizeCompressedKvRowsInCurrentCta(latentCache, kvALayerNormWeight, latentCacheStrideToken,
+                latentCacheStrideDim, numTokens, kvALayerNormEps);
+        }
+        return;
+    }
+    if (!useDedicatedNormCta && blockIdxX == 0 && kvALayerNormWeight != nullptr)
+    {
+        normalizeCompressedKvRowsInCurrentCta(
+            latentCache, kvALayerNormWeight, latentCacheStrideToken, latentCacheStrideDim, numTokens, kvALayerNormEps);
+    }
+    if (blockIdxX >= qBProjWorkCtas)
+    {
+        return;
+    }
+
+    if (qBProjImpl == kQbProjImplMma)
+    {
+        int const outputTileIdx = blockIdxX;
         if (outputTileIdx < kQbProjMmaOutputTiles)
         {
             projectQbProjMmaTile(qBProjScratch, qBProjInput, qBProjWeight, qBProjWeightScalePacked, qBProjStrideToken,
@@ -1457,7 +1548,7 @@ __global__ void qBProjProjectionKernel(__nv_bfloat16* qBProjScratch, __nv_bfloat
     }
     if (qBProjImpl == kQbProjImplUmma)
     {
-        int const outputTileIdx = static_cast<int>(blockIdx.x);
+        int const outputTileIdx = blockIdxX;
         if (outputTileIdx < kQbProjUmmaOutputTiles)
         {
             projectQbProjUmmaTile(qBProjScratch, qBProjInput, qBProjWeight, qBProjWeightScalePacked, qBProjStrideToken,
@@ -1506,7 +1597,7 @@ __device__ __forceinline__ void projectGenerationQNopeHead(__nv_bfloat16* fusedQ
     int tokenIdx, int headIdx)
 {
     // Each thread owns one or two latent output dimensions for the current [token, head].
-    for (int dim = threadIdx.x; dim < kKvLoraRank; dim += blockDim.x)
+    for (int dim = threadIdx.x; dim < kKvLoraRank; dim += kGenerationAttentionThreads)
     {
         // Flattened [token, head, dim] offset for both fusedQ and quantQ.
         int const qOffset = (tokenIdx * kLocalHeads + headIdx) * kHeadDim + dim;
@@ -1557,7 +1648,7 @@ __device__ __forceinline__ void rotateGenerationQPeHead(__nv_bfloat16* fusedQ, _
     int tokenIdx, int tokenIdxInKvCache, int headIdx)
 {
     // Each thread handles a strided subset of the 32 adjacent RoPE pairs.
-    for (int pairIdx = threadIdx.x; pairIdx < kRopeDim / 2; pairIdx += blockDim.x)
+    for (int pairIdx = threadIdx.x; pairIdx < kRopeDim / 2; pairIdx += kGenerationAttentionThreads)
     {
         // Adjacent RoPE scalar pair within the 64-dim suffix.
         int const dim = 2 * pairIdx;
@@ -1591,7 +1682,7 @@ __device__ __forceinline__ void rotateGenerationQPeHead(__nv_bfloat16* fusedQ, _
 // Append the current decode/MTP token's shared latent KV row to the paged KV cache.
 //
 // Inputs:
-// - latentCache: BF16 [numTokens, kHeadDim]. Dims [0, 512) are latent KV/V; dims [512, 576) are K RoPE.
+// - latentCache: mutable BF16 [numTokens, kHeadDim]. Dims [0, 512) are latent KV/V; dims [512, 576) are K RoPE.
 // - rotaryCosSin: FP32 float2 RoPE table indexed by absolute KV position.
 // - kvCache: paged TRT-LLM KV cache view with one MLA KV head.
 // - quantScale: float, original-domain to FP8 scale.
@@ -1601,13 +1692,14 @@ __device__ __forceinline__ void rotateGenerationQPeHead(__nv_bfloat16* fusedQ, _
 //
 // Side effects:
 // - Writes one FP8 row into kvCache for request 0 at tokenIdxInKvCache.
-__device__ __forceinline__ void appendGenerationKvCache(__nv_bfloat16 const* latentCache, float2 const* rotaryCosSin,
+// - Replaces latentCache[token, 512:576] with the rotated K RoPE suffix.
+__device__ __forceinline__ void appendGenerationKvCache(__nv_bfloat16* latentCache, float2 const* rotaryCosSin,
     tensorrt_llm::kernels::KVBlockArray kvCache, float quantScale, int tokenIdx, int tokenIdxInKvCache)
 {
     // Resolve the physical page that contains this token's single MLA KV head.
     auto* blockPtr = kvCache.getKBlockPtr(/*seqIdx=*/0, tokenIdxInKvCache);
     // Copy and quantize latent KV/V prefix [0, 512).
-    for (int dim = threadIdx.x; dim < kKvLoraRank; dim += blockDim.x)
+    for (int dim = threadIdx.x; dim < kKvLoraRank; dim += kGenerationAttentionThreads)
     {
         // Scalar offset inside the resolved physical KV page.
         int const cacheOffset = kvCache.getKVLocalIdx(tokenIdxInKvCache, /*headIdx=*/0, kHeadDim, dim);
@@ -1617,7 +1709,7 @@ __device__ __forceinline__ void appendGenerationKvCache(__nv_bfloat16 const* lat
     }
 
     // Rotate and quantize the shared K RoPE suffix [512, 576).
-    for (int pairIdx = threadIdx.x; pairIdx < kRopeDim / 2; pairIdx += blockDim.x)
+    for (int pairIdx = threadIdx.x; pairIdx < kRopeDim / 2; pairIdx += kGenerationAttentionThreads)
     {
         // Adjacent scalar pair within the K RoPE suffix.
         int const dim = 2 * pairIdx;
@@ -1641,6 +1733,9 @@ __device__ __forceinline__ void appendGenerationKvCache(__nv_bfloat16 const* lat
         reinterpret_cast<__nv_fp8_e4m3*>(blockPtr)[cacheOffset] = __nv_fp8_e4m3(toFloat(first) * quantScale);
         // Store second rotated K suffix component as FP8.
         reinterpret_cast<__nv_fp8_e4m3*>(blockPtr)[cacheOffset + 1] = __nv_fp8_e4m3(toFloat(second) * quantScale);
+        // Match MLA RoPE append semantics: chunked prefill can reuse the latent-cache K suffix without reloading KV.
+        latentCache[latentOffset] = first;
+        latentCache[latentOffset + 1] = second;
     }
 }
 
@@ -1658,7 +1753,7 @@ __device__ __forceinline__ void appendGenerationKvCache(__nv_bfloat16 const* lat
 // - fusedQ: mutable BF16 [numTokens, kLocalHeads, kHeadDim]. Dims [0, kKvLoraRank) already contain the
 //   absorbed q_nope projection. The Q branch fills dims [kKvLoraRank, kHeadDim) with rotated Q RoPE.
 // - latentCache: BF16 [numTokens, kHeadDim]. Dims [0, kKvLoraRank) are compressed latent KV/V values.
-//   Dims [kKvLoraRank, kHeadDim) are the unrotated shared K RoPE suffix. This tensor is read only.
+//   Dims [kKvLoraRank, kHeadDim) are the unrotated shared K RoPE suffix and are updated with rotated K.
 // - qPe: BF16 [numTokens, kLocalHeads, kRopeDim]. Unrotated per-head Q RoPE values.
 // - rotaryCosSin: FP32 float2 RoPE table. It is indexed by the absolute KV position, so cached prefixes use
 //   the same rotary phase as TRT-LLM's paged attention path.
@@ -1672,6 +1767,7 @@ __device__ __forceinline__ void appendGenerationKvCache(__nv_bfloat16 const* lat
 // Side effects:
 // - Q branch mutates fusedQ[token, head, kKvLoraRank:kHeadDim].
 // - KV branch writes latentCache[token, :] to kvCache with a rotated K RoPE suffix.
+// - KV branch replaces latentCache[token, 512:576] with the rotated K RoPE suffix.
 // - The function does not produce a returned tensor; contextAttentionKernel consumes fusedQ and kvCachePool later.
 template <bool kFp8KvCache>
 __global__ void preprocessContextKernel(__nv_bfloat16* fusedQ, __nv_bfloat16* latentCache, __nv_bfloat16 const* qPe,
@@ -1744,7 +1840,6 @@ __global__ void preprocessContextKernel(__nv_bfloat16* fusedQ, __nv_bfloat16* la
     }
 
     // KV branch: one block per token writes the complete [latent KV/V, K RoPE] row into TRT-LLM's paged KV cache.
-    // Match the trusted MLA context path by leaving latentCache itself unchanged; only the cache receives rotated K.
     // Resolve the base pointer for the physical KV-cache page containing tokenIdxInKvCache for request 0.
     auto* blockPtr = kvCache.getKBlockPtr(/*seqIdx=*/0, tokenIdxInKvCache);
     // Copy and quantize the latent [0, 512) value prefix. These dims are both latent K content and V content.
@@ -1794,6 +1889,9 @@ __global__ void preprocessContextKernel(__nv_bfloat16* fusedQ, __nv_bfloat16* la
         __nv_bfloat16 const first = toBfloat16(rotated.x);
         // Round the second rotated scalar to BF16 before optional FP8 quantization.
         __nv_bfloat16 const second = toBfloat16(rotated.y);
+        // Mirror the baseline MLA append side effect for chunked prefill users of latent_cache.
+        latentCache[latentOffset] = first;
+        latentCache[latentOffset + 1] = second;
         // Mirror the rotated K suffix into the paged KV cache for later decode.
         if constexpr (kFp8KvCache)
         {
@@ -2033,8 +2131,9 @@ __global__ void contextAttentionKernel(__nv_bfloat16 const* fusedQ, __nv_fp8_e4m
 // [token, sparse top-k split]. For the GLM-5 topK=2048 path, kSparseSplitSize=64 gives 32 CTAs per token, matching
 // TileRT's documented CTAID layout. The launch starts by using the split CTAs to apply RoPE, quantize Q, and append
 // the current KV rows. During attention math, consumer warps 0..7 map one warp to one local MLA head and
-// producer/control warps 8..11 stay alive as the reserved TileRT-style group. After all split CTAs finish, the same
-// launch grid-syncs and the first eight split CTAs for each token combine one local-head output each.
+// the current optimized launch omits the idle producer/control warps until the WIP kernel has TMA prefetch work for
+// them. After all split CTAs finish, the same launch grid-syncs and the first eight split CTAs for each token combine
+// one local-head output each.
 //
 // Inputs:
 // - fusedQ: mutable BF16 [numTokens, kLocalHeads, kHeadDim]. The kernel writes dims [0, kKvLoraRank) with
@@ -2042,8 +2141,8 @@ __global__ void contextAttentionKernel(__nv_bfloat16 const* fusedQ, __nv_fp8_e4m
 // - qNope: BF16 [numTokens, kLocalHeads, kQkNopeHeadDim]. Unabsorbed query prefix from q_a/q_b projection.
 // - kBProjTrans: BF16 [kLocalHeads, kKvLoraRank, kQkNopeHeadDim]. Per-head absorbed-K projection weight.
 // - qPe: BF16 [numTokens, kLocalHeads, kRopeDim]. Unrotated per-head Q RoPE suffix.
-// - latentCache: BF16 [numTokens, kHeadDim]. Dims [0, kKvLoraRank) are latent KV/V; dims [kKvLoraRank, kHeadDim)
-//   are unrotated shared K RoPE.
+// - latentCache: mutable BF16 [numTokens, kHeadDim]. Dims [0, kKvLoraRank) are latent KV/V; dims
+//   [kKvLoraRank, kHeadDim) are unrotated shared K RoPE on entry and rotated K on exit.
 // - rotaryCosSin: FP32 float2 RoPE table indexed as [position, rope_pair].
 // - kvCache: paged TRT-LLM KV cache view. The kernel writes the current decode/MTP group into sequence 0 before
 //   attention reads those rows through kvCachePool.
@@ -2053,7 +2152,7 @@ __global__ void contextAttentionKernel(__nv_bfloat16 const* fusedQ, __nv_fp8_e4m
 // - topkIndicesPool: INT32 [numTokens, topK]. Global row indices into kvCachePool produced from local top-k.
 // - topkIndicesLocal: INT32 [numTokens, topK]. Local sequence positions for MTP visibility checks.
 // - sequenceLength: INT32 [1]. Total KV length after the current decode/MTP group has been appended.
-// - specDecodingPackedMask/specMaskWords: accepted for signature parity; ignored to match TRTLLM-Gen MLA.
+// - specDecodingPackedMask/specMaskWords: accepted for signature parity; ignored to match GLM-5 WIP MLA generation.
 // - bmm1Scale: optional FP32 [2]. The append phase writes natural-log and log2-space QK score scales.
 // - bmm2Scale: optional FP32 [1]. The append phase writes the dequantization scale for FP8 V values.
 // - kvScaleOrigQuant: optional FP32 [1]. Original-domain to FP8 scale for Q and appended KV.
@@ -2079,34 +2178,30 @@ __global__ void contextAttentionKernel(__nv_bfloat16 const* fusedQ, __nv_fp8_e4m
 //   splitOutput, syncScratch, optional qBProjScratch, and output.
 // - Uses dynamic shared memory [kLocalHeads, kSparseSplitSize] floats for per-head split scores/probabilities.
 __global__ void generationAttentionCombinedKernel(__nv_bfloat16* fusedQ, __nv_bfloat16 const* qNope,
-    __nv_bfloat16 const* kBProjTrans, __nv_bfloat16 const* qPe, __nv_bfloat16 const* latentCache,
-    float2 const* rotaryCosSin, tensorrt_llm::kernels::KVBlockArray kvCache, __nv_fp8_e4m3* quantQ,
-    __nv_fp8_e4m3 const* kvCachePool, int32_t const* topkIndicesPool, int32_t const* topkIndicesLocal,
-    int32_t const* sequenceLength, int32_t const* specDecodingPackedMask, int specMaskWords, float* splitLse,
-    float* splitOutput, int32_t* syncScratch, __nv_bfloat16* output, float* bmm1Scale, float* bmm2Scale,
-    float const* kvScaleOrigQuant, float const* kvScaleQuantOrig, __nv_bfloat16* qBProjScratch,
-    __nv_bfloat16 const* qBProjInput, __nv_fp8_e4m3 const* qBProjWeight, int32_t const* qBProjWeightScalePacked,
-    float const* qBProjWeightScaleFp32, int64_t qNopeStrideToken, int64_t qNopeStrideHead, int64_t kBProjStrideHead,
-    int64_t kBProjStrideDim, int64_t kBProjStrideReduction, int64_t qPeStrideToken, int64_t qPeStrideHead,
-    int64_t qBProjStrideToken, int64_t qBProjStrideDim, int64_t qBProjWeightStrideRow, int64_t qBProjWeightStrideDim,
-    int64_t qBProjScaleStrideRow, int64_t qBProjScaleStridePack, int64_t qBProjScratchStrideToken,
-    int64_t qBProjScratchStrideDim, int numTokens, int topK, int numSplits, int expectedCtas, float hostScoreScale,
-    bool isContext, int contextChunkStart)
+    __nv_bfloat16 const* kBProjTrans, __nv_bfloat16 const* qPe, __nv_bfloat16* latentCache, float2 const* rotaryCosSin,
+    tensorrt_llm::kernels::KVBlockArray kvCache, __nv_fp8_e4m3* quantQ, __nv_fp8_e4m3 const* kvCachePool,
+    int32_t const* topkIndicesPool, int32_t const* topkIndicesLocal, int32_t const* sequenceLength,
+    int32_t const* specDecodingPackedMask, int specMaskWords, float* splitLse, float* splitOutput, int32_t* syncScratch,
+    __nv_bfloat16* output, float* bmm1Scale, float* bmm2Scale, float const* kvScaleOrigQuant,
+    float const* kvScaleQuantOrig, __nv_bfloat16* qBProjScratch, __nv_bfloat16 const* qBProjInput,
+    __nv_fp8_e4m3 const* qBProjWeight, int32_t const* qBProjWeightScalePacked, float const* qBProjWeightScaleFp32,
+    int64_t qNopeStrideToken, int64_t qNopeStrideHead, int64_t kBProjStrideHead, int64_t kBProjStrideDim,
+    int64_t kBProjStrideReduction, int64_t qPeStrideToken, int64_t qPeStrideHead, int64_t qBProjStrideToken,
+    int64_t qBProjStrideDim, int64_t qBProjWeightStrideRow, int64_t qBProjWeightStrideDim, int64_t qBProjScaleStrideRow,
+    int64_t qBProjScaleStridePack, int64_t qBProjScratchStrideToken, int64_t qBProjScratchStrideDim, int numTokens,
+    int topK, int numSplits, int expectedCtas, float hostScoreScale, bool isContext, int contextChunkStart)
 {
     // Dynamic shared memory is reused by the q_b projection phase and the later attention score phase. Declare it
     // as 16-byte-aligned bytes so it can hold either uint32 scale bytes or FP32 split scores.
     extern __shared__ __align__(16) uint8_t dynamicShared[];
     float* splitScores = reinterpret_cast<float*>(dynamicShared);
-    // The baseline TRTLLM-Gen MLA path ignores the packed speculative mask. Keep these parameters only so the WIP op
-    // can preserve its Python signature while using the same causal current-group visibility as the backend.
     (void) specDecodingPackedMask;
     (void) specMaskWords;
-
     // blockIdx.x is a linearized [token, split] coordinate: token is the high component, split is the low one.
     int const tokenIdx = static_cast<int>(blockIdx.x) / numSplits;
     // Split id in [0, numSplits). For topK=2048 and split size 64 this is [0, 32).
     int const splitIdx = static_cast<int>(blockIdx.x) - tokenIdx * numSplits;
-    // Thread id inside the 384-thread CTA.
+    // Thread id inside the generation CTA.
     int const tid = threadIdx.x;
     // Warp id inside the CTA. Warps 0..7 are consumer warps, matching the 256-thread consumer group in TileRT.
     int const warpIdx = tid / 32;
@@ -2115,6 +2210,8 @@ __global__ void generationAttentionCombinedKernel(__nv_bfloat16* fusedQ, __nv_bf
 
     // The group start is shared by all warps in this CTA. It is derived once by thread 0.
     __shared__ int currentGroupStartShared;
+    __shared__ float scoreScaleLog2Shared;
+    __shared__ float outputScaleShared;
     if (tid == 0)
     {
         // Normally: post-append length minus number of just-appended decode tokens.
@@ -2140,31 +2237,35 @@ __global__ void generationAttentionCombinedKernel(__nv_bfloat16* fusedQ, __nv_bf
         }
         // Publish the group start to every warp.
         currentGroupStartShared = currentGroupStart;
-    }
-    // All 12 warps must observe currentGroupStartShared before consumer warps start validity checks.
-    __syncthreads();
 
-    // Defensive guard for padded launches. Current dispatch uses an exact grid.
-    if (tokenIdx >= numTokens || splitIdx >= numSplits)
-    {
-        return;
-    }
-
-    // Publish FP8 dequant scales once before any CTA can enter attention.
-    if (tokenIdx == 0 && splitIdx == 0 && tid == 0)
-    {
         // FP8 to original-domain dequant scale used by BMM1 and BMM2.
         float const dequantScale = kvScaleQuantOrig == nullptr ? 1.0F : kvScaleQuantOrig[0];
         // TRTLLM-Gen softmax uses exp2f, so keep both natural-log and log2-space score scales.
         constexpr float kLog2e = 1.4426950408889634074F;
         // BMM1 scale is dequant_q * dequant_k * attention_scale.
         float const bmm1ScaleValue = dequantScale * dequantScale * hostScoreScale;
-        // Natural-log score scale.
-        bmm1Scale[0] = bmm1ScaleValue;
-        // Log2-space score scale consumed by the generation split-attention phase below.
-        bmm1Scale[1] = bmm1ScaleValue * kLog2e;
-        // BMM2 dequantizes FP8 V. The generic op multiplies by out_scale when provided; WIP passes no out_scale.
-        bmm2Scale[0] = dequantScale;
+        // Cache the values consumed by this custom attention kernel in CTA-local shared memory. The scale tensors are
+        // still written by CTA 0 below for side-effect parity with the reference MLA path.
+        scoreScaleLog2Shared = bmm1ScaleValue * kLog2e;
+        outputScaleShared = dequantScale;
+
+        if (tokenIdx == 0 && splitIdx == 0)
+        {
+            // Natural-log score scale.
+            bmm1Scale[0] = bmm1ScaleValue;
+            // Log2-space score scale consumed by generation split attention.
+            bmm1Scale[1] = scoreScaleLog2Shared;
+            // BMM2 dequantizes FP8 V. The generic op multiplies by out_scale when provided; WIP passes no out_scale.
+            bmm2Scale[0] = dequantScale;
+        }
+    }
+    // All 12 warps must observe CTA-local metadata before consumer warps start validity checks.
+    __syncthreads();
+
+    // Defensive guard for padded launches. Current dispatch uses an exact grid.
+    if (tokenIdx >= numTokens || splitIdx >= numSplits)
+    {
+        return;
     }
 
     // The current group's first absolute KV position. This uses the same fallback as the visibility logic so CUDA
@@ -2198,7 +2299,7 @@ __global__ void generationAttentionCombinedKernel(__nv_bfloat16* fusedQ, __nv_bf
                 splitScores);
         }
         // The setup phase below consumes q_nope/q_pe from qBProjScratch, so all 32 q_b tiles must finish first.
-        generationGridBarrier(syncScratch, expectedCtas);
+        generationGridBarrier(syncScratch, expectedCtas, true);
     }
 
     // q_b-fused mode reads q_nope and q_pe from the internal [token, head, 256] scratch. Legacy mode keeps reading
@@ -2256,7 +2357,9 @@ __global__ void generationAttentionCombinedKernel(__nv_bfloat16* fusedQ, __nv_bf
     }
 
     // Wait until Q quantization, bmm scale publication, and paged KV appends are visible to every split CTA.
-    generationGridBarrier(syncScratch + 2, expectedCtas);
+    bool const setupWritesGlobal
+        = useParallelSetup ? splitIdx < 2 * kLocalHeads + 1 : (splitIdx < kLocalHeads || splitIdx == 0);
+    generationGridBarrier(syncScratch + 2, expectedCtas, setupWritesGlobal);
 
     // Stage the sparse KV row offsets once per [token, split] CTA. The selected rows and visibility do not depend
     // on attention head or V dimension, so this removes redundant top-k loads and visibility checks from the QK/AV
@@ -2274,20 +2377,41 @@ __global__ void generationAttentionCombinedKernel(__nv_bfloat16* fusedQ, __nv_bf
     }
     __syncthreads();
 
-    // Threads 256..383 correspond to TileRT's producer/control group. This WIP version does not issue TMA gather
-    // from them yet; they skip split math but stay alive so the CTA reaches the common grid barrier safely.
-    if (tid < kTileRtConsumerThreads)
+    // The WIP launch currently contains only TileRT's 256-thread consumer group, so every launched thread
+    // participates in split math. If producer/control warps are added later for TMA gather work, restore a guard here
+    // so they stay outside this block and still reach the grid barriers.
     {
         // Each of the 8 consumer warps owns one local attention head.
         int const headIdx = warpIdx;
         // Each head gets 64 score/probability slots inside dynamic shared memory.
         float* headScores = splitScores + headIdx * kSparseSplitSize;
-        // bmm1Scale[1] is already in log2 space. exp2f below therefore matches the existing generation path.
-        float const scoreScaleLog2 = bmm1Scale == nullptr ? 1.4426950408889634F : bmm1Scale[1];
-        // Full FP8 query vector for this token/head.
-        __nv_fp8_e4m3 const* qPtr = quantQ + (tokenIdx * kLocalHeads + headIdx) * kHeadDim;
+        // Log2-space score scale. exp2f below therefore matches the existing generation path.
+        float const scoreScaleLog2 = scoreScaleLog2Shared;
         // Track the largest log2 score inside this 64-key split.
         float maxScore = -INFINITY;
+
+        // Full FP8 query vector for this token/head.
+        __nv_fp8_e4m3 const* qPtr = quantQ + (tokenIdx * kLocalHeads + headIdx) * kHeadDim;
+        // Each lane owns 18 elements of the 576-wide query. Convert them once and reuse across all 64 sparse
+        // candidates in this split.
+        float const qValue0 = toFloat(qPtr[laneIdx]);
+        float const qValue1 = toFloat(qPtr[laneIdx + 32]);
+        float const qValue2 = toFloat(qPtr[laneIdx + 64]);
+        float const qValue3 = toFloat(qPtr[laneIdx + 96]);
+        float const qValue4 = toFloat(qPtr[laneIdx + 128]);
+        float const qValue5 = toFloat(qPtr[laneIdx + 160]);
+        float const qValue6 = toFloat(qPtr[laneIdx + 192]);
+        float const qValue7 = toFloat(qPtr[laneIdx + 224]);
+        float const qValue8 = toFloat(qPtr[laneIdx + 256]);
+        float const qValue9 = toFloat(qPtr[laneIdx + 288]);
+        float const qValue10 = toFloat(qPtr[laneIdx + 320]);
+        float const qValue11 = toFloat(qPtr[laneIdx + 352]);
+        float const qValue12 = toFloat(qPtr[laneIdx + 384]);
+        float const qValue13 = toFloat(qPtr[laneIdx + 416]);
+        float const qValue14 = toFloat(qPtr[laneIdx + 448]);
+        float const qValue15 = toFloat(qPtr[laneIdx + 480]);
+        float const qValue16 = toFloat(qPtr[laneIdx + 512]);
+        float const qValue17 = toFloat(qPtr[laneIdx + 544]);
 
         // QK pass: one consumer warp computes all candidate scores for its head over this 64-key split.
         for (int splitOffset = 0; splitOffset < kSparseSplitSize; ++splitOffset)
@@ -2295,19 +2419,31 @@ __global__ void generationAttentionCombinedKernel(__nv_bfloat16* fusedQ, __nv_bf
             // Candidate must have a real pool row and be visible to this query token.
             int64_t const kvBaseOffset = validKvBaseOffsets[splitOffset];
             bool const validKv = kvBaseOffset >= 0;
+            int64_t const kvLoadBaseOffset = validKv ? kvBaseOffset : 0;
             // Each lane accumulates a strided slice of the 576-dim QK dot product.
             float partial = 0.0F;
-            if (validKv)
-            {
-                // Pointer to the selected FP8 latent KV row.
-                __nv_fp8_e4m3 const* kvPtr = kvCachePool + kvBaseOffset;
-                // Stride the warp lanes over [0, 576).
-                for (int dim = laneIdx; dim < kHeadDim; dim += 32)
-                {
-                    // Accumulate q_fp8[dim] * k_fp8[dim] in FP32.
-                    partial += toFloat(qPtr[dim]) * toFloat(kvPtr[dim]);
-                }
-            }
+            // Pointer to the selected FP8 latent KV row. Invalid candidates load row 0; their score is still
+            // forced to -inf below, so their softmax contribution remains zero.
+            __nv_fp8_e4m3 const* kvPtr = kvCachePool + kvLoadBaseOffset;
+            // Accumulate q_fp8[dim] * k_fp8[dim] in FP32, preserving the original lane-local dim order.
+            partial += qValue0 * toFloat(kvPtr[laneIdx]);
+            partial += qValue1 * toFloat(kvPtr[laneIdx + 32]);
+            partial += qValue2 * toFloat(kvPtr[laneIdx + 64]);
+            partial += qValue3 * toFloat(kvPtr[laneIdx + 96]);
+            partial += qValue4 * toFloat(kvPtr[laneIdx + 128]);
+            partial += qValue5 * toFloat(kvPtr[laneIdx + 160]);
+            partial += qValue6 * toFloat(kvPtr[laneIdx + 192]);
+            partial += qValue7 * toFloat(kvPtr[laneIdx + 224]);
+            partial += qValue8 * toFloat(kvPtr[laneIdx + 256]);
+            partial += qValue9 * toFloat(kvPtr[laneIdx + 288]);
+            partial += qValue10 * toFloat(kvPtr[laneIdx + 320]);
+            partial += qValue11 * toFloat(kvPtr[laneIdx + 352]);
+            partial += qValue12 * toFloat(kvPtr[laneIdx + 384]);
+            partial += qValue13 * toFloat(kvPtr[laneIdx + 416]);
+            partial += qValue14 * toFloat(kvPtr[laneIdx + 448]);
+            partial += qValue15 * toFloat(kvPtr[laneIdx + 480]);
+            partial += qValue16 * toFloat(kvPtr[laneIdx + 512]);
+            partial += qValue17 * toFloat(kvPtr[laneIdx + 544]);
             // Warp-local reduction produces the dot product in lane 0.
             float const dot = warpReduceSum(partial);
             if (laneIdx == 0)
@@ -2320,9 +2456,6 @@ __global__ void generationAttentionCombinedKernel(__nv_bfloat16* fusedQ, __nv_bf
                 maxScore = fmaxf(maxScore, score);
             }
         }
-        // Make lane-0 score writes visible to the other lanes in this head warp.
-        __syncwarp();
-
         // Lane 0 computes split-local denominator, normalizes probabilities, and publishes this split's LSE.
         if (laneIdx == 0)
         {
@@ -2364,32 +2497,55 @@ __global__ void generationAttentionCombinedKernel(__nv_bfloat16* fusedQ, __nv_bf
         // Make normalized probabilities visible to every lane in this head warp.
         __syncwarp();
 
-        // AV pass: write split-local normalized latent output in raw FP8-cache units.
-        for (int dim = laneIdx; dim < kKvLoraRank; dim += 32)
+        // AV pass: write split-local normalized latent output in raw FP8-cache units. Each lane owns eight latent
+        // dimensions; group them so one probability load feeds eight independent accumulators.
+        constexpr int kAvDimsPerLaneGroup = 8;
+        static_assert(kKvLoraRank % (32 * kAvDimsPerLaneGroup) == 0);
+        for (int dimBase = laneIdx; dimBase < kKvLoraRank; dimBase += 32 * kAvDimsPerLaneGroup)
         {
-            // Accumulator for one latent V dimension for this [token, head, split].
-            float acc = 0.0F;
+            float acc0 = 0.0F;
+            float acc1 = 0.0F;
+            float acc2 = 0.0F;
+            float acc3 = 0.0F;
+            float acc4 = 0.0F;
+            float acc5 = 0.0F;
+            float acc6 = 0.0F;
+            float acc7 = 0.0F;
             // Sum split-local probability times selected latent V value.
             for (int splitOffset = 0; splitOffset < kSparseSplitSize; ++splitOffset)
             {
                 // Reuse the exact same visible KV row selected for the QK pass.
                 int64_t const kvBaseOffset = validKvBaseOffsets[splitOffset];
-                if (kvBaseOffset >= 0)
-                {
-                    // Flattened [pool row, latent dim] address. Only dims [0, 512) are latent V.
-                    int64_t const kvOffset = kvBaseOffset + dim;
-                    // Accumulate split-softmax probability times raw FP8-cache V value.
-                    acc += headScores[splitOffset] * toFloat(kvCachePool[kvOffset]);
-                }
+                int64_t const kvLoadBaseOffset = kvBaseOffset >= 0 ? kvBaseOffset : 0;
+                float const probability = headScores[splitOffset];
+                // Accumulate split-softmax probability times raw FP8-cache V value. Invalid candidates have zero
+                // probability, so their row-0 loads add exact zero contributions.
+                acc0 += probability * toFloat(kvCachePool[kvLoadBaseOffset + dimBase]);
+                acc1 += probability * toFloat(kvCachePool[kvLoadBaseOffset + dimBase + 32]);
+                acc2 += probability * toFloat(kvCachePool[kvLoadBaseOffset + dimBase + 64]);
+                acc3 += probability * toFloat(kvCachePool[kvLoadBaseOffset + dimBase + 96]);
+                acc4 += probability * toFloat(kvCachePool[kvLoadBaseOffset + dimBase + 128]);
+                acc5 += probability * toFloat(kvCachePool[kvLoadBaseOffset + dimBase + 160]);
+                acc6 += probability * toFloat(kvCachePool[kvLoadBaseOffset + dimBase + 192]);
+                acc7 += probability * toFloat(kvCachePool[kvLoadBaseOffset + dimBase + 224]);
             }
             // Store FP32 partial output for the combine phase. Layout is [token, head, split, dim].
-            splitOutput[((tokenIdx * kLocalHeads + headIdx) * numSplits + splitIdx) * kKvLoraRank + dim] = acc;
+            int64_t const splitOutputBase
+                = ((tokenIdx * kLocalHeads + headIdx) * numSplits + splitIdx) * kKvLoraRank + dimBase;
+            splitOutput[splitOutputBase] = acc0;
+            splitOutput[splitOutputBase + 32] = acc1;
+            splitOutput[splitOutputBase + 64] = acc2;
+            splitOutput[splitOutputBase + 96] = acc3;
+            splitOutput[splitOutputBase + 128] = acc4;
+            splitOutput[splitOutputBase + 160] = acc5;
+            splitOutput[splitOutputBase + 192] = acc6;
+            splitOutput[splitOutputBase + 224] = acc7;
         }
     }
 
     // Wait until every split CTA has published splitLse and splitOutput. Use a second independent one-shot barrier
     // because the append-phase barrier's release flag remains set for the rest of this kernel launch.
-    generationGridBarrier(syncScratch + 4, expectedCtas);
+    generationGridBarrier(syncScratch + 4, expectedCtas, true);
 
     // Reuse the split CTAs for each token as combine collectors. With the target topK=2048 case there are 32 split
     // CTAs per token, so the first eight CTAs collect one local head each. Small-topK tests may have fewer than eight
@@ -2434,36 +2590,65 @@ __global__ void generationAttentionCombinedKernel(__nv_bfloat16* fusedQ, __nv_bf
             // Ensure every thread in the collector CTA sees globalLseShared.
             __syncthreads();
 
-            // bmm2Scale[0] dequantizes FP8 V/cache values before storing BF16 latent output.
-            float const outputScale = bmm2Scale == nullptr ? 1.0F : bmm2Scale[0];
+            // Dequantizes FP8 V/cache values before storing BF16 latent output.
+            float const outputScale = outputScaleShared;
             // Read global log2 LSE into a register.
             float const globalLse = globalLseShared;
-
-            // Each collector CTA writes the 512 latent V dimensions for one [token, head].
-            for (int dim = tid; dim < kKvLoraRank; dim += blockDim.x)
+            // Reuse the dynamic split-score scratch as one cached combine weight per split for this head.
+            float* splitWeights = splitScores;
+            for (int combineSplitIdx = tid; combineSplitIdx < numSplits; combineSplitIdx += kGenerationAttentionThreads)
             {
+                float const lse = splitLse[(tokenIdx * kLocalHeads + headIdx) * numSplits + combineSplitIdx];
+                splitWeights[combineSplitIdx] = lse == -INFINITY ? 0.0F : exp2f(lse - globalLse);
+            }
+            __syncthreads();
+
+            // Each collector CTA writes the 512 latent V dimensions for one [token, head]. Group dimensions so a
+            // single split-weight load feeds four independent accumulators while preserving split order per output.
+            constexpr int kCombineDimsPerThread = 4;
+            static_assert(kKvLoraRank % kCombineDimsPerThread == 0);
+            if (tid < kKvLoraRank / kCombineDimsPerThread)
+            {
+                int const dim0 = tid;
+                int const dim1 = tid + kKvLoraRank / kCombineDimsPerThread;
+                int const dim2 = tid + 2 * (kKvLoraRank / kCombineDimsPerThread);
+                int const dim3 = tid + 3 * (kKvLoraRank / kCombineDimsPerThread);
                 // Accumulator in raw FP8-cache units before applying outputScale.
-                float acc = 0.0F;
-                if (globalLse != -INFINITY)
+                float acc0 = 0.0F;
+                float acc1 = 0.0F;
+                float acc2 = 0.0F;
+                float acc3 = 0.0F;
+                int64_t const splitOutputBase = (tokenIdx * kLocalHeads + headIdx) * numSplits * kKvLoraRank;
+                float const* splitOutputPtr0 = splitOutput + splitOutputBase + dim0;
+                float const* splitOutputPtr1 = splitOutput + splitOutputBase + dim1;
+                float const* splitOutputPtr2 = splitOutput + splitOutputBase + dim2;
+                float const* splitOutputPtr3 = splitOutput + splitOutputBase + dim3;
+                // Combine all split-local normalized outputs using exp(lse_s - global_lse).
+                for (int combineSplitIdx = 0; combineSplitIdx < numSplits; ++combineSplitIdx)
                 {
-                    // Combine all split-local normalized outputs using exp(lse_s - global_lse).
-                    for (int combineSplitIdx = 0; combineSplitIdx < numSplits; ++combineSplitIdx)
-                    {
-                        // Load split LSE in log2 space.
-                        float const lse = splitLse[(tokenIdx * kLocalHeads + headIdx) * numSplits + combineSplitIdx];
-                        // Empty splits have zero combine weight.
-                        float const splitWeight = lse == -INFINITY ? 0.0F : exp2f(lse - globalLse);
-                        // Load split-local normalized latent output.
-                        float const splitValue
-                            = splitOutput[((tokenIdx * kLocalHeads + headIdx) * numSplits + combineSplitIdx)
-                                    * kKvLoraRank
-                                + dim];
-                        // Add this split's contribution to the global softmax output.
-                        acc += splitWeight * splitValue;
-                    }
+                    // Empty splits have zero combine weight.
+                    float const splitWeight = splitWeights[combineSplitIdx];
+                    // Load split-local normalized latent output.
+                    float const splitValue0 = *splitOutputPtr0;
+                    float const splitValue1 = *splitOutputPtr1;
+                    float const splitValue2 = *splitOutputPtr2;
+                    float const splitValue3 = *splitOutputPtr3;
+                    // Add this split's contribution to the global softmax output.
+                    acc0 += splitWeight * splitValue0;
+                    acc1 += splitWeight * splitValue1;
+                    acc2 += splitWeight * splitValue2;
+                    acc3 += splitWeight * splitValue3;
+                    splitOutputPtr0 += kKvLoraRank;
+                    splitOutputPtr1 += kKvLoraRank;
+                    splitOutputPtr2 += kKvLoraRank;
+                    splitOutputPtr3 += kKvLoraRank;
                 }
                 // Dequantize the FP8 V sum to original units and round to BF16 output.
-                output[(tokenIdx * kLocalHeads + headIdx) * kKvLoraRank + dim] = toBfloat16(acc * outputScale);
+                int64_t const outputBase = (tokenIdx * kLocalHeads + headIdx) * kKvLoraRank;
+                output[outputBase + dim0] = toBfloat16(acc0 * outputScale);
+                output[outputBase + dim1] = toBfloat16(acc1 * outputScale);
+                output[outputBase + dim2] = toBfloat16(acc2 * outputScale);
+                output[outputBase + dim3] = toBfloat16(acc3 * outputScale);
             }
             // Do not let thread 0 overwrite globalLseShared for the next head before every thread finishes this head.
             __syncthreads();
@@ -2482,9 +2667,9 @@ namespace dsv3_fused_mla
 // - fused_q: BF16 [numTokens, 8, 576]. On entry, dims [0, 512) contain the absorbed q_nope projection.
 //   This function fills dims [512, 576) with rotated Q RoPE values before attention.
 // - q_pe: BF16 [numTokens, 8, 64]. Unrotated per-head Q RoPE values.
-// - latent_cache: BF16 [numTokens, 576]. Dims [0, 512) are compressed latent KV/V values; dims [512, 576)
-//   are unrotated shared K RoPE values. This tensor is left unchanged; preprocessing writes rotated K to
-//   the paged cache and to a temporary FP8 current-context KV tensor.
+// - latent_cache: mutable BF16 [numTokens, 576]. Dims [0, 512) are compressed latent KV/V values; dims [512, 576)
+//   are unrotated shared K RoPE values on entry. Preprocessing writes rotated K to the paged cache and replaces the
+//   suffix with rotated K for chunked-prefill parity.
 // - topk_indices_pool: INT32 [numTokens, topK]. Global row indices into kv_cache_pool. This is kept in the
 //   op signature for parity with generation and for shape checks; context attention gathers from topk_indices_local.
 // - topk_indices_local: INT32 [numTokens, topK]. Local current-context sparse attention row indices.
@@ -2508,6 +2693,7 @@ namespace dsv3_fused_mla
 //
 // Side effects:
 // - Mutates fused_q by writing rotated Q RoPE suffix.
+// - Mutates latent_cache by replacing the shared K RoPE suffix with rotated K.
 // - Mutates kv_cache by appending/writing the context latent KV rows with rotated K RoPE.
 //
 // Output:
@@ -2639,7 +2825,8 @@ torch::Tensor dsv3_fused_mla_q_b_proj_cuda(torch::Tensor q_b_proj_input, torch::
     qBProjProjectionKernel<<<qBProjGrid, qBProjBlockSize, qBProjSharedBytes, stream>>>(qBProjOutputPtr, qBProjInputPtr,
         qBProjWeightPtr, qBProjWeightScalePackedPtr, qBProjWeightScaleFp32Ptr, qBProjStrideToken, qBProjStrideDim,
         qBProjWeightStrideRow, qBProjWeightStrideDim, qBProjScaleStrideRow, qBProjScaleStridePack,
-        qBProjOutputStrideToken, qBProjOutputStrideDim, numTokens, numSplits, qBProjImpl);
+        qBProjOutputStrideToken, qBProjOutputStrideDim, numTokens, numSplits, qBProjImpl, nullptr, nullptr, 0, 0, 0.0F,
+        false);
 
     sync_check_cuda_error(stream);
     return output;
@@ -2666,8 +2853,8 @@ torch::Tensor dsv3_fused_mla_q_b_proj_cuda(torch::Tensor q_b_proj_input, torch::
 // - mla_bmm2_scale: FP32 [1], FP8 V dequantization scale.
 // - kv_scale_orig_quant: optional FP32 [1], original-domain to FP8 scale.
 // - kv_scale_quant_orig: optional FP32 [1], FP8 to original-domain scale.
-// - spec_decoding_packed_mask: optional INT32 [maxRequests, numTokens, packedWords], accepted for call-site
-//   compatibility but ignored because TRTLLM-Gen MLA generation uses causal current-group visibility here.
+// - spec_decoding_packed_mask: accepted for signature parity. GLM-5 MLA generation follows causal current-group
+//   visibility and ignores this mask, matching the TRTLLM-Gen MLA path.
 // - q_scaling: model attention scaling divisor.
 // - is_context: bool, true when this launch handles a context/prefill chunk instead of a decode/MTP group.
 // - context_chunk_start: int64, first local KV position of the current context chunk when is_context is true.
@@ -2811,12 +2998,9 @@ torch::Tensor dsv3_fused_mla_generation_cuda(torch::Tensor fused_q, torch::Tenso
     auto* kvCachePoolPtr = reinterpret_cast<__nv_fp8_e4m3 const*>(kv_cache_pool.data_ptr());
     // Raw BF16 output pointer [numTokens, 8 * 512].
     auto* outputPtr = static_cast<__nv_bfloat16*>(output.data_ptr());
-    // Optional packed mask pointer. Null means use causal current-group rule.
-    int32_t const* specDecodingPackedMaskPtr
-        = spec_decoding_packed_mask.has_value() ? spec_decoding_packed_mask.value().data_ptr<int32_t>() : nullptr;
-    // Number of int32 mask words per query token row.
-    int const specMaskWords
-        = spec_decoding_packed_mask.has_value() ? static_cast<int>(spec_decoding_packed_mask.value().size(-1)) : 0;
+    // GLM-5 MLA generation ignores the speculative packed mask and uses causal current-group visibility.
+    int32_t const* specDecodingPackedMaskPtr = nullptr;
+    int const specMaskWords = 0;
     int const contextChunkStart = static_cast<int>(context_chunk_start);
 
     // Launch one CTA per [decode token, 64-key sparse split], matching TileRT's 32 CTAs/token for topK=2048.
@@ -2834,13 +3018,17 @@ torch::Tensor dsv3_fused_mla_generation_cuda(torch::Tensor fused_q, torch::Tenso
         // buffer after the kernel boundary and therefore no longer uses the in-kernel q_b grid barrier path.
         int const qBProjImpl = selectQbProjImpl(static_cast<int>(q_b_proj_impl), deviceProperties,
             qBProjWeightScalePackedPtr, qBProjWeightScaleFp32Ptr, numTokens);
-        dim3 const qBProjGrid(qBProjProjectionGridSize(qBProjImpl, numTokens, numSplits));
+        bool const useDedicatedNormCta = kvALayerNormWeightPtr != nullptr;
+        int const qBProjWorkCtas = qBProjProjectionGridSize(qBProjImpl, numTokens, numSplits);
+        dim3 const qBProjGrid(qBProjWorkCtas + (useDedicatedNormCta ? 1 : 0));
         int const qBProjBlockSize = qBProjProjectionBlockSize(qBProjImpl);
         size_t const qBProjSharedBytes = qBProjProjectionSharedBytes(qBProjImpl);
         qBProjProjectionKernel<<<qBProjGrid, qBProjBlockSize, qBProjSharedBytes, stream>>>(qBProjScratchPtr,
             qBProjInputPtr, qBProjWeightPtr, qBProjWeightScalePackedPtr, qBProjWeightScaleFp32Ptr, qBProjStrideToken,
             qBProjStrideDim, qBProjWeightStrideRow, qBProjWeightStrideDim, qBProjScaleStrideRow, qBProjScaleStridePack,
-            qBProjScratchStrideToken, qBProjScratchStrideDim, numTokens, numSplits, qBProjImpl);
+            qBProjScratchStrideToken, qBProjScratchStrideDim, numTokens, numSplits, qBProjImpl, latentCachePtr,
+            kvALayerNormWeightPtr, latentCacheStrideToken, latentCacheStrideDim, static_cast<float>(kv_a_layernorm_eps),
+            useDedicatedNormCta);
 
         qNopeForCombinedPtr = qBProjScratchPtr;
         qPeForCombinedPtr = qBProjScratchPtr + static_cast<int64_t>(kQkNopeHeadDim) * qBProjScratchStrideDim;
@@ -2850,7 +3038,7 @@ torch::Tensor dsv3_fused_mla_generation_cuda(torch::Tensor fused_q, torch::Tenso
         qPeStrideTokenForCombined = qBProjScratchStrideToken;
         qPeStrideHeadForCombined = kQkHeadDim * qBProjScratchStrideDim;
     }
-    if (kvALayerNormWeightPtr != nullptr)
+    if (kvALayerNormWeightPtr != nullptr && !hasQbProj)
     {
         int const compressedKvRmsNormCtas
             = (numTokens + kCompressedKvRmsNormRowsPerCta - 1) / kCompressedKvRmsNormRowsPerCta;
@@ -2858,11 +3046,11 @@ torch::Tensor dsv3_fused_mla_generation_cuda(torch::Tensor fused_q, torch::Tenso
             kvALayerNormWeightPtr, latentCacheStrideToken, latentCacheStrideDim, numTokens,
             static_cast<float>(kv_a_layernorm_eps));
     }
-    // Shared memory stores [8 heads, 64 split candidates] score/probability slots in the attention phase.
+    // Shared memory stores [8 heads, 64 split candidates] score/probability slots.
     size_t const splitSharedBytes = static_cast<size_t>(kLocalHeads * kSparseSplitSize * sizeof(float));
     // The combined launch first performs RoPE/Q quantization/KV append, grid-syncs, computes split-local partials,
     // grid-syncs again, and then combines into final latent outputs.
-    generationAttentionCombinedKernel<<<splitGrid, kTileRtThreads, splitSharedBytes, stream>>>(fusedQPtr,
+    generationAttentionCombinedKernel<<<splitGrid, kGenerationAttentionThreads, splitSharedBytes, stream>>>(fusedQPtr,
         qNopeForCombinedPtr, kBProjTransPtr, qPeForCombinedPtr, latentCachePtr, rotaryCosSinPtr, kv_cache, quantQPtr,
         kvCachePoolPtr, topk_indices_pool.data_ptr<int32_t>(), topk_indices.data_ptr<int32_t>(),
         sequence_length.data_ptr<int32_t>(), specDecodingPackedMaskPtr, specMaskWords, splitLse.data_ptr<float>(),

@@ -36,6 +36,7 @@ from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_deepseekv3_mla_pytorch import (
+    _rotate_context_tensors,
     dsv3_mla_context_pytorch,
     dsv3_mla_decode_pytorch,
 )
@@ -1780,7 +1781,26 @@ def test_glm5_fp8_context_combined_kernel_chunks_match_pytorch_reference() -> No
         )
 
     _assert_context_attention_close(actual, expected)
-    torch.testing.assert_close(actual_latent_cache, latent_cache_before, rtol=0.0, atol=0.0)
+    _, expected_latent_cache = _rotate_context_tensors(
+        fused_q,
+        q_pe,
+        latent_cache_before,
+        attention.rotary_cos_sin,
+        cached_sequence_length,
+        attention.rope_params.max_positions,
+    )
+    torch.testing.assert_close(
+        actual_latent_cache[:, :_KV_LORA_RANK],
+        latent_cache_before[:, :_KV_LORA_RANK],
+        rtol=0.0,
+        atol=0.0,
+    )
+    torch.testing.assert_close(
+        actual_latent_cache[:, _KV_LORA_RANK:],
+        expected_latent_cache[:, _KV_LORA_RANK:],
+        rtol=0.0,
+        atol=0.0,
+    )
 
 
 def test_glm5_fp8_context_combined_kernel_chunks_match_backend_with_long_prefix() -> None:
