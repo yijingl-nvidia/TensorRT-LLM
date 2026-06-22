@@ -21,7 +21,7 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
  * SOFTWARE.
  *
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -92,6 +92,13 @@ constexpr auto getSmemLayoutK()
     }
 }
 
+// kHeadDim_: Q/K head dim
+// kBlockM_: Query tile height, number of Q rows per CTA
+// kBlockN_: KV tile height, number of K/V rows per step per CTA
+// kNWarps_: Number of warps per CTA
+// elem_type: Q/K/V element type, default: BF16
+// elem_type_o: Final output element type, default BF16
+// kHeadDimV_: V/output head dimension. default 0: means same as kHeadDim
 template <int kHeadDim_, int kBlockM_, int kBlockN_, int kNWarps_, typename elem_type = cutlass::bfloat16_t,
     typename elem_type_o = cutlass::bfloat16_t, int kHeadDimV_ = 0>
 struct Flash_fwd_kernel_traits_mla
@@ -196,6 +203,9 @@ namespace flash
 
 using namespace cute;
 
+// Defines a compile-time shared memory struct for all the buffers used in the MLA kernel.
+// Kernel_traits: template class Flash_fwd_kernel_traits_mla that defines kernel dtypes and dimensions.
+// Can call `sizeof(SharedStorageMLA)` to get required shared memory size for the kernel.
 template <typename Kernel_traits>
 struct SharedStorageMLA
 {
@@ -336,6 +346,26 @@ __forceinline__ __device__ void store(Flash_fwd_mla_params const& params, int co
         gmem_tiled_copy_Oaccum, tOrOaccum, tOgOaccum, tOcO, tOpO, params.seqlen_q - m_block * kBlockM);
 }
 
+// Grid dimension:
+// x: num_m_block: How many Q blocks on the query matrix row/m dimension
+// y: params.h: How many query heads to compute on this kernel
+// z: params.num_sm_parts: how many parts of the (batch and seq dim) flattened sequence to break into for
+//    parallel CTAs
+// Kernel_traits: template class Flash_fwd_kernel_traits_mla
+// SharedStorage: template class flash::SharedStorageMLA
+// bidb: batch_id, which request the CTA is currently working on
+// bidh: same as params.h, how many query heads to compute on this kernel
+// m_block: the Q block idx on the query matrix row/m direction, [0, blockIdx.x)
+// n_split_idx: output split idx to write the partial output o to for each request, since one request can be
+//   computed by multiple CTAs via multiple splits/partitions
+// seqlen_k: this request's KV sequence length
+// n_block_min: starting KV block ID on this sequence
+// n_block_max: ending KV block ID on this sequence
+// NoSplit: Whether the current request has no splits, aka whether this CT kernel function call fully "owns"
+//   the request.
+// descale_k: dequanting scale for fp8; 1.0f other wise
+// scale_softmax: scaling value after softmax
+// scale_softmax_log2: `scale_softmax` converted to base-2 exponent units
 template <typename Kernel_traits, bool Is_causal, typename SharedStorage>
 __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mla(Flash_fwd_mla_params const& params, int const bidb,
     int const bidh, int const m_block, int const n_split_idx, int const seqlen_k, int const n_block_min,
@@ -347,7 +377,7 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mla(Flash_fwd_mla
     constexpr int kHeadDim = Kernel_traits::kHeadDim;
     constexpr int kHeadDimV = Kernel_traits::kHeadDimV;
     constexpr int kNThreads = Kernel_traits::kNThreads;
-    constexpr int kNThreadsS = Kernel_traits::kNThreadsS;
+    constexpr int kNThreadsS = Kernel_traits::kNThreadsS; // Score computing threads
     static_assert(kNThreads == 256 and kNThreadsS == 128);
     using Element = typename Kernel_traits::Element;
     using index_t = typename Kernel_traits::index_t;
@@ -659,6 +689,13 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mla(Flash_fwd_mla
 }
 
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 900)
+// Grid dimension:
+// x: num_m_block: How many Q blocks on the query matrix row/m dimension
+// y: params.h: How many query heads to compute on this kernel
+// z: params.num_sm_parts: how many parts of the (batch and seq dim) flattened sequence to break into for
+//    parallel CTAs
+// Kernel_traits: template class Flash_fwd_kernel_traits_mla
+// SharedStorage: template class flash::SharedStorageMLA
 template <typename Kernel_traits, bool Is_causal, typename SharedStorage>
 __global__ void __launch_bounds__(Kernel_traits::kNThreads, 1, 1)
     flash_fwd_splitkv_mla_kernel(__grid_constant__ const Flash_fwd_mla_params params)
@@ -692,11 +729,15 @@ __global__ void __launch_bounds__(Kernel_traits::kNThreads, 1, 1)
         scale_softmax_log2 = scale_softmax_log2 * descale_q * descale_k;
     }
 
+    // Compute attention on the assigned flattened KV sequence parts/partitions, for a given block (`m_block`) of
+    // queries.
 #pragma unroll 1
     for (int batch_id = begin_idx; batch_id <= end_idx; ++batch_id)
     {
+        // Loop over each request/sequence in this assigned partitions
         int const n_split_idx = batch_id == begin_idx ? begin_n_split_idx : 0;
         int const seqlen_k = __ldg(params.cu_seqlens_k + batch_id);
+        // when generating tile_scheduler_metadata_ptr, begin_seqlen is guaranteed to be divisible by kBlockN
         int const n_block_min = batch_id == begin_idx ? begin_seqlen / kBlockN : 0;
         int const n_block_max
             = batch_id == end_idx ? cute::ceil_div(end_seqlen, kBlockN) : cute::ceil_div(seqlen_k, kBlockN);
@@ -705,6 +746,7 @@ __global__ void __launch_bounds__(Kernel_traits::kNThreads, 1, 1)
         {
             __syncthreads(); // Barrier between two tiles.
         }
+        // Compute partial attentions for this request/sequence in the partition, for Q block `m_block`.
         flash::compute_attn_1rowblock_splitkv_mla<Kernel_traits, Is_causal>(params, batch_id, bidh, m_block,
             n_split_idx, seqlen_k, n_block_min, n_block_max, NoSplit, shared_storage, descale_k, scale_softmax,
             scale_softmax_log2);
@@ -840,6 +882,8 @@ template <typename Kernel_traits, typename SharedStorage>
 void run_flash_splitkv_fwd_mla(Flash_fwd_mla_params& params, cudaStream_t stream)
 {
     FLASH_ASSERT(params.page_block_size == Kernel_traits::kBlockN);
+    // How many Q blocks on the query matrix row/m dimension
+    // Each CTA process one Q block.
     int const num_m_block = cute::ceil_div(params.seqlen_q, Kernel_traits::kBlockM);
     BOOL_SWITCH(params.is_causal, Is_causal,
         [&]
@@ -847,6 +891,11 @@ void run_flash_splitkv_fwd_mla(Flash_fwd_mla_params& params, cudaStream_t stream
             auto kernel = &flash::flash_fwd_splitkv_mla_kernel<Kernel_traits, Is_causal, SharedStorage>;
             constexpr size_t smem_size = sizeof(SharedStorage);
             CHECK_CUDA(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+            // Grid dimension:
+            // x: num_m_block: How many Q blocks on the query matrix row/m dimension
+            // y: params.h: How many query heads to compute on this kernel
+            // z: params.num_sm_parts: how many parts of the (batch and seq dim) flattened sequence to break into for
+            //    parallel CTAs
             kernel<<<dim3(num_m_block, params.h, params.num_sm_parts), Kernel_traits::kNThreads, smem_size, stream>>>(
                 params);
         });
@@ -864,12 +913,38 @@ void run_flash_splitkv_fwd_mla(Flash_fwd_mla_params& params, cudaStream_t stream
     CHECK_CUDA_KERNEL_LAUNCH();
 }
 
+// Run the FlashMLA split-KV MLA forward kernel.
+//
+// This function selects the Headdim=576, d_v=512 DeepSeek MLA specialization. The main split-KV kernel processes
+// scheduled KV-cache ranges in 64x64 Q/K blocks, computes `QK^T`, maintains online softmax/LSE state, and
+// accumulates `O = softmax(QK^T) * V`. If a sequence's KV range is split across multiple SM parts, partial O and
+// LSE values are written to scratch buffers. The combine kernel then rescales and reduces those partials into the
+// final output.
+//
+// Launches the main split-KV attention kernel and the combine kernel on `stream`. Writes final output and
+// softmax LSE (log-sum-exp) through `params.o_ptr` and `params.softmax_lse_ptr`. Writes split partials through
+// `params.oaccum_ptr` and `params.softmax_lseaccum_ptr` when split-KV is used.
+//
+// Args
+// - params: `Flash_fwd_mla_params&`, parameter block containing sizes, strides, scheduler metadata, and tensor
+//   pointers. Requires `Headdim == 576`, `params.d_v == 512`, and `params.k_ptr == params.v_ptr`. `q_ptr` points
+//   to Q with last dimension 576 and element type `T`; `k_ptr` and `v_ptr` point to the shared latent K/V cache
+//   with last dimension 576 and element type `T`; `o_ptr` points to output with last dimension 512 and element
+//   type `To`.
+// - stream: `cudaStream_t`, CUDA stream used for both kernel launches.
+//
+// Returns
+// - `void`: results are written through output pointers in `params`.
 template <typename T, typename To, int Headdim>
 void run_mha_fwd_splitkv_mla(Flash_fwd_mla_params& params, cudaStream_t stream)
 {
+    // Enforce DeepSeek MLA dims: Q/K head dim 576, V/output head dim 512
     static_assert(Headdim == 576);
     FLASH_ASSERT(params.d_v == 512);
     FLASH_ASSERT(params.k_ptr == params.v_ptr); // Shared_KV
+
+    // Set each CTA to process a tile of 64 x 64: 64 Q rows and 64 K/V rows per CTA
+    // Set 8 warps per CTA
     using Kernel_traits = Flash_fwd_kernel_traits_mla<576, 64, 64, 8, T, To, 512>;
     run_flash_splitkv_fwd_mla<Kernel_traits, flash::SharedStorageMLA<Kernel_traits>>(params, stream);
 }
