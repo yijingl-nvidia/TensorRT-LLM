@@ -96,6 +96,7 @@ add_library(
   ../kernels/dsv3FusedKernels/dsv3FusedExpertUpFp16.cu
   dsv3FusedMLA.cpp
   ../kernels/dsv3FusedKernels/dsv3FusedMLA.cu
+  ../kernels/dsv3FusedKernels/dsv3FusedMLAFlashAttention.cu
   dsv3FusedExpertDownOp.cpp
   ../kernels/dsv3FusedKernels/dsv3FusedExpertDown.cu
   fusedCatFp4Op.cpp
