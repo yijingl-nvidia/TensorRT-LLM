@@ -274,6 +274,12 @@ class HfWeightLoader(BaseWeightLoader):
                      mapping: Mapping,
                      use_consolidated: bool = False,
                      **kwargs) -> dict[str, Any]:
+        """
+        Load the model weights as a dict of name -> tensor-like value.
+
+        If CPU memory is large enough, prefetch all files in parallel to warm up OS file cache.
+        Then build and return a `ConsumableWeightsDict` by loading all files in parallel.
+        """
         if self._is_kimi_k3_checkpoint(checkpoint_dir):
             return self._load_lazy_safetensors(checkpoint_dir)
         weight_files = glob.glob(f"{checkpoint_dir}/*.safetensors")
@@ -360,7 +366,7 @@ class HfWeightLoader(BaseWeightLoader):
         return ConsumableWeightsDict(weights)
 
     @staticmethod
-    def _load_safetensors_file(file):
+    def _load_safetensors_file(file) -> dict[str, torch.Tensor]:
         logger.info(f"Start to load safetensor file {file}")
         return safetensors.torch.load_file(file)
 
