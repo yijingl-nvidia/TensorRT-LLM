@@ -5,6 +5,7 @@ import copy
 import gc
 import importlib
 import os
+import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -34,6 +35,7 @@ from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
 from ..attention_backend.interface import AttentionRuntimeFeatures
 from ..attention_backend.trtllm import TrtllmAttention
 from ..distributed import Distributed
+from ..models.modeling_utils import timing_metric
 from ..speculative import (get_num_extra_kv_tokens, get_spec_drafter,
                            get_spec_resource_manager)
 from ..virtual_memory import scope as virtual_memory_scope
@@ -360,9 +362,13 @@ def create_py_executor(
     Returns:
         A fully initialized PyExecutor instance.
     """
+    creation_started_at = time.perf_counter()
+    creation_metrics: dict[str, float] = {}
 
-    llm_args, checkpoint_loader = _load_config_and_create_checkpoint_loader(
-        llm_args, checkpoint_dir)
+    with timing_metric("config_and_checkpoint_loader_initialization_seconds",
+                       creation_metrics):
+        llm_args, checkpoint_loader = _load_config_and_create_checkpoint_loader(
+            llm_args, checkpoint_dir)
 
     skip_est = os.environ.get("TRTLLM_SKIP_KV_CACHE_ESTIMATION", '0') == '1'
 
@@ -541,8 +547,13 @@ def create_py_executor(
 
     @contextmanager
     def allocation_scope(current_stage: ExecutorMemoryType):
-        with mem_monitor.observe_creation_stage(current_stage):
-            stage = current_stage.value
+        stage = current_stage.value
+        metric_stage = stage.removeprefix("_no_capture_")
+        metric_name = f"{metric_stage}_initialization_seconds"
+        with timing_metric(
+                metric_name,
+                creation_metrics), mem_monitor.observe_creation_stage(
+                    current_stage):
             if not enable_sleep or stage.startswith("_no_capture"):
                 yield
             else:
@@ -1092,6 +1103,11 @@ def create_py_executor(
     if mapping.rank == 0:
         logger.info(f"LLM Args:\n{llm_args}")
 
-    py_executor.start_worker()
+    with timing_metric("worker_start_seconds", creation_metrics):
+        py_executor.start_worker()
+
+    model_engine.metrics.update(creation_metrics)
+    model_engine.metrics["total_executor_creation_seconds"] = (
+        time.perf_counter() - creation_started_at)
 
     return py_executor
