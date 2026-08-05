@@ -238,6 +238,10 @@ _KIMI_K3_KDA_GLUE_FP8_ENV = "KIMI_K3_KDA_GLUE_FP8"
 # conversion helper's comment).
 _KIMI_K3_FP8_WEIGHT_READ_GATE_UP_ENV = "KIMI_K3_FP8_WEIGHT_READ_GATE_UP"
 
+# Experimental K3-only checkpoint reader. ModelStreamer reads rank-local
+# safetensors byte ranges concurrently and yields one tensor at a time.
+_KIMI_K3_MODEL_STREAMER_ENV = "KIMI_K3_MODEL_STREAMER"
+
 
 # ---------------------------------------------------------------------------
 # Config helpers.
@@ -2353,35 +2357,29 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                 mla_tp_rank = layer.self_attn._mla_tp_rank
                 break
 
-        def load_param(name: str, param: torch.nn.Parameter):
+        def load_gate_up_half(
+            name: str, param: torch.nn.Parameter, src: torch.Tensor, row_offset: int
+        ):
             if device.type == "cuda":
                 torch.cuda.set_device(device)
-            if name.endswith(_GATE_UP_FUSED_SUFFIX):
-                # Row-concat the checkpoint's separate gate_proj / up_proj
-                # tensors into the fused [gate | up] parameter.
-                gate_key, up_key = _gate_up_ckpt_keys(name_map[name])
-                gate = _materialize(weights[gate_key])
-                up = _materialize(weights[up_key])
-                inter = param.shape[0] // 2
-                if gate.shape[0] != inter and gate.shape[0] % inter == 0:
-                    # TP-sharded fused MLP (shared experts on the direct
-                    # MoE path, dense MLP with attention-DP off): take
-                    # this rank's MATCHING row block from each half so
-                    # the SiTU gate/up pairs stay aligned. shared_tp_rank
-                    # == tp_rank in every mode that shards these.
-                    lo = shared_tp_rank * inter
-                    gate = gate[lo : lo + inter]
-                    up = up[lo : lo + inter]
-                if gate.shape != (inter, param.shape[1]) or up.shape != gate.shape:
-                    raise ValueError(
-                        f"{name}: checkpoint gate/up shapes "
-                        f"{tuple(gate.shape)} / {tuple(up.shape)} do not "
-                        f"concat to param shape {tuple(param.shape)}"
-                    )
-                param.data[:inter].copy_(gate.to(param.dtype))
-                param.data[inter:].copy_(up.to(param.dtype))
-                return
-            src = _materialize(weights[name_map[name]])
+            src = _materialize(src)
+            inter = param.shape[0] // 2
+            if src.shape[0] != inter and src.shape[0] % inter == 0:
+                # TP-sharded fused MLP: take this rank's matching row block
+                # from each half so the SiTU gate/up pairs stay aligned.
+                lo = shared_tp_rank * inter
+                src = src[lo : lo + inter]
+            if src.shape != (inter, param.shape[1]):
+                raise ValueError(
+                    f"{name}: checkpoint gate/up half shape {tuple(src.shape)} "
+                    f"does not fit param shape {tuple(param.shape)}"
+                )
+            param.data[row_offset : row_offset + inter].copy_(src.to(param.dtype))
+
+        def load_param_tensor(name: str, param: torch.nn.Parameter, src: torch.Tensor):
+            if device.type == "cuda":
+                torch.cuda.set_device(device)
+            src = _materialize(src)
             if name == "lm_head.weight":
                 # LMHead is vocab-sharded (TP column) + gathered; its
                 # load_weights shards the full checkpoint tensor.
@@ -2529,6 +2527,17 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                 )
             param.data.copy_(src.to(param.dtype))
 
+        def load_param(name: str, param: torch.nn.Parameter):
+            if name.endswith(_GATE_UP_FUSED_SUFFIX):
+                # Row-concat the checkpoint's separate gate_proj / up_proj
+                # tensors into the fused [gate | up] parameter.
+                gate_key, up_key = _gate_up_ckpt_keys(name_map[name])
+                inter = param.shape[0] // 2
+                load_gate_up_half(name, param, weights[gate_key], 0)
+                load_gate_up_half(name, param, weights[up_key], inter)
+                return
+            load_param_tensor(name, param, weights[name_map[name]])
+
         def load_expert(
             moe: KimiK3MoERuntime, base: str, local_slot_id: int, expert_idx: int, get_tensor
         ):
@@ -2559,7 +2568,94 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                 )
 
         param_jobs = [(name, params[name]) for name in name_map]
-        run_concurrently(load_param, param_jobs, num_workers=8)
+        use_model_streamer = os.environ.get(_KIMI_K3_MODEL_STREAMER_ENV, "0") == "1"
+        if use_model_streamer:
+            from .kimi_k3_model_streamer import stream_selected_safetensors
+
+            ckpt_dir = getattr(self, "_checkpoint_dir", None) or getattr(
+                self.model_config.pretrained_config, "_name_or_path", None
+            )
+            if not ckpt_dir:
+                raise ValueError(
+                    f"{_KIMI_K3_MODEL_STREAMER_ENV}=1 requires a local checkpoint directory."
+                )
+
+            param_destinations = {}
+            for name, param in param_jobs:
+                if name.endswith(_GATE_UP_FUSED_SUFFIX):
+                    gate_key, up_key = _gate_up_ckpt_keys(name_map[name])
+                    inter = param.shape[0] // 2
+                    param_destinations[gate_key] = (name, param, 0)
+                    param_destinations[up_key] = (name, param, inter)
+                else:
+                    param_destinations[name_map[name]] = (name, param, None)
+
+            expert_destinations = {}
+            for _, moe, base in expert_jobs:
+                for local_slot_id, expert_idx in enumerate(moe.local_expert_ids):
+                    for w in ("w1", "w2", "w3"):
+                        for kind in ("weight_packed", "weight_scale"):
+                            key = f"{base}.{expert_idx}.{w}.{kind}"
+                            expert_destinations[key] = (
+                                moe,
+                                base,
+                                local_slot_id,
+                                expert_idx,
+                            )
+
+            pending_experts: Dict[tuple[int, int], Dict[str, torch.Tensor]] = {}
+            seen_keys = set()
+
+            def consume_tensor(key: str, tensor: torch.Tensor) -> None:
+                if key in seen_keys:
+                    raise ValueError(f"Kimi K3 ModelStreamer yielded duplicate tensor {key!r}")
+                seen_keys.add(key)
+
+                param_destination = param_destinations.get(key)
+                if param_destination is not None:
+                    name, param, row_offset = param_destination
+                    if row_offset is None:
+                        load_param_tensor(name, param, tensor)
+                    else:
+                        load_gate_up_half(name, param, tensor, row_offset)
+                    return
+
+                moe, base, local_slot_id, expert_idx = expert_destinations[key]
+                pending_key = (id(moe), local_slot_id)
+                pending = pending_experts.setdefault(pending_key, {})
+                # FileStreamer reuses its staging buffer. Expert packing needs
+                # six tensors simultaneously, so retain these six explicitly.
+                pending[key] = tensor.clone()
+                if len(pending) == 6:
+                    load_expert(
+                        moe,
+                        base,
+                        local_slot_id,
+                        expert_idx,
+                        pending.__getitem__,
+                    )
+                    del pending_experts[pending_key]
+
+            self._weight_loading_metrics = stream_selected_safetensors(
+                ckpt_dir, expected_keys, consume_tensor
+            )
+            if seen_keys != expected_keys:
+                missing_streamed_keys = sorted(expected_keys - seen_keys)
+                raise RuntimeError(
+                    "Kimi K3 ModelStreamer did not yield every selected tensor; "
+                    f"missing {missing_streamed_keys[:10]}"
+                )
+            if pending_experts:
+                raise RuntimeError(
+                    "Kimi K3 ModelStreamer ended with incomplete expert tensor groups."
+                )
+            logger.info(
+                f"Kimi K3: ModelStreamer loaded {len(expected_keys)} rank-local "
+                f"tensors ({self._weight_loading_metrics['model_streamer_selected_bytes'] / (1024**3):.2f} GiB)"
+            )
+        else:
+            self._weight_loading_metrics = {}
+            run_concurrently(load_param, param_jobs, num_workers=8)
 
         logger.info(
             f"Kimi K3: loaded {len(mla_mixers)} MLA KV-B projections in grouped runtime layout"
@@ -2574,9 +2670,11 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
         # trays). Instead, group the rank-local expert tensors by shard file
         # and stream each file through a short-lived handle:
         # open -> copy -> close (unmap) -> fadvise(DONTNEED).
-        ckpt_dir = getattr(self.model_config.pretrained_config, "_name_or_path", None)
+        ckpt_dir = getattr(self, "_checkpoint_dir", None) or getattr(
+            self.model_config.pretrained_config, "_name_or_path", None
+        )
         index_path = os.path.join(ckpt_dir or "", "model.safetensors.index.json")
-        if expert_jobs and os.path.isfile(index_path):
+        if not use_model_streamer and expert_jobs and os.path.isfile(index_path):
             import json as _json
             from contextlib import ExitStack
 
@@ -2644,7 +2742,7 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
 
             run_concurrently(load_expert_file, sorted(per_file.items()), num_workers=4)
             run_concurrently(load_split_file_expert, split_file_jobs, num_workers=4)
-        else:
+        elif not use_model_streamer:
             run_concurrently(load_experts_from_weights, expert_jobs, num_workers=4)
 
         for _, moe, _ in expert_jobs:

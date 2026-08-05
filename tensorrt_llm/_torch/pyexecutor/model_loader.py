@@ -709,6 +709,7 @@ class ModelLoader:
                     model, config)
 
                 if weights:
+                    model._checkpoint_dir = _checkpoint_dir
                     with timing_metric(
                             ModelLoaderMetricNames.WEIGHT_POPULATION_SECONDS.
                             value, self._metrics):
@@ -716,6 +717,16 @@ class ModelLoader:
                                                 self.weight_mapper)
                         if torch.cuda.is_available():  # CPU guard
                             torch.cuda.synchronize()
+                    model_weight_loading_metrics = getattr(
+                        model, "_weight_loading_metrics", None)
+                    if model_weight_loading_metrics:
+                        duplicate_metrics = set(self._metrics).intersection(
+                            model_weight_loading_metrics)
+                        if duplicate_metrics:
+                            raise ValueError(
+                                "Model weight-loading metrics duplicate ModelLoader metrics: "
+                                f"{sorted(duplicate_metrics)}")
+                        self._metrics.update(model_weight_loading_metrics)
 
                 if loads_draft_weights:
                     with timing_metric(
