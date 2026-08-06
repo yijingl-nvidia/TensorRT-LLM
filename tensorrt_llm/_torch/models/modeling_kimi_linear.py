@@ -75,6 +75,7 @@ from __future__ import annotations
 
 import copy
 import os
+import time
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import torch
@@ -241,6 +242,7 @@ _KIMI_K3_FP8_WEIGHT_READ_GATE_UP_ENV = "KIMI_K3_FP8_WEIGHT_READ_GATE_UP"
 # Experimental K3-only checkpoint reader. ModelStreamer reads rank-local
 # safetensors byte ranges concurrently and yields one tensor at a time.
 _KIMI_K3_MODEL_STREAMER_ENV = "KIMI_K3_MODEL_STREAMER"
+_KIMI_K3_MODEL_STREAMER_MODE_ENV = "KIMI_K3_MODEL_STREAMER_MODE"
 
 
 # ---------------------------------------------------------------------------
@@ -2570,7 +2572,14 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
         param_jobs = [(name, params[name]) for name in name_map]
         use_model_streamer = os.environ.get(_KIMI_K3_MODEL_STREAMER_ENV, "0") == "1"
         if use_model_streamer:
-            from .kimi_k3_model_streamer import stream_selected_safetensors
+            from .kimi_k3_model_streamer import gather_node_rank_needs, stream_selected_safetensors
+
+            model_streamer_mode = os.environ.get(_KIMI_K3_MODEL_STREAMER_MODE_ENV, "distributed")
+            if model_streamer_mode != "distributed":
+                raise ValueError(
+                    f"{_KIMI_K3_MODEL_STREAMER_MODE_ENV} must be 'distributed' "
+                    f"on this experiment branch, got {model_streamer_mode!r}."
+                )
 
             ckpt_dir = getattr(self, "_checkpoint_dir", None) or getattr(
                 self.model_config.pretrained_config, "_name_or_path", None
@@ -2603,13 +2612,86 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                                 expert_idx,
                             )
 
-            pending_experts: Dict[tuple[int, int], Dict[str, torch.Tensor]] = {}
-            seen_keys = set()
+            if set(param_destinations).union(expert_destinations) != expected_keys:
+                raise RuntimeError(
+                    "Kimi K3 ModelStreamer destinations do not cover the expected checkpoint keys."
+                )
+
+            local_expert_ids = {expert_idx for _, _, _, expert_idx in expert_destinations.values()}
+            if device.type == "cuda":
+                torch.cuda.set_device(device)
+            coordination_start = time.perf_counter()
+            node_needs = gather_node_rank_needs(param_destinations, local_expert_ids)
+
+            def expert_keys_for_ids(expert_ids) -> set[str]:
+                return {
+                    f"{base}.{expert_idx}.{w}.{kind}"
+                    for _, _, base in expert_jobs
+                    for expert_idx in expert_ids
+                    for w in ("w1", "w2", "w3")
+                    for kind in ("weight_packed", "weight_scale")
+                }
+
+            node_keys = set(node_needs.non_expert_union)
+            node_keys.update(expert_keys_for_ids(node_needs.expert_union))
+            node_common_keys = set(node_needs.non_expert_intersection)
+            node_common_keys.update(expert_keys_for_ids(node_needs.expert_intersection))
+            coordination_seconds = time.perf_counter() - coordination_start
+
+            staged_experts: Dict[str, torch.Tensor] = {}
+            seen_streamed_keys = set()
+            seen_accepted_keys = set()
+            streamed_bytes = 0
+            accepted_bytes = 0
+            skipped_bytes = 0
+
+            def stage_expert_tensor(
+                key: str,
+                tensor: torch.Tensor,
+                destination,
+            ) -> None:
+                moe, base, local_slot_id, expert_idx = destination
+                backend = moe.routed_experts.backend
+                suffix = key.removeprefix(f"{base}.{expert_idx}.")
+                if suffix == "w1.weight_packed":
+                    _, storage = backend.w3_w1_weight.data[local_slot_id].chunk(2, dim=0)
+                elif suffix == "w3.weight_packed":
+                    storage, _ = backend.w3_w1_weight.data[local_slot_id].chunk(2, dim=0)
+                elif suffix == "w2.weight_packed":
+                    storage = backend.w2_weight.data[local_slot_id]
+                elif suffix == "w1.weight_scale":
+                    _, storage = backend.w3_w1_weight_scale.data[local_slot_id].chunk(2, dim=0)
+                elif suffix == "w3.weight_scale":
+                    storage, _ = backend.w3_w1_weight_scale.data[local_slot_id].chunk(2, dim=0)
+                elif suffix == "w2.weight_scale":
+                    storage = backend.w2_weight_scale.data[local_slot_id]
+                else:
+                    raise KeyError(f"Unsupported Kimi K3 expert checkpoint tensor {key!r}.")
+
+                storage_flat = storage.view(-1)
+                if tensor.numel() > storage_flat.numel():
+                    raise ValueError(
+                        f"{key}: checkpoint tensor has {tensor.numel()} elements but "
+                        f"its runtime staging storage has {storage_flat.numel()}."
+                    )
+                staged = storage_flat[: tensor.numel()].view(tensor.shape)
+                staged.copy_(tensor)
+                staged_experts[key] = staged
 
             def consume_tensor(key: str, tensor: torch.Tensor) -> None:
-                if key in seen_keys:
+                nonlocal accepted_bytes, skipped_bytes, streamed_bytes
+                if key in seen_streamed_keys:
                     raise ValueError(f"Kimi K3 ModelStreamer yielded duplicate tensor {key!r}")
-                seen_keys.add(key)
+                seen_streamed_keys.add(key)
+                tensor_bytes = tensor.numel() * tensor.element_size()
+                streamed_bytes += tensor_bytes
+
+                if key not in expected_keys:
+                    skipped_bytes += tensor_bytes
+                    return
+
+                seen_accepted_keys.add(key)
+                accepted_bytes += tensor_bytes
 
                 param_destination = param_destinations.get(key)
                 if param_destination is not None:
@@ -2620,38 +2702,73 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                         load_gate_up_half(name, param, tensor, row_offset)
                     return
 
-                moe, base, local_slot_id, expert_idx = expert_destinations[key]
-                pending_key = (id(moe), local_slot_id)
-                pending = pending_experts.setdefault(pending_key, {})
-                # FileStreamer reuses its staging buffer. Expert packing needs
-                # six tensors simultaneously, so retain these six explicitly.
-                pending[key] = tensor.clone()
-                if len(pending) == 6:
+                stage_expert_tensor(key, tensor, expert_destinations[key])
+
+            self._weight_loading_metrics = {
+                "model_streamer_node_key_coordination_seconds": coordination_seconds,
+                "model_streamer_node_ranks": float(node_needs.ranks_on_node),
+                "model_streamer_node_union_tensors": float(len(node_keys)),
+                "model_streamer_node_common_tensors": float(len(node_common_keys)),
+            }
+            self._weight_loading_metrics.update(
+                stream_selected_safetensors(
+                    ckpt_dir,
+                    node_keys,
+                    consume_tensor,
+                    device=device,
+                    is_distributed=True,
+                    metric_prefix="model_streamer_distributed",
+                )
+            )
+            if seen_streamed_keys != node_keys:
+                missing_streamed_keys = sorted(node_keys - seen_streamed_keys)
+                raise RuntimeError(
+                    "Kimi K3 distributed ModelStreamer did not yield every "
+                    f"node-selected tensor; missing {missing_streamed_keys[:10]}"
+                )
+            if seen_accepted_keys != expected_keys:
+                missing_accepted_keys = sorted(expected_keys - seen_accepted_keys)
+                raise RuntimeError(
+                    "Kimi K3 distributed ModelStreamer did not accept every "
+                    f"rank-local tensor; missing {missing_accepted_keys[:10]}"
+                )
+            if set(staged_experts) != set(expert_destinations):
+                missing_staged_keys = sorted(set(expert_destinations) - set(staged_experts))
+                raise RuntimeError(
+                    "Kimi K3 distributed ModelStreamer did not stage every "
+                    f"rank-local expert tensor; missing {missing_staged_keys[:10]}"
+                )
+
+            postprocess_start = time.perf_counter()
+            for _, moe, base in expert_jobs:
+                for local_slot_id, expert_idx in enumerate(moe.local_expert_ids):
                     load_expert(
                         moe,
                         base,
                         local_slot_id,
                         expert_idx,
-                        pending.__getitem__,
+                        staged_experts.__getitem__,
                     )
-                    del pending_experts[pending_key]
-
-            self._weight_loading_metrics = stream_selected_safetensors(
-                ckpt_dir, expected_keys, consume_tensor
+            torch.cuda.synchronize()
+            postprocess_seconds = time.perf_counter() - postprocess_start
+            staged_experts.clear()
+            self._weight_loading_metrics.update(
+                {
+                    "model_streamer_rank_accepted_tensors": float(len(seen_accepted_keys)),
+                    "model_streamer_rank_accepted_bytes": float(accepted_bytes),
+                    "model_streamer_rank_skipped_tensors": float(
+                        len(seen_streamed_keys - seen_accepted_keys)
+                    ),
+                    "model_streamer_rank_skipped_bytes": float(skipped_bytes),
+                    "model_streamer_rank_streamed_bytes": float(streamed_bytes),
+                    "model_streamer_expert_postprocess_seconds": postprocess_seconds,
+                }
             )
-            if seen_keys != expected_keys:
-                missing_streamed_keys = sorted(expected_keys - seen_keys)
-                raise RuntimeError(
-                    "Kimi K3 ModelStreamer did not yield every selected tensor; "
-                    f"missing {missing_streamed_keys[:10]}"
-                )
-            if pending_experts:
-                raise RuntimeError(
-                    "Kimi K3 ModelStreamer ended with incomplete expert tensor groups."
-                )
             logger.info(
-                f"Kimi K3: ModelStreamer loaded {len(expected_keys)} rank-local "
-                f"tensors ({self._weight_loading_metrics['model_streamer_selected_bytes'] / (1024**3):.2f} GiB)"
+                f"Kimi K3: distributed ModelStreamer accepted "
+                f"{len(seen_accepted_keys)} rank-local tensors and skipped "
+                f"{len(seen_streamed_keys - seen_accepted_keys)} tensors needed "
+                f"only by peer ranks on the node"
             )
         else:
             self._weight_loading_metrics = {}

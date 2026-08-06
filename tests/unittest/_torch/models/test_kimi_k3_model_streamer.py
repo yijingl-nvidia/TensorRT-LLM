@@ -5,7 +5,10 @@ from types import SimpleNamespace
 
 import pytest
 
-from tensorrt_llm._torch.models.kimi_k3_model_streamer import _select_tensor_ranges
+from tensorrt_llm._torch.models.kimi_k3_model_streamer import (
+    _combine_node_rank_needs,
+    _select_tensor_ranges,
+)
 
 
 def _tensor_metadata(name, start, end):
@@ -79,3 +82,25 @@ def test_select_tensor_ranges_rejects_missing_key():
 
     with pytest.raises(KeyError, match="could not find 1 selected"):
         _select_tensor_ranges(("model.safetensors",), files_metadata, {"present", "missing"})
+
+
+def test_combine_node_rank_needs_builds_union_and_intersection():
+    needs = _combine_node_rank_needs(
+        (
+            ("node-a", ("shared", "rank-0"), (0, 1)),
+            ("node-a", ("shared", "rank-1"), (2, 3)),
+            ("node-b", ("other-node",), (4, 5)),
+        ),
+        "node-a",
+    )
+
+    assert needs.non_expert_union == {"shared", "rank-0", "rank-1"}
+    assert needs.non_expert_intersection == {"shared"}
+    assert needs.expert_union == {0, 1, 2, 3}
+    assert needs.expert_intersection == set()
+    assert needs.ranks_on_node == 2
+
+
+def test_combine_node_rank_needs_rejects_missing_host():
+    with pytest.raises(RuntimeError, match="No gathered ModelStreamer requirements"):
+        _combine_node_rank_needs((("node-a", (), ()),), "node-b")

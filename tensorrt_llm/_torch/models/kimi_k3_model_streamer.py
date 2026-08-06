@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+import socket
 import time
 from collections.abc import Callable, Collection, Sequence
 from dataclasses import dataclass
@@ -24,6 +25,70 @@ class _SelectedRange:
     tensor_metadata: tuple[Any, ...]
     offset: int
     sizes: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class _NodeRankNeeds:
+    """Union and intersection of checkpoint needs for one node."""
+
+    non_expert_union: frozenset[str]
+    non_expert_intersection: frozenset[str]
+    expert_union: frozenset[int]
+    expert_intersection: frozenset[int]
+    ranks_on_node: int
+
+
+def _combine_node_rank_needs(
+    gathered_needs: Sequence[tuple[str, Sequence[str], Sequence[int]]],
+    hostname: str,
+) -> _NodeRankNeeds:
+    """Combine compact rank requirements gathered across the world group."""
+    node_needs = [entry for entry in gathered_needs if entry[0] == hostname]
+    if not node_needs:
+        raise RuntimeError(f"No gathered ModelStreamer requirements for host {hostname!r}.")
+
+    non_expert_sets = [set(entry[1]) for entry in node_needs]
+    expert_sets = [set(entry[2]) for entry in node_needs]
+    return _NodeRankNeeds(
+        non_expert_union=frozenset().union(*non_expert_sets),
+        non_expert_intersection=frozenset.intersection(
+            *(frozenset(keys) for keys in non_expert_sets)
+        ),
+        expert_union=frozenset().union(*expert_sets),
+        expert_intersection=frozenset.intersection(
+            *(frozenset(expert_ids) for expert_ids in expert_sets)
+        ),
+        ranks_on_node=len(node_needs),
+    )
+
+
+def gather_node_rank_needs(
+    non_expert_keys: Collection[str], local_expert_ids: Collection[int]
+) -> _NodeRankNeeds:
+    """Gather compact Kimi K3 checkpoint ownership metadata across ranks."""
+    import torch.distributed as dist
+
+    if not dist.is_initialized() or dist.get_world_size() <= 1:
+        raise RuntimeError(
+            "Kimi K3 distributed ModelStreamer requires initialized "
+            "torch.distributed with more than one rank."
+        )
+
+    hostname = socket.gethostname()
+    local_needs = (
+        hostname,
+        tuple(sorted(non_expert_keys)),
+        tuple(sorted(local_expert_ids)),
+    )
+    gathered_needs: list[tuple[str, Sequence[str], Sequence[int]] | None] = [
+        None
+    ] * dist.get_world_size()
+    dist.all_gather_object(gathered_needs, local_needs)
+    if any(entry is None for entry in gathered_needs):
+        raise RuntimeError("ModelStreamer rank-requirement gathering returned an empty entry.")
+    return _combine_node_rank_needs(
+        [entry for entry in gathered_needs if entry is not None], hostname
+    )
 
 
 def _select_tensor_ranges(
@@ -114,11 +179,15 @@ def stream_selected_safetensors(
     checkpoint_dir: str,
     selected_keys: Collection[str],
     consume_tensor: Callable[[str, torch.Tensor], None],
+    *,
+    device: str | torch.device = "cpu",
+    is_distributed: bool = False,
+    metric_prefix: str = "model_streamer",
 ) -> dict[str, float]:
     """Stream selected Kimi K3 tensors and synchronously pass each to a consumer.
 
     The consumer must finish using a tensor before returning. ModelStreamer owns
-    and reuses the CPU staging buffer after the callback returns.
+    and reuses the staging buffer after the callback returns.
     """
     try:
         from runai_model_streamer import DistributedStreamer, FileChunks
@@ -157,16 +226,28 @@ def stream_selected_safetensors(
         }
 
         stream_start = time.perf_counter()
-        streamer.stream_files(requests, credentials=None, device="cpu", is_distributed=False)
+        streamer.stream_files(
+            requests,
+            credentials=None,
+            device=str(device),
+            is_distributed=is_distributed,
+        )
+        if is_distributed and not streamer.is_distributed:
+            raise RuntimeError(
+                "ModelStreamer rejected distributed mode; check torch.distributed, "
+                "the process-group backend, and available staging-buffer memory."
+            )
         for request_id, tensor_index, buffer in streamer.get_chunks():
             metadata = metadata_by_request[request_id][tensor_index]
             consume_tensor(metadata.name, create_torch_tensor(buffer, metadata))
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
         stream_and_load_seconds = time.perf_counter() - stream_start
 
     return {
-        "model_streamer_metadata_seconds": metadata_seconds,
-        "model_streamer_stream_and_load_seconds": stream_and_load_seconds,
-        "model_streamer_total_seconds": time.perf_counter() - total_start,
-        "model_streamer_selected_tensors": float(len(set(selected_keys))),
-        "model_streamer_selected_bytes": float(selected_bytes),
+        f"{metric_prefix}_metadata_seconds": metadata_seconds,
+        f"{metric_prefix}_stream_and_load_seconds": stream_and_load_seconds,
+        f"{metric_prefix}_total_seconds": time.perf_counter() - total_start,
+        f"{metric_prefix}_selected_tensors": float(len(set(selected_keys))),
+        f"{metric_prefix}_selected_bytes": float(selected_bytes),
     }
