@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+import os
 import socket
 import time
 from collections.abc import Callable, Collection, Sequence
@@ -36,6 +37,38 @@ class _NodeRankNeeds:
     expert_union: frozenset[int]
     expert_intersection: frozenset[int]
     ranks_on_node: int
+
+
+def initialize_torch_distributed(*, rank: int, world_size: int) -> float:
+    """Initialize the NCCL group required by ModelStreamer distributed mode."""
+    import torch.distributed as dist
+
+    if dist.is_initialized():
+        if dist.get_rank() != rank or dist.get_world_size() != world_size:
+            raise RuntimeError(
+                "Existing torch.distributed group does not match the TRT-LLM "
+                f"mapping: group rank/world={dist.get_rank()}/{dist.get_world_size()}, "
+                f"TRT-LLM rank/world={rank}/{world_size}."
+            )
+        return 0.0
+
+    missing_rendezvous = [
+        variable for variable in ("MASTER_ADDR", "MASTER_PORT") if not os.environ.get(variable)
+    ]
+    if missing_rendezvous:
+        raise RuntimeError(
+            "Kimi K3 distributed ModelStreamer requires a torch.distributed "
+            f"rendezvous; missing environment variables {missing_rendezvous}."
+        )
+
+    initialization_start = time.perf_counter()
+    dist.init_process_group(
+        backend="nccl",
+        init_method="env://",
+        rank=rank,
+        world_size=world_size,
+    )
+    return time.perf_counter() - initialization_start
 
 
 def _combine_node_rank_needs(

@@ -2572,7 +2572,11 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
         param_jobs = [(name, params[name]) for name in name_map]
         use_model_streamer = os.environ.get(_KIMI_K3_MODEL_STREAMER_ENV, "0") == "1"
         if use_model_streamer:
-            from .kimi_k3_model_streamer import gather_node_rank_needs, stream_selected_safetensors
+            from .kimi_k3_model_streamer import (
+                gather_node_rank_needs,
+                initialize_torch_distributed,
+                stream_selected_safetensors,
+            )
 
             model_streamer_mode = os.environ.get(_KIMI_K3_MODEL_STREAMER_MODE_ENV, "distributed")
             if model_streamer_mode != "distributed":
@@ -2620,6 +2624,10 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
             local_expert_ids = {expert_idx for _, _, _, expert_idx in expert_destinations.values()}
             if device.type == "cuda":
                 torch.cuda.set_device(device)
+            torch_distributed_initialization_seconds = initialize_torch_distributed(
+                rank=self.model_config.mapping.rank,
+                world_size=self.model_config.mapping.world_size,
+            )
             coordination_start = time.perf_counter()
             node_needs = gather_node_rank_needs(param_destinations, local_expert_ids)
 
@@ -2705,6 +2713,9 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                 stage_expert_tensor(key, tensor, expert_destinations[key])
 
             self._weight_loading_metrics = {
+                "model_streamer_torch_distributed_initialization_seconds": (
+                    torch_distributed_initialization_seconds
+                ),
                 "model_streamer_node_key_coordination_seconds": coordination_seconds,
                 "model_streamer_node_ranks": float(node_needs.ranks_on_node),
                 "model_streamer_node_union_tensors": float(len(node_keys)),
