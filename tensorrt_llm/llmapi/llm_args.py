@@ -5871,6 +5871,8 @@ class LoadFormat(Enum):
     VISION_ONLY = 2
     # Load weights through GPU Memory Service.
     GMS = 3
+    # Stream selected safetensors with Model Streamer (Kimi K3 only).
+    MODEL_STREAMER = 4
 
 
 class ModelExpressConfig(StrictBaseModel):
@@ -6444,7 +6446,7 @@ class TorchLlmArgs(BaseLlmArgs):
         description=
         "How to load the model weights. By default, detect the weight type from the model checkpoint.",
         telemetry=TelemetryField.categorical("auto", "dummy", "vision_only",
-                                             "gms"))
+                                             "gms", "model_streamer"))
 
     enable_min_latency: bool = Field(
         default=False,

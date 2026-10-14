@@ -872,10 +872,12 @@
         "dummy",
         "vision_only",
         "gms",
+        "model_streamer",
         "AUTO",
         "DUMMY",
         "VISION_ONLY",
-        "GMS"
+        "GMS",
+        "MODEL_STREAMER"
       ],
       "capture_policy": "allowlist|enum[LoadFormat]",
       "kind": "categorical",

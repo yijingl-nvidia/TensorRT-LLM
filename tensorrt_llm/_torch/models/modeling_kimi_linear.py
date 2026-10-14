@@ -2357,9 +2357,16 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                     projections.append((f"{scope}.{attr}", module, attention))
         return projections
 
-    def _load_attention_fp8(self, weights: Dict[str, torch.Tensor], prefix: str) -> int:
+    def _load_attention_fp8(
+        self,
+        weights: Dict[str, torch.Tensor],
+        prefix: str,
+        projection_names: Set[str] | None = None,
+    ) -> int:
         """Load checkpoint FP8 codes/scales without a BF16 projection intermediate."""
         projections = self._attention_fp8_linears()
+        if projection_names is not None:
+            projections = [item for item in projections if item[0] in projection_names]
         for name, linear, attention in projections:
             # Both attention implementations use self_attn keys in the checkpoint.
             key = (
@@ -2632,6 +2639,186 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
             # work before the caller can release the weights container.
             torch.cuda.synchronize(device)
 
+    def load_weights_model_streamer(self, checkpoint_dir: str) -> None:
+        """Load only node-owned checkpoint tensors with Model Streamer."""
+        from .kimi_k3_model_streamer import (
+            checkpoint_paths_and_keys,
+            node_tensor_selection,
+            stream_selected_safetensors,
+        )
+
+        paths, checkpoint_keys = checkpoint_paths_and_keys(checkpoint_dir)
+        device = next(self.parameters()).device
+        if device.type == "cuda":
+            torch.cuda.set_device(device)
+        prefix = (
+            "language_model."
+            if any(key.startswith("language_model.") for key in checkpoint_keys)
+            else ""
+        )
+        params = self._trunk_parameters()
+        name_map, expected_keys, expert_jobs = self.checkpoint_name_plan(prefix)
+        missing = {
+            key
+            for key in expected_keys - checkpoint_keys
+            if not (key.endswith("_scale") and key + "_inv" in checkpoint_keys)
+        }
+        if missing:
+            raise KeyError(
+                f"Kimi K3 Model Streamer missing checkpoint keys: {sorted(missing)[:10]}"
+            )
+
+        def source_keys(key: str) -> set[str]:
+            keys = {key}
+            scale_key = _fp8_block_scale_key(key)
+            if scale_key in checkpoint_keys:
+                keys.add(scale_key)
+            elif scale_key + "_inv" in checkpoint_keys:
+                keys.add(scale_key + "_inv")
+            return keys
+
+        groups: Dict[Tuple[str, str], Set[str]] = {}
+        expert_destinations = {}
+        fused_a_param_ids = {
+            id(layer.self_attn.mixer.kv_a_proj_with_mqa.weight)
+            for layer in self.model.layers
+            if not getattr(layer, "is_kda", True)
+            and _has_weights(layer)
+            and getattr(layer.self_attn.mixer, "fuse_qkv_a_proj", False)
+        }
+        for name in name_map:
+            key = name_map[name]
+            if name.endswith(_GATE_UP_FUSED_SUFFIX):
+                inputs = _gate_up_ckpt_keys(key)
+            else:
+                inputs = (key,)
+            needed = set().union(*(source_keys(input_key) for input_key in inputs))
+            if id(params[name]) in fused_a_param_ids:
+                needed.update(
+                    source_keys(key.replace("kv_a_proj_with_mqa.weight", "q_a_proj.weight"))
+                )
+            groups[("param", name)] = needed
+
+        for name, _, attention in self._attention_fp8_linears():
+            key = (
+                prefix
+                + name.replace(".linear_attn.", ".self_attn.").replace(
+                    ".self_attn.mixer.", ".self_attn."
+                )
+                + ".weight"
+            )
+            needed = source_keys(key)
+            if name.endswith("kv_a_proj_with_mqa") and attention.fuse_qkv_a_proj:
+                needed.update(
+                    source_keys(key.replace("kv_a_proj_with_mqa.weight", "q_a_proj.weight"))
+                )
+            groups[("fp8", name)] = needed
+
+        for _, moe, base in expert_jobs:
+            for slot, expert_idx in enumerate(moe.local_expert_ids):
+                group = ("expert", f"{base}.{expert_idx}")
+                groups[group] = {
+                    f"{base}.{expert_idx}.{weight}.{kind}"
+                    for weight in ("w1", "w2", "w3")
+                    for kind in moe.expert_ckpt_spec.kinds
+                }
+                expert_destinations[group] = (moe, base, slot, expert_idx)
+
+        local_keys = set().union(*groups.values())
+        selected_keys, ranks_on_node = node_tensor_selection(
+            local_keys,
+            rank=self.model_config.mapping.rank,
+            world_size=self.model_config.mapping.world_size,
+        )
+        # All ranks on a node pass the identical set to the distributed API.
+        if not selected_keys.issubset(checkpoint_keys):
+            raise KeyError(
+                f"Model Streamer node selection includes missing keys: "
+                f"{sorted(selected_keys - checkpoint_keys)[:10]}"
+            )
+
+        key_groups: Dict[str, list[Tuple[str, str]]] = {}
+        for group, keys in groups.items():
+            for key in keys:
+                key_groups.setdefault(key, []).append(group)
+        remaining = {group: set(keys) for group, keys in groups.items()}
+        pending: Dict[Tuple[str, str], Dict[str, torch.Tensor]] = {}
+        seen_local: set[str] = set()
+        prepared_backends: set[int] = set()
+        finalized_backends: set[int] = set()
+        num_params = 0
+
+        def complete(group: Tuple[str, str], data: Dict[str, torch.Tensor]) -> None:
+            nonlocal num_params
+            kind, name = group
+            if kind == "param":
+                num_params += self._load_trunk_params(
+                    data, {name: params[name]}, {name: name_map[name]}, log_summary=False
+                )
+            elif kind == "fp8":
+                num_params += self._load_attention_fp8(data, prefix, {name})
+            else:
+                moe, base, slot, expert_idx = expert_destinations[group]
+                backend = moe.routed_experts.backend
+                spec = moe.expert_ckpt_spec
+                if spec.needs_layer_finalize and id(backend) not in prepared_backends:
+                    backend.quant_method.prepare_streaming_expert_load(backend)
+                    prepared_backends.add(id(backend))
+                spec.loader(backend, base, expert_idx, slot, data.__getitem__)
+                if (
+                    spec.needs_layer_finalize
+                    and id(backend) not in finalized_backends
+                    and len(getattr(backend, spec.loaded_slots_attr, ()))
+                    == backend.expert_size_per_partition
+                ):
+                    backend.process_weights_after_loading()
+                    finalized_backends.add(id(backend))
+
+        def consume(name: str, tensor: torch.Tensor) -> None:
+            owners = key_groups.get(name)
+            if not owners:
+                return
+            seen_local.add(name)
+            retained = tensor.clone()
+            for group in owners:
+                data = pending.setdefault(group, {})
+                data[name] = retained
+                remaining[group].remove(name)
+                if not remaining[group]:
+                    complete(group, data)
+                    del pending[group]
+                    del remaining[group]
+
+        distributed = ranks_on_node > 1
+        self._weight_loading_metrics = stream_selected_safetensors(
+            paths, selected_keys, consume, distributed=distributed
+        )
+        if seen_local != local_keys or remaining:
+            raise RuntimeError(
+                f"Kimi K3 Model Streamer left {len(local_keys - seen_local)} keys and "
+                f"{len(remaining)} load groups incomplete"
+            )
+        for _, moe, _ in expert_jobs:
+            backend = moe.routed_experts.backend
+            spec = moe.expert_ckpt_spec
+            expected_slots = set(range(backend.expert_size_per_partition))
+            if getattr(backend, spec.loaded_slots_attr, set()) != expected_slots:
+                raise RuntimeError("Kimi K3 Model Streamer did not fill every expert slot")
+            if (
+                spec.needs_layer_finalize
+                and expected_slots
+                and id(backend) not in finalized_backends
+            ):
+                raise RuntimeError("Kimi K3 Model Streamer did not finalize every expert layer")
+            backend._weights_transformed = False
+        self._finalize_weight_load(num_params, len(expert_jobs))
+        self._weight_loading_metrics.update(
+            {
+                "model_streamer_rank_tensors": float(len(seen_local)),
+                "model_streamer_node_ranks": float(ranks_on_node),
+            }
+        )
+
     def _validate_checkpoint_keys(
         self, weights: Dict[str, torch.Tensor], expected_keys: Set[str], prefix: str
     ) -> None:
@@ -2673,6 +2860,7 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
         weights: Dict[str, torch.Tensor],
         params: Dict[str, torch.nn.Parameter],
         name_map: Dict[str, str],
+        log_summary: bool = True,
     ) -> int:
         """Load every non-expert trunk parameter concurrently (with the
         per-parameter TP-shard / pad / fuse conversions) and return the
@@ -2861,11 +3049,15 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
             param.data.copy_(src.to(param.dtype))
 
         param_jobs = [(name, params[name]) for name in name_map]
-        run_concurrently(load_param, param_jobs, num_workers=8)
+        if len(param_jobs) == 1:
+            load_param(*param_jobs[0])
+        else:
+            run_concurrently(load_param, param_jobs, num_workers=8)
 
-        logger.info(
-            f"Kimi K3: loaded {len(mla_mixers)} MLA KV-B projections in grouped runtime layout"
-        )
+        if log_summary:
+            logger.info(
+                f"Kimi K3: loaded {len(mla_mixers)} MLA KV-B projections in grouped runtime layout"
+            )
         return len(param_jobs)
 
     def _load_expert_slices(

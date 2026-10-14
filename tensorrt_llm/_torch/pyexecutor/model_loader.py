@@ -1138,6 +1138,29 @@ class ModelLoader:
                     self._materialize_draft_checkpoint_weights(
                         checkpoint_loader, model)
 
+            elif load_format == LoadFormat.MODEL_STREAMER:
+                from ..models.modeling_kimi_linear import KimiLinearForCausalLM
+
+                if not isinstance(model, KimiLinearForCausalLM):
+                    raise ValueError(
+                        "MODEL_STREAMER currently supports only Kimi K3")
+                if checkpoint_loader.checkpoint_format != "HF":
+                    raise ValueError(
+                        "MODEL_STREAMER requires a Hugging Face checkpoint")
+                if loads_draft_weights:
+                    raise ValueError(
+                        "MODEL_STREAMER does not support separate draft weights"
+                    )
+                weights_checkpoint_dir = getattr(model, "llm_checkpoint_dir",
+                                                 checkpoint_dir)
+                with timing_metric(
+                        ModelLoaderMetricNames.WEIGHT_POPULATION_SECONDS.value,
+                        self._metrics):
+                    model.load_weights_model_streamer(weights_checkpoint_dir)
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                self._metrics.update(model._weight_loading_metrics)
+
             elif load_format == LoadFormat.GMS:
                 # GPU Memory Service path: weight tensors live in a
                 # node-shared GPU memory pool so multiple TRT-LLM instances

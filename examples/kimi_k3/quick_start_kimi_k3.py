@@ -39,6 +39,12 @@ def parse_arguments() -> argparse.Namespace:
         help="Number of GPUs used for expert parallelism (default: 16).",
     )
     parser.add_argument(
+        "--load-format",
+        choices=("AUTO", "MODEL_STREAMER"),
+        default="AUTO",
+        help="Checkpoint loader (default: AUTO).",
+    )
+    parser.add_argument(
         "--enable-block-reuse",
         action="store_true",
         help="Enable KV-cache block reuse (unified-pool hybrid cache "
@@ -52,6 +58,7 @@ def main() -> None:
     args = parse_arguments()
     llm = LLM(
         model=args.model,
+        load_format=args.load_format,
         tensor_parallel_size=args.tp_size,
         enable_attention_dp=True,
         moe_expert_parallel_size=args.tp_size,
