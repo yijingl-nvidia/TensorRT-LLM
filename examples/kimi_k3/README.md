@@ -85,9 +85,10 @@ streamer reads only tensors needed by the ranks on each node and uses
 node-local distributed loading when multiple ranks share a node. Its current
 scope is local Hugging Face safetensors checkpoints for the text Kimi K3 model.
 
-This experimental option requires a complete checkpoint and, for multi-rank
-launches, a torch distributed rendezvous (`MASTER_ADDR` and `MASTER_PORT`).
-For the quick start below, pass `--load-format MODEL_STREAMER` to the Slurm
+This experimental option requires a complete checkpoint. For multi-rank MPI
+launches, it initializes a PyTorch distributed group when needed and shares
+the rendezvous address through MPI. For the quick start below, pass
+`--load-format MODEL_STREAMER` to the Slurm
 script after installing the wheel in the serving runtime. On 4-GPU GB300
 workers, `sbatch --nodes=2 ... --tp-size 8` selects the documented TEP8
 configuration; the script defaults to 16 GPUs on four nodes.

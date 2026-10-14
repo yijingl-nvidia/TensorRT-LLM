@@ -945,6 +945,10 @@ class ModelLoader:
         post_transform_config_identity = PostTransformConfigIdentity.from_model_config(
             config)
         load_format = self.llm_args.load_format
+        if load_format == LoadFormat.MODEL_STREAMER:
+            from ..models.kimi_k3_model_streamer import ensure_torch_distributed
+
+            ensure_torch_distributed(self.mapping.rank, self.mapping.world_size)
         locality_domain_policy = getattr(config, "locality_domain_policy", None)
         if (load_format == LoadFormat.GMS
                 and getattr(locality_domain_policy, "enabled", False)):

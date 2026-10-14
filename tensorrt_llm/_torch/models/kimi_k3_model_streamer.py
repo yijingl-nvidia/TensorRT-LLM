@@ -40,6 +40,36 @@ def checkpoint_paths_and_keys(checkpoint_dir: str) -> tuple[list[str], set[str]]
     return paths, keys
 
 
+def ensure_torch_distributed(rank: int, world_size: int) -> None:
+    """Join the TRT-LLM MPI world with a NCCL group for node streaming."""
+    if world_size == 1:
+        return
+    import torch.distributed as dist
+
+    if dist.is_initialized():
+        if dist.get_rank() != rank or dist.get_world_size() != world_size:
+            raise RuntimeError("Torch distributed group does not match the TRT-LLM mapping")
+    else:
+        from tensorrt_llm._utils import mpi_comm, mpi_rank, mpi_world_size
+
+        if mpi_rank() != rank or mpi_world_size() != world_size:
+            raise RuntimeError("MPI world does not match the TRT-LLM mapping")
+
+        def rendezvous() -> tuple[str, str]:
+            if address := os.environ.get("MASTER_ADDR"):
+                if port := os.environ.get("MASTER_PORT"):
+                    return address, port
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.bind(("", 0))
+                port = str(sock.getsockname()[1])
+            return socket.gethostbyname(socket.gethostname()), port
+
+        address, port = mpi_comm().bcast(rendezvous() if rank == 0 else None, root=0)
+        os.environ["MASTER_ADDR"] = address
+        os.environ["MASTER_PORT"] = port
+        dist.init_process_group("nccl", init_method="env://", rank=rank, world_size=world_size)
+
+
 def node_tensor_selection(
     local_keys: Collection[str],
     *,
@@ -52,14 +82,7 @@ def node_tensor_selection(
 
     import torch.distributed as dist
 
-    if dist.is_initialized():
-        if dist.get_rank() != rank or dist.get_world_size() != world_size:
-            raise RuntimeError("Torch distributed group does not match the TRT-LLM mapping")
-    else:
-        if not os.environ.get("MASTER_ADDR") or not os.environ.get("MASTER_PORT"):
-            raise RuntimeError("MODEL_STREAMER requires MASTER_ADDR and MASTER_PORT")
-        dist.init_process_group("nccl", init_method="env://", rank=rank, world_size=world_size)
-
+    ensure_torch_distributed(rank, world_size)
     hostname = socket.gethostname()
     local = (hostname, tuple(sorted(local_keys)))
     gathered: list[tuple[str, tuple[str, ...]] | None] = [None] * world_size
@@ -101,8 +124,6 @@ def stream_selected_safetensors(
         streamer.stream_files(
             paths, device="cuda", is_distributed=distributed, tensor_names=selected
         )
-        if distributed and not streamer.file_streamer.is_distributed:
-            raise RuntimeError("Model Streamer could not activate node-distributed loading")
         for name, tensor in streamer.get_tensors():
             if name not in selected or name in seen:
                 raise ValueError(f"Unexpected or duplicate Model Streamer tensor: {name}")
